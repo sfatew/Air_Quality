@@ -9,11 +9,12 @@ if len(sys.argv) < 2:
     sys.exit(1)
 
 aod_file = sys.argv[1]
-stations_file = "C:/Users/MY LAPTOP/OneDrive/Documents/GitHub/Air_Quality/AOD data/vietnam_meteostat_stations.csv"
+stations_file = ""
+OUTPUT_DIR = ""
 
 # Các ngưỡng uncertainty và tên file tương ứng
 uncertainty_thresholds = [0.5, 0.7, 0.8, 1, 1.2, 1.5]
-output_files = [f"E:/Air Quality/AOD/all_station{str(threshold).replace('.', '')}.csv" for threshold in uncertainty_thresholds]
+output_files = [OUTPUT_DIR + f"/all_station{str(threshold).replace('.', '')}.csv" for threshold in uncertainty_thresholds]
 
 # Lấy timestamp từ tên file
 filename = os.path.basename(aod_file)

@@ -4,15 +4,17 @@ from ftplib import FTP
 import subprocess
 from datetime import datetime, timedelta
 
+from config.config import AOD_config
+
 FTP_HOST = "ftp.ptree.jaxa.jp"
-FTP_USER = "tr.hoanganh1124work_gmail.com"
-FTP_PASS = "SP+wari8"
+FTP_USER = AOD_config.FTP_USER
+FTP_PASS = AOD_config.FTP_PASS
 BASE_DIR = "/pub/himawari/L2/ARP/031"
 
 # Cấu hình thư mục local
-LOCAL_BASE = "E:/Air Quality/AOD"
-PROCESS_SCRIPT = "C:/Users/MY LAPTOP/OneDrive/Documents/GitHub/Air_Quality/AOD data/process_aod_data.py"
-LOG_FILE = "C:/Users/MY LAPTOP/OneDrive/Documents/GitHub/Air_Quality/AOD data/downloaded_files.log"
+LOCAL_BASE = ""
+PROCESS_SCRIPT = ""
+LOG_FILE = ""
 
 # Thời gian bắt đầu
 start_time = datetime(2025, 6, 16, 0, 0)

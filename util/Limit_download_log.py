@@ -16,6 +16,7 @@ class Limit_download_log:
                     if item:
                         self.add(item, log=False)
 
+    #TODO: fix add method
     def add(self, item, log=True):
         if item in self.data:
             return  # already seen

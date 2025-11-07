@@ -17,7 +17,7 @@ from config.config import gis_config
 FTP_TLS.ssl_version = ssl.PROTOCOL_TLSv1_2
 
 SERVER = gis_config.SERVER
-DOWNLOAD_DIR = r'E:/Air Quality/GIS'
+DOWNLOAD_DIR = r'/home/slow_data/Air_Quality/GIS'
 USER = gis_config.GIS_USERNAME
 PASSWORD = gis_config.GIS_PASSWORD
 
@@ -68,11 +68,12 @@ def download_for_date(ftps, date_obj):
         print("ℹ️ No matching HHR .zip files found.")
         return False
 
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    local_path = os.path.join(DOWNLOAD_DIR, year, month, day)
+    os.makedirs(local_path, exist_ok=True)
 
     # Loop through and download each file
     for filename in file_list:
-        get_file(ftps, filename)
+        get_file(ftps, filename, local_path)
     
     return True
 
@@ -109,12 +110,12 @@ def get_file_list(ftps: FTP_TLS, remote_path: str):
     print(f"✅ Found {len(matches)} HHR .zip files.")
     return matches
 
-def get_file(ftps: FTP_TLS, filename: str):
+def get_file(ftps: FTP_TLS, filename: str, local_path: str):
     """
     Get the given file from the current FTPS directory.
     'filename' is the basename (e.g., 'file.zip').
     """
-    output_path = os.path.join(DOWNLOAD_DIR, filename)
+    output_path = os.path.join(local_path, filename)
 
     if os.path.exists(output_path):
         print(f"⏭️ File already exists, skipping: {filename}")

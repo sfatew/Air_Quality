@@ -39,7 +39,7 @@ is_real_time_mode = False
 
 # --- Log Management ---
 # Global set to track downloaded files.
-downloaded = Limit_download_log.Limit_download_log(max_size=5000, log_path=LOG_FILE)
+downloaded = Limit_download_log.Limit_download_log(max_size=1000, log_path=LOG_FILE, log_limit_lines=10000)
 
 def fetch_file(file, local_path, ftp):
     local_file = os.path.join(local_path, file)

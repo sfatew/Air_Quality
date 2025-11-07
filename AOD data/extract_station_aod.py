@@ -9,8 +9,8 @@ if len(sys.argv) < 2:
     sys.exit(1)
 
 aod_file = sys.argv[1]
-stations_file = ""
-OUTPUT_DIR = ""
+stations_file = "/home/work1/projects/Air_Quality/AOD data/vietnam_meteostat_stations.csv"
+OUTPUT_DIR = "/home/slow_data/Air_Quality/AOD/station_aod"
 
 # Các ngưỡng uncertainty và tên file tương ứng
 uncertainty_thresholds = [0.5, 0.7, 0.8, 1, 1.2, 1.5]
@@ -39,7 +39,7 @@ with rasterio.open(aod_file) as src:
     aot_values_dict = {threshold: [] for threshold in uncertainty_thresholds}
     
     for _, row in stations.iterrows():
-        lon, lat = row["Longitude"], row["Latitude"]
+        lon, lat = row["longitude"], row["latitude"]
         try:
             rowcol = src.index(lon, lat)
             aot_value = aot_band[rowcol[0], rowcol[1]]
@@ -67,7 +67,7 @@ for threshold, output_csv in zip(uncertainty_thresholds, output_files):
                             on="station_id", 
                             how="left")
     else:
-        df_merged = stations_copy[["station_id", "station_name", "Latitude", "Longitude", 
+        df_merged = stations_copy[["station_id", "station_name", "latitude", "longitude", 
                                  aot_col_name]]
     df_merged.to_csv(output_csv, index=False)
 print(f"✅ Hoàn tất xử lý ")

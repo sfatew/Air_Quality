@@ -70,7 +70,7 @@ if __name__ == "__main__":
 
     # print("Path: ", aod_full_path)
 
-    shapefile_path = os.path.join("GADM_Vietnam/gadm41_VNM_0.shp")
+    shapefile_path = "/home/work1/projects/Air_Quality/GADM_Vietnam/gadm41_VNM_0.shp"
 
     nc_to_geotiff(nc_path, aod_full_path)
     crop_to_vietnam(aod_full_path, aod_vietnam_path, shapefile_path)
@@ -79,5 +79,5 @@ if __name__ == "__main__":
     os.remove(aod_full_path)
 
     
-    EXTRACT_SCRIPT = ""
+    EXTRACT_SCRIPT = "/home/work1/projects/Air_Quality/AOD data/extract_station_aod.py"
     subprocess.run(["python", EXTRACT_SCRIPT, aod_vietnam_path])

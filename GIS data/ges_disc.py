@@ -17,7 +17,7 @@ def download_gesdisc_imerg(
     target_dir,
     username,
     password,
-    cookie_file=os.path.expanduser("~/.urs_cookies"),
+    cookie_file=os.path.expanduser("/home/work1/.urs_cookies"),
     curl_path="curl"
 ):
     """
@@ -35,7 +35,7 @@ def download_gesdisc_imerg(
     password : str
         Your Earthdata password.
     cookie_file : str, optional
-        Path to cookie file (default ~/.urs_cookies).
+        Path to cookie file (default /home/work1/.urs_cookies).
     curl_path : str, optional
         Path to curl executable.
     """

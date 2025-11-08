@@ -22,7 +22,7 @@ USER = gis_config.GIS_USERNAME
 PASSWORD = gis_config.GIS_PASSWORD
 
 # DATE_STR = "2025-09-01"
-START_DATE_STR = "2022-09-27"
+START_DATE_STR = "2023-03-16"
 print(f"📅 Using date: {START_DATE_STR}")
 
 CHECK_INTERVAL = 6 * 60 * 60  # every 6 hours
@@ -142,15 +142,25 @@ def download_historical_data():
         print("Error: Invalid date format. Please use YYYY-MM-DD.")
         sys.exit(1)
     ftps = connect_ftps()
+    connected_since = None
+    reconnect_interval_days = 30  # reconnect every 30 days or upon failure
 
     while True:
+        if ftps is None or (connected_since and (current_date - connected_since).days >= reconnect_interval_days):
+            if ftps:
+                ftps.quit()
+            ftps = connect_ftps()
+            connected_since = current_date
+            print(f"🔄 Reconnected FTPS at {current_date.date()}")
+
         found = download_for_date(ftps, current_date)
+
         if not found:
             print(f"🚫 No more GIS data found. Reached latest date.")
             break
         current_date += timedelta(days=1)
-
-    ftps.quit()
+    if ftps:
+        ftps.quit()
     return current_date  # The last checked date
 
 def check_for_updates(start_from_date):

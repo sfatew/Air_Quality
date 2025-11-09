@@ -22,7 +22,7 @@ USER = gis_config.GIS_USERNAME
 PASSWORD = gis_config.GIS_PASSWORD
 
 # DATE_STR = "2025-09-01"
-START_DATE_STR = "2023-03-16"
+START_DATE_STR = "2023-04-30"
 print(f"📅 Using date: {START_DATE_STR}")
 
 CHECK_INTERVAL = 6 * 60 * 60  # every 6 hours

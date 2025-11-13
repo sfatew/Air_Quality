@@ -95,7 +95,7 @@ SERVER = 'https://ladsweb.modaps.eosdis.nasa.gov/archive/allData/61/MOD11A1'
 DOWNLOAD_DIR = r'/home/slow_data/Air_Quality/MODIS'
 TOKEN = modis_config.TOKEN
 
-START_DATE_STR = "2022-09-27"
+START_DATE_STR = "2025-11-07"
 print(f"📅 Using date: {START_DATE_STR}")
 
 TILES = ["h27v06", "h28v06", "h27v07", "h28v07", "h28v08"]
@@ -153,7 +153,7 @@ def download_files(files, date_obj, base_url):
     """Download the given list of files, skipping files that already exist."""
     if not files:
         print(f"ℹ️ No matching tiles found for {date_obj.strftime('%Y-%m-%d')}")
-        return
+        raise FileNotFoundError("No matching tiles found")
     
     year = date_obj.strftime("%Y")
     day = date_obj.strftime("%j")
@@ -203,6 +203,9 @@ def download_for_date(date_obj):
         all_files = list_files(url, TOKEN)
         wanted_files = filter_tiles(all_files)
         download_files(wanted_files, date_obj, url)
+    except FileNotFoundError:
+        raise FileNotFoundError("No matching tiles found for this date")
+    
     except Exception as e:
         print(f"❌ Error processing {date_obj.strftime('%Y-%m-%d')}: {e}", file=sys.stderr)
 
@@ -220,7 +223,11 @@ def check_for_updates(last_date):
         
         dates_downloaded = 0
         while check_date <= current_date_eod:
-            download_for_date(check_date)
+            try:
+                download_for_date(check_date)
+            except FileNotFoundError:
+                print(f"🚫 No data found for {check_date.strftime('%Y-%m-%d')}. Stopping checks for now.")
+                break
             last_checked_date = check_date
             check_date += timedelta(days=1)
             dates_downloaded += 1
@@ -240,7 +247,10 @@ def main():
     print(f"📥 Starting historical download from {start_date.strftime('%Y-%m-%d')} to {current_date_eod.strftime('%Y-%m-%d')}")
     
     while date <= current_date_eod:
-        download_for_date(date)
+        try:
+            download_for_date(date)
+        except FileNotFoundError:
+            break
         last_downloaded_date = date  # Update the tracker
         date += timedelta(days=1)
     

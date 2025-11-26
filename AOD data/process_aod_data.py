@@ -11,6 +11,10 @@ def nc_to_geotiff(nc_file, output_path):
     ds = xr.open_dataset(nc_file, decode_timedelta=True)
     aot = ds['AOT'].values
     aot_uncertainty = ds['AOT_uncertainty'].values
+    ae = ds['AE'].values
+    qa_flag = ds['QA_flag'].values
+    ssa = ds['SSA'].values
+    rf = ds['RF'].values
     lon = ds['longitude'].values
     lat = ds['latitude'].values
     ds.close()
@@ -29,16 +33,24 @@ def nc_to_geotiff(nc_file, output_path):
         'driver': 'GTiff',
         'height': aot.shape[0],
         'width': aot.shape[1],
-        'count': 2,  # Thay đổi count thành 2 để lưu cả AOT và uncertainty
+        'count': 6,
         'dtype': 'float32',
         'crs': 'EPSG:4326',
         'transform': transform,
     }
 
+    name = ['AOT', 'AOT_uncertainty', 'AE', 'QA_flag', 'SSA', 'RF']
     # Ghi cả AOT và uncertainty vào file GeoTIFF
     with rasterio.open(output_path, 'w', **profile) as dst:
         dst.write(aot.astype('float32'), 1)  # Band 1: AOT
         dst.write(aot_uncertainty.astype('float32'), 2)  # Band 2: AOT_uncertainty
+        dst.write(ae.astype('float32'), 3)
+        dst.write(qa_flag.astype('float32'), 4)
+        dst.write(ssa.astype('float32'), 5) 
+        dst.write(rf.astype('float32'), 6) 
+        
+        for i, n in enumerate(name):
+            dst.set_band_description(i + 1, n)
 
 def crop_to_vietnam(input_tif, output_tif, vietnam_shapefile):
     with rasterio.open(input_tif) as src:

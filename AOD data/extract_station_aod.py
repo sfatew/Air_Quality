@@ -20,14 +20,9 @@ output_files = [OUTPUT_DIR + f"/all_station{str(threshold).replace('.', '')}.csv
 filename = os.path.basename(aod_file)
 parts = filename.split("_")
 timestamp = parts[4] + "_" + parts[5]
-aot_col_name = f"AOT_{timestamp}"
 
-# Đọc danh sách trạm
+# Đọc danh sách trạm (giữ nguyên station_id gốc)
 stations = pd.read_csv(stations_file)
-stations = stations.rename(columns={"name": "station_name"})
-
-if "station_id" not in stations.columns:
-    stations["station_id"] = range(len(stations))
 
 # Đọc ảnh AOT và uncertainty
 with rasterio.open(aod_file) as src:
@@ -47,27 +42,37 @@ with rasterio.open(aod_file) as src:
             
             for threshold in uncertainty_thresholds:
                 if np.isnan(aot_value) or np.isnan(uncertainty_value) or uncertainty_value >= threshold:
-                    aot_values_dict[threshold].append(None)
+                    aot_values_dict[threshold].append(np.nan) 
                 else:
-                    aot_values_dict[threshold].append(aot_value)
+                    aot_values_dict[threshold].append(float(aot_value))
         except Exception as e:
             for threshold in uncertainty_thresholds:
-                aot_values_dict[threshold].append(None)
+                aot_values_dict[threshold].append(np.nan)
 
 # Lưu ra các file CSV tương ứng với từng ngưỡng uncertainty
 for threshold, output_csv in zip(uncertainty_thresholds, output_files):
-    stations_copy = stations.copy()
-    stations_copy[aot_col_name] = aot_values_dict[threshold]
+    # Tạo DataFrame cho hàng mới: timestamp + AOT values cho từng station
+    new_row = {'timestamp': timestamp}
     
-    # Ghi hoặc cập nhật file tổng
+    # Thêm giá trị AOT cho từng station (dùng station_id gốc làm tên cột)
+    for i, station_id in enumerate(stations['id']):
+        new_row[str(station_id)] = aot_values_dict[threshold][i]
+    
+    new_df = pd.DataFrame([new_row])
+    
+    # Thêm vào file CSV (append)
     if os.path.exists(output_csv):
         df_old = pd.read_csv(output_csv)
-        df_merged = pd.merge(df_old, 
-                            stations_copy[["station_id", aot_col_name]], 
-                            on="station_id", 
-                            how="left")
+        # Đảm bảo tất cả các cột (trừ timestamp) là kiểu float
+        for col in df_old.columns:
+            if col != 'timestamp':
+                df_old[col] = df_old[col].astype('float64')
+                new_df[col] = new_df[col].astype('float64')
+        
+        df_merged = pd.concat([df_old, new_df], ignore_index=True)
     else:
-        df_merged = stations_copy[["station_id", "station_name", "latitude", "longitude", 
-                                 aot_col_name]]
+        df_merged = new_df
+    
     df_merged.to_csv(output_csv, index=False)
-print(f"✅ Hoàn tất xử lý ")
+
+print(f"✅ Hoàn tất xử lý cho timestamp {timestamp}")

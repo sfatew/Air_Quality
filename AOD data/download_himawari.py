@@ -30,7 +30,7 @@ PROCESS_SCRIPT = "/home/work1/projects/Air_Quality/AOD data/process_aod_data.py"
 MISSING_LOG_FILE = "/home/work1/projects/Air_Quality/AOD data/missing_data.log"
 
 # Thời gian bắt đầu lịch sử để tải về (Starting time for historical download)
-start_time_holder = datetime(2023, 12, 4, 0, 0)
+start_time_holder = datetime(2022, 9, 27, 0, 0)
 
 # Maximum number of consecutive missing hours before considering we've caught up
 MAX_CONSECUTIVE_MISSING = 24  # If ... in a row are missing, assume we're caught up

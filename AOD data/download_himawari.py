@@ -30,13 +30,71 @@ PROCESS_SCRIPT = "/home/work1/projects/Air_Quality/AOD data/process_aod_data.py"
 MISSING_LOG_FILE = "/home/work1/projects/Air_Quality/AOD data/missing_data.log"
 
 # Thời gian bắt đầu lịch sử để tải về (Starting time for historical download)
-start_time_holder = datetime(2022, 9, 27, 0, 0)
+start_time_holder = datetime(2025, 10, 11, 15, 0)
 
 # Maximum number of consecutive missing hours before considering we've caught up
 MAX_CONSECUTIVE_MISSING = 24  # If ... in a row are missing, assume we're caught up
 
 
-# --- Log Management ---
+# --- Missing Data Log Management ---
+def load_missing_data_log():
+    """Load missing data entries from log file into a dictionary"""
+    missing_data = {}
+    if not os.path.exists(MISSING_LOG_FILE):
+        return missing_data
+    
+    try:
+        with open(MISSING_LOG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    # Parse log format: timestamp | data_timestamp | remote_path | reason
+                    parts = line.split(" | ")
+                    if len(parts) >= 3:
+                        data_timestamp_str = parts[1]
+                        remote_path = parts[2]
+                        # Parse the data timestamp
+                        data_timestamp = datetime.strptime(data_timestamp_str, '%Y-%m-%d %H:%M')
+                        # Store with timestamp as key for quick lookup
+                        missing_data[data_timestamp] = line
+                except Exception as e:
+                    print(f"⚠️ Could not parse log line: {line[:50]}... Error: {e}")
+                    continue
+        
+        if missing_data:
+            print(f"📋 Loaded {len(missing_data)} missing data entries from log")
+    except Exception as e:
+        print(f"⚠️ Error loading missing data log: {e}")
+    
+    return missing_data
+
+
+def remove_from_missing_log(timestamp):
+    """Remove a timestamp entry from the missing data log file"""
+    if not os.path.exists(MISSING_LOG_FILE):
+        return
+    
+    try:
+        # Read all lines
+        with open(MISSING_LOG_FILE, "r") as f:
+            lines = f.readlines()
+        
+        # Filter out the line with this timestamp
+        timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M')
+        filtered_lines = [line for line in lines if f" | {timestamp_str} | " not in line]
+        
+        # Write back
+        with open(MISSING_LOG_FILE, "w") as f:
+            f.writelines(filtered_lines)
+        
+        if len(filtered_lines) < len(lines):
+            print(f"✅ Removed {timestamp_str} from missing data log")
+    except Exception as e:
+        print(f"⚠️ Error removing from missing data log: {e}")
+
+
 def log_missing_data(timestamp, remote_path, reason="Directory not found"):
     """Log missing data to file"""
     try:
@@ -89,9 +147,12 @@ def fetch_file(file, local_path, ftp):
 
 
 # --- Core FTP and Processing Logic ---
-def download_and_process(ftp, remote_path, local_path, timestamp):
+def download_and_process(ftp, remote_path, local_path, timestamp, missing_data_log):
     """
     Attempts to connect to a remote directory, downloads new files, and processes them.
+    
+    Args:
+        missing_data_log: Dictionary of missing data entries loaded from log file
     
     Returns:
         bool: True if the remote directory was successfully accessed (even if empty/no new files).
@@ -109,11 +170,9 @@ def download_and_process(ftp, remote_path, local_path, timestamp):
         
         # Get list of files already downloaded locally
         local_files = get_local_files(local_path)
-        # print(local_files)
         
         # Filter files that need to be downloaded
         files_to_download = [f for f in remote_nc_files if f.removesuffix(".nc") not in local_files]
-        # print(files_to_download)
 
         
         if not files_to_download:
@@ -121,12 +180,23 @@ def download_and_process(ftp, remote_path, local_path, timestamp):
                 print(f"✔️ Đã kiểm tra {remote_path}. Tất cả {len(remote_nc_files)} file .nc đã tồn tại.")
             else:
                 print(f"✔️ Đã kiểm tra {remote_path}. Không có file .nc.")
+            
+            # Check if this timestamp was in missing log and remove it if data exists
+            if timestamp in missing_data_log and remote_nc_files:
+                print(f"🔄 Data now available for previously missing timestamp")
+                remove_from_missing_log(timestamp)
+            
             return True
 
         print(f"📥 Bắt đầu tải {len(files_to_download)} file mới từ {remote_path}...")
         
         for file in files_to_download:
             fetch_file(file, local_path, ftp)
+
+        # After successful download, check if this was in missing log
+        if timestamp in missing_data_log:
+            print(f"🎉 Successfully recovered previously missing data!")
+            remove_from_missing_log(timestamp)
 
         return True  # Successfully accessed the directory
 
@@ -135,13 +205,14 @@ def download_and_process(ftp, remote_path, local_path, timestamp):
         error_msg = str(e)
         print(f"⛔ Không truy cập được thư mục {remote_path}: {error_msg}")
         
-        # Log the missing data
-        log_missing_data(timestamp, remote_path, error_msg)
+        # Only log if not already in missing data log
+        if timestamp not in missing_data_log:
+            log_missing_data(timestamp, remote_path, error_msg)
         
         return False
 
 
-def historical_mode():
+def historical_mode(missing_data_log):
     """Download historical data with gap tracking"""
     global start_time_holder
     
@@ -160,6 +231,10 @@ def historical_mode():
         try:
             print(f"\n🚀 [HISTORICAL] Đang kiểm tra: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
+            # Check if this timestamp is in missing log
+            if current_time in missing_data_log:
+                print(f"🔍 This timestamp was previously logged as missing - attempting recovery...")
+            
             with FTP(FTP_HOST, timeout=30) as ftp:
                 ftp.login(FTP_USER, FTP_PASS)
                 
@@ -171,7 +246,7 @@ def historical_mode():
                 local_path = os.path.join(LOCAL_BASE, ymd, dd, hh)
 
                 # Download and process
-                directory_found = download_and_process(ftp, remote_path, local_path, current_time)
+                directory_found = download_and_process(ftp, remote_path, local_path, current_time, missing_data_log)
 
             if directory_found:
                 # Reset missing counter when data is found
@@ -211,10 +286,13 @@ def realtime_mode():
     """Monitor and download real-time data"""
     global start_time_holder
     
+    # Create empty missing_data_log for realtime mode (not needed but keeps function signature consistent)
+    missing_data_log = {}
+    
     while True:
-        # Always check the last 2 hours to ensure we don't miss any data
+        # Always check the last   hours to ensure we don't miss any data
         current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
-        check_times = [current_hour - timedelta(hours=2), current_hour - timedelta(hours=1)]
+        check_times = [current_hour - timedelta(hours=6), current_hour - timedelta(hours=1)]
         
         try:
             for check_time in check_times:
@@ -231,7 +309,7 @@ def realtime_mode():
                     local_path = os.path.join(LOCAL_BASE, ymd, dd, hh)
 
                     # Download and process (missing data is already logged inside)
-                    download_and_process(ftp, remote_path, local_path, check_time)
+                    download_and_process(ftp, remote_path, local_path, check_time, missing_data_log)
                     
                     time.sleep(1)
             
@@ -248,15 +326,19 @@ def main():
     """Main loop for managing historical and real-time modes"""
     global start_time_holder
     
+    # Load missing data log at startup
+    print("📖 Loading missing data log...")
+    missing_data_log = load_missing_data_log()
+    
     while True:
         # Check if we should start in real-time mode
-        if start_time_holder >= datetime.now() - timedelta(hours=2):
+        if start_time_holder >= datetime.now() - timedelta(hours=6):
             print("🔄 Bắt đầu ở chế độ real-time.")
             realtime_mode()
         else:
             # Start with historical mode
             print("📚 Bắt đầu tải dữ liệu lịch sử.")
-            historical_mode()
+            historical_mode(missing_data_log)
             
             # After historical mode completes, switch to real-time
             realtime_mode()

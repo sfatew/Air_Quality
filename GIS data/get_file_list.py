@@ -21,8 +21,11 @@ DOWNLOAD_DIR = r'/home/slow_data/Air_Quality/GIS'
 USER = gis_config.GIS_USERNAME
 PASSWORD = gis_config.GIS_PASSWORD
 
-START_DATE_STR = "2025-06-30"
-print(f"📅 Using date: {START_DATE_STR}")
+# CHANGED: Updated the start date to pick up where your folders left off
+START_DATE_STR = "2025-10-01"
+# ADDED: Created a hard end date so the script doesn't download 2026 data
+END_DATE_STR = "2025-12-31" 
+print(f"📅 Using date range: {START_DATE_STR} to {END_DATE_STR}")
 
 CHECK_INTERVAL = 6 * 60 * 60  # every 6 hours
 RECONNECT_AFTER_FILES = 50  # Reconnect after every N files
@@ -178,6 +181,8 @@ def download_historical_data():
     """Download historical data with automatic reconnection."""
     try:
         current_date = datetime.strptime(START_DATE_STR, '%Y-%m-%d')
+        # ADDED: Parse the end date so the script knows when to stop
+        end_date = datetime.strptime(END_DATE_STR, '%Y-%m-%d')
     except ValueError:
         print("Error: Invalid date format. Please use YYYY-MM-DD.")
         sys.exit(1)
@@ -192,6 +197,11 @@ def download_historical_data():
     reconnect_interval_seconds = 30 * 60  # 30 minutes
 
     while True:
+        # ADDED: Check if we have passed the target end date. If yes, break the loop!
+        if current_date > end_date:
+            print(f"\n🎯 Reached target end date: {END_DATE_STR}. Stopping download.")
+            break
+
         # Check if we need to reconnect
         current_time = time.time()
         time_since_connection = current_time - last_connection_time
@@ -220,8 +230,8 @@ def download_historical_data():
             found, num_files = download_for_date(ftps, current_date)
             
             if not found:
-                print(f"🚫 No more GIS data found. Reached latest date: {current_date.date()}")
-                break
+                print(f"🚫 No GIS data found for: {current_date.date()}")
+                # REMOVED the 'break' here so it doesn't stop just because one day is missing
                 
             files_since_reconnect += num_files
             current_date += timedelta(days=1)
@@ -299,7 +309,13 @@ def check_for_updates(start_from_date):
 
 
 if __name__ == '__main__':
-    print(f"📅 Starting historical download from {START_DATE_STR}")
+    # CHANGED: Print statement updated to show the end date
+    print(f"📅 Starting historical download from {START_DATE_STR} to {END_DATE_STR}")
     latest_date = download_historical_data()
-    print(f"🔁 Switching to scheduled update mode after {latest_date.date()}")
-    check_for_updates(latest_date)
+    
+    # ADDED: Simple completion message
+    print("✅ Finished downloading requested date range. Shutting down script.")
+    
+    # COMMENTED OUT: We no longer want the script to switch to the infinite update loop
+    # print(f"🔁 Switching to scheduled update mode after {latest_date.date()}")
+    # check_for_updates(latest_date)

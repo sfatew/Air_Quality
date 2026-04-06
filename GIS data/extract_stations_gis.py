@@ -8,12 +8,13 @@ import numpy as np
 from io import BytesIO
 from PIL import Image
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-STATIONS_FILE = "/home/work1/projects/Air_Quality/AOD data/target_stations_aod.csv"
+STATIONS_FILE = "/home/slow_data/Air_Quality/Envisoft_station_metadata.csv"
 OUTPUT_DIR    = "/home/slow_data/Air_Quality/GIS/station_gis_extracted"
 
 # All 9 fields from each ZIP:
@@ -23,7 +24,7 @@ TIF_FIELDS = [
     ("total.rate.tif",          "total_rate_mmh",      10.0,  29999),
     ("liquid.accum.tif",        "liquid_accum_mm",     10.0,  29999),
     ("liquid.rate.tif",         "liquid_rate_mmh",     10.0,  29999),
-    ("liquidPercent.tif",       "liquid_pct",           1.0,    255),  # 1-byte, 0-100; 255 = missing
+    ("liquidPercent.tif",       "liquid_pct",           1.0,    255),  # 1-byte, 0-100; 255 = missing  (absent in some months → NaN)
     ("ice.accum.tif",           "ice_accum_mm",        10.0,  29999),
     ("ice.rate.tif",            "ice_rate_mmh",        10.0,  29999),
     ("numValidHalfHour.tif",    "num_valid_halfhour",   1.0,   None),  # count, no missing sentinel
@@ -44,29 +45,40 @@ def sanitize_filename(name):
 def parse_timestamp_from_filename(filename):
     """
     Parse start timestamp from Final IMERG GIS zip filename.
-    Example: 3B-HHR-GIS.MS.MRG.3IMERG.20250601-S003000-E005959.0030.V07B.zip
+    Example: 3B-HHR-GIS.MS.MRG.3IMERG.20250406-S160000-E162959.0960.V07B.zip
+    Converts from UTC to UTC+7.
     Returns 'YYYY-MM-DD HH:MM:SS' string or None on failure.
     """
     m = re.search(r"(\d{8})-S(\d{6})", filename)
     if not m:
         return None
+    
     date_str, time_str = m.group(1), m.group(2)
-    return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]} {time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
+    
+    # Parse as UTC datetime
+    dt_utc = datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
+    
+    # Convert to UTC+7
+    dt_local = dt_utc + timedelta(hours=7)
+    
+    # Return formatted string
+    return dt_local.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def latlon_to_index(lat, lon):
     """
     Convert lat/lon to IMERG GIS pixel indices (row, col).
-    Grid: 1800 rows x 3600 cols, 0.1 deg resolution.
-    Taken directly from NASA IMERG GIS readme section 4.3:
-        iLat = round((lat + 90) * 10)
-        iLon = round((lon + 180) * 10)
+
+    Grid: 1800 rows × 3600 cols, 0.1° resolution, **north-up**.
+
     """
-    row = int(round((lat + 90) * 10))
-    col = int(round((lon + 180) * 10))
+    row = int((90.0 - lat) * 10.0 + 1e-8)
+    col = int((lon + 180.0) * 10.0 + 1e-8) 
+    
     # Clamp to valid bounds
     row = max(0, min(row, 1799))
     col = max(0, min(col, 3599))
+
     return row, col
 
 
@@ -84,7 +96,7 @@ def read_tif_from_zip(zf, suffix):
 # Core per-file processing (runs in worker processes)
 # ---------------------------------------------------------------------------
 
-def process_single_file(zip_path, stations_df):
+def process_single_file(zip_path, station_coords):
     """
     Opens one GIS .zip, reads all 9 TIF fields into numpy arrays,
     then extracts one pixel per station using precomputed row/col indices.
@@ -103,12 +115,9 @@ def process_single_file(zip_path, stations_df):
             for suffix, col_name, scale, missing in TIF_FIELDS:
                 arrays[col_name] = (read_tif_from_zip(zf, suffix), scale, missing)
 
-        # Extract per-station values using simple index math (no rasterio)
+        # Extract per-station values using pre-computed indices for maximum efficiency
         file_results = {}
-        for _, row in stations_df.iterrows():
-            station_id = sanitize_filename(row["stationId"])
-            r, c       = latlon_to_index(row["latitude"], row["longitude"])
-
+        for safe_id, r, c in station_coords:
             station_record = {"timestamp": timestamp}
 
             for col_name, (arr, scale, missing) in arrays.items():
@@ -116,14 +125,20 @@ def process_single_file(zip_path, stations_df):
                     station_record[col_name] = np.nan
                     continue
 
-                pixel = int(arr[r, c])
+                if arr.ndim != 2 or r >= arr.shape[0] or c >= arr.shape[1]:
+                    station_record[col_name] = np.nan
+                    continue
 
-                if missing is not None and pixel == missing:
+                # Cast to float to handle potential native np.nan safely without throwing ValueError
+                pixel_val = float(arr[r, c])
+
+                # Check for standard missing, or naturally occurring NaN
+                if np.isnan(pixel_val) or (missing is not None and pixel_val == missing):
                     station_record[col_name] = np.nan
                 else:
-                    station_record[col_name] = round(float(pixel) / scale, 3)
+                    station_record[col_name] = round(pixel_val / scale, 3)
 
-            file_results[station_id] = station_record
+            file_results[safe_id] = station_record
 
         return file_results
 
@@ -141,9 +156,38 @@ def process_single_file(zip_path, stations_df):
 def main(target_directory):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # Warn if stale CSVs exist from a previous (potentially wrong) run
+    existing = glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))
+    if existing:
+        print(
+            f"WARNING: {len(existing)} existing CSV(s) found in {OUTPUT_DIR}.\n"
+            "If they were produced before the latlon_to_index row-formula fix,\n"
+            "or before the UTC+7 conversion, delete them first so they are fully regenerated:\n"
+            f"  rm {OUTPUT_DIR}/*.csv\n"
+        )
+
     stations_df = pd.read_csv(STATIONS_FILE)
-    stations_df["safe_id"] = stations_df["stationId"].apply(sanitize_filename)
+    
+    # Safely handle column name variant: 'stationId' vs 'ID'
+    id_col = 'stationId' if 'stationId' in stations_df.columns else 'ID'
+    if id_col not in stations_df.columns:
+        raise ValueError(f"Could not find a valid ID column. Available columns: {stations_df.columns.tolist()}")
+        
+    stations_df["safe_id"] = stations_df[id_col].apply(sanitize_filename)
     unique_stations = stations_df["safe_id"].unique()
+
+    # Safely handle latitude and longitude column variants (case-insensitive & whitespace-stripped)
+    lat_col = next((c for c in stations_df.columns if c.strip().lower() in ['latitude', 'lat']), None)
+    lon_col = next((c for c in stations_df.columns if c.strip().lower() in ['longitude', 'lon', 'long']), None)
+    
+    if not lat_col or not lon_col:
+        raise ValueError(f"Could not find valid latitude/longitude columns. Available columns: {stations_df.columns.tolist()}")
+
+    # Pre-compute target arrays/indices once (drastically saves time & serialization overhead)
+    station_coords = []
+    for _, row in stations_df.iterrows():
+        r, c = latlon_to_index(row[lat_col], row[lon_col])
+        station_coords.append((row["safe_id"], r, c))
 
     search_path = os.path.join(target_directory, "**", "*.zip")
     zip_files   = sorted(glob.glob(search_path, recursive=True))
@@ -158,7 +202,8 @@ def main(target_directory):
     processed_count = 0
 
     with ProcessPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(process_single_file, f, stations_df): f for f in zip_files}
+        # Pass the lightweight precomputed tuple array 'station_coords' instead of the DataFrame
+        futures = {executor.submit(process_single_file, f, station_coords): f for f in zip_files}
 
         for future in as_completed(futures):
             result = future.result()
@@ -192,14 +237,11 @@ def main(target_directory):
 
         df_final = df_final[cols]
         df_final = df_final.sort_values("timestamp").reset_index(drop=True)
+        
         df_final.to_csv(output_csv, index=False)
         print(f"Saved {len(df_final)} rows for {station_id} -> {os.path.basename(output_csv)}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python extract_station_gis.py <target_directory_path>")
-        sys.exit(1)
-
-    target_dir = sys.argv[1]
+    target_dir = '/home/slow_data/Air_Quality/GIS'
     main(target_dir)

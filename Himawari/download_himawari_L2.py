@@ -22,21 +22,18 @@ from config.config import aod_config
 FTP_HOST = "ftp.ptree.jaxa.jp"
 FTP_USER = aod_config.FTP_USER
 FTP_PASS = aod_config.FTP_PASS
-BASE_DIR = "/pub/himawari/L3/ARP/031"
+BASE_DIR = "/pub/himawari/L2/ARP/031"
 
 # Cấu hình thư mục local
-LOCAL_BASE = "/home/slow_data/Air_Quality/AOD/L3_AOD"
-PROCESS_SCRIPT = "/home/work1/projects/Air_Quality/Himawari/process_aod_data.py"
+LOCAL_BASE = "/home/slow_data/Air_Quality/Himawari/L2_AOD"
+PROCESS_SCRIPT = "/home/work1/projects/Air_Quality/Himawari/process_aod_data_L2.py"
 MISSING_LOG_FILE = "/home/work1/projects/Air_Quality/Himawari/missing_data.log"
 
-# Thời gian bắt đầu lịch sử để tải về (resume from where Dec 2025 left off)
-start_time_holder = datetime(2022, 9, 26, 0, 0)
-
-# Stop after this point — do not download 2026 data yet
-END_TIME = datetime(2026, 3, 23, 23, 0)
+# Thời gian bắt đầu lịch sử để tải về (Starting time for historical download)
+start_time_holder = datetime(2025, 12, 31, 23, 0)
 
 # Maximum number of consecutive missing hours before considering we've caught up
-MAX_CONSECUTIVE_MISSING = 24  # If 24 in a row are missing, assume we're caught up
+MAX_CONSECUTIVE_MISSING = 24  # If ... in a row are missing, assume we're caught up
 
 
 # --- Missing Data Log Management ---
@@ -154,6 +151,9 @@ def download_and_process(ftp, remote_path, local_path, timestamp, missing_data_l
     """
     Attempts to connect to a remote directory, downloads new files, and processes them.
     
+    Args:
+        missing_data_log: Dictionary of missing data entries loaded from log file
+    
     Returns:
         bool: True if the remote directory was successfully accessed (even if empty/no new files).
               False if accessing the remote path failed (e.g., directory does not exist).
@@ -174,6 +174,7 @@ def download_and_process(ftp, remote_path, local_path, timestamp, missing_data_l
         # Filter files that need to be downloaded
         files_to_download = [f for f in remote_nc_files if f.removesuffix(".nc") not in local_files]
 
+        
         if not files_to_download:
             if remote_nc_files:
                 print(f"✔️ Đã kiểm tra {remote_path}. Tất cả {len(remote_nc_files)} file .nc đã tồn tại.")
@@ -200,6 +201,7 @@ def download_and_process(ftp, remote_path, local_path, timestamp, missing_data_l
         return True  # Successfully accessed the directory
 
     except Exception as e:
+        # This catches errors like 550 (directory not found) or connection issues
         error_msg = str(e)
         print(f"⛔ Không truy cập được thư mục {remote_path}: {error_msg}")
         
@@ -211,7 +213,7 @@ def download_and_process(ftp, remote_path, local_path, timestamp, missing_data_l
 
 
 def historical_mode(missing_data_log):
-    """Download historical data with gap tracking, stopping at END_TIME"""
+    """Download historical data with gap tracking"""
     global start_time_holder
     
     consecutive_missing_count = 0
@@ -219,12 +221,7 @@ def historical_mode(missing_data_log):
     
     while True:
         current_time = start_time_holder
-
-        # --- Stop condition: do not go past END_TIME ---
-        if current_time > END_TIME:
-            print(f"🛑 Reached end date ({END_TIME.strftime('%Y-%m-%d %H:%M')}). Stopping.")
-            return
-
+        
         # Check if we've caught up to present (leaving 2 hours buffer for data availability)
         if current_time >= datetime.now() - timedelta(hours=2):
             print("🏁 Đã hoàn thành tải lịch sử.")
@@ -244,9 +241,9 @@ def historical_mode(missing_data_log):
                 # Build paths
                 ymd = current_time.strftime("%Y%m")
                 dd = current_time.strftime("%d")
-                # hh = current_time.strftime("%H")
-                remote_path = f"{BASE_DIR}/{ymd}/{dd}/"
-                local_path = os.path.join(LOCAL_BASE, ymd, dd)
+                hh = current_time.strftime("%H")
+                remote_path = f"{BASE_DIR}/{ymd}/{dd}/{hh}/"
+                local_path = os.path.join(LOCAL_BASE, ymd, dd, hh)
 
                 # Download and process
                 directory_found = download_and_process(ftp, remote_path, local_path, current_time, missing_data_log)
@@ -257,7 +254,7 @@ def historical_mode(missing_data_log):
                 first_missing_time = None
                 
                 # Move to next hour
-                start_time_holder += timedelta(days=1)
+                start_time_holder += timedelta(hours=1)
                 time.sleep(1)
                 
             else:
@@ -277,7 +274,7 @@ def historical_mode(missing_data_log):
                 else:
                     # Continue to next hour to find where data resumes
                     print(f"⏩ Bỏ qua giờ này ({consecutive_missing_count}/{MAX_CONSECUTIVE_MISSING} missing). Tiếp tục...")
-                    start_time_holder += timedelta(days=1)
+                    start_time_holder += timedelta(hours=1)
                     time.sleep(1)
 
         except Exception as e:
@@ -289,21 +286,14 @@ def realtime_mode():
     """Monitor and download real-time data"""
     global start_time_holder
     
+    # Create empty missing_data_log for realtime mode (not needed but keeps function signature consistent)
     missing_data_log = {}
     
     while True:
+        # Always check the last   hours to ensure we don't miss any data
         current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
-
-        # --- Stop condition: do not download beyond END_TIME ---
-        if current_hour > END_TIME:
-            print(f"🛑 Current time is past end date ({END_TIME.strftime('%Y-%m-%d %H:%M')}). Real-time mode disabled.")
-            print("ℹ️  Update END_TIME in the script when you are ready to download 2026 data.")
-            return
-
-        check_times = [current_hour - timedelta(days=6), current_hour - timedelta(days=1)]
-        # Only check timestamps within the allowed range
-        check_times = [t for t in check_times if t <= END_TIME]
-
+        check_times = [current_hour - timedelta(hours=6), current_hour - timedelta(hours=1)]
+        
         try:
             for check_time in check_times:
                 print(f"\n🚀 [REAL-TIME] Đang kiểm tra: {check_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -314,14 +304,16 @@ def realtime_mode():
                     # Build paths
                     ymd = check_time.strftime("%Y%m")
                     dd = check_time.strftime("%d")
-                    # hh = check_time.strftime("%H")
-                    remote_path = f"{BASE_DIR}/{ymd}/{dd}/"
-                    local_path = os.path.join(LOCAL_BASE, ymd, dd)
+                    hh = check_time.strftime("%H")
+                    remote_path = f"{BASE_DIR}/{ymd}/{dd}/{hh}/"
+                    local_path = os.path.join(LOCAL_BASE, ymd, dd, hh)
 
+                    # Download and process (missing data is already logged inside)
                     download_and_process(ftp, remote_path, local_path, check_time, missing_data_log)
                     
                     time.sleep(1)
             
+            # Wait 10 minutes before next check
             print(f"\n⏳ [REAL-TIME] Chờ 10 phút trước khi kiểm tra lại...")
             time.sleep(600)
 
@@ -334,6 +326,7 @@ def main():
     """Main loop for managing historical and real-time modes"""
     global start_time_holder
     
+    # Load missing data log at startup
     print("📖 Loading missing data log...")
     missing_data_log = load_missing_data_log()
     
@@ -343,6 +336,7 @@ def main():
             print("🔄 Bắt đầu ở chế độ real-time.")
             realtime_mode()
         else:
+            # Start with historical mode
             print("📚 Bắt đầu tải dữ liệu lịch sử.")
             historical_mode(missing_data_log)
             

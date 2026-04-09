@@ -4,6 +4,7 @@ class GIS_config(BaseSettings):
     GIS_USERNAME: str = "tr.hoanganh1124work@gmail.com"
     GIS_PASSWORD: str = "tr.hoanganh1124work@gmail.com"
     SERVER: str = 'arthurhouftps.pps.eosdis.nasa.gov'
+    NEAR_REALTIME_SERVER: str = 'jsimpsonftps.pps.eosdis.nasa.gov'
 
 gis_config = GIS_config()
 

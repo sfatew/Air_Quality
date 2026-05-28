@@ -19,6 +19,10 @@ import requests
 import numpy as np
 import netCDF4 as nc
 import pandas as pd
+import sys
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT_DIR))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -79,20 +83,52 @@ PRODUCTS = {
     },
 }
 
-STATIONS = {
-    "HN: 556 Nguyễn Văn Cừ":    {"lat": 21.0491, "lon": 105.8831},
-    "HN: CV Nhân Chính":         {"lat": 21.0031, "lon": 105.7947},
-    "HN: ĐHBK Giải Phóng":      {"lat": 21.0052, "lon": 105.8418},
+SITES_CSV = Path("/home/work1/projects/Air_Quality/Masterdata/envisoft_27_stations.csv")
+
+
+def load_stations(csv_path: Path = SITES_CSV) -> dict:
+    df = pd.read_csv(csv_path)
+    stations = {}
+    for _, row in df.iterrows():
+        city = row["stationName"].split(":")[0].strip()
+        stations[row["stationName"]] = {
+            "lat": row["latitude"],
+            "lon": row["longitude"],
+            "city": city,
+        }
+    return stations
+
+
+
+
+def compute_bbox(stations: dict, padding: float = 0.5) -> dict:
+    lats = [s["lat"] for s in stations.values()]
+    lons = [s["lon"] for s in stations.values()]
+    return {
+        "lat_min": min(lats) - padding,
+        "lat_max": max(lats) + padding,
+        "lon_min": min(lons) - padding,
+        "lon_max": max(lons) + padding,
+    }
+
+
+def group_stations_by_city(stations: dict) -> dict[str, dict]:
+    groups = {}
+    for name, info in stations.items():
+        city = info["city"]
+        if city not in groups:
+            groups[city] = {}
+        groups[city][name] = info
+    return groups
+
+
+EXTRA_STATIONS = {
+    "NGHIA_DO": {"lat": 21.048, "lon": 105.800, "city": "Hà Nội"},
+    "Bac_Lieu":  {"lat": 9.30,  "lon": 105.70,  "city": "Bạc Liêu"},
 }
 
-_lats = [s["lat"] for s in STATIONS.values()]
-_lons = [s["lon"] for s in STATIONS.values()]
-BBOX = {
-    "lat_min": min(_lats) - 0.5,
-    "lat_max": max(_lats) + 0.5,
-    "lon_min": min(_lons) - 0.5,
-    "lon_max": max(_lons) + 0.5,
-}
+STATIONS = {**load_stations(), **EXTRA_STATIONS}
+BBOX = compute_bbox(STATIONS)
 
 # How often to force garbage collection (every N files)
 GC_EVERY = 50
@@ -189,6 +225,12 @@ class VIIRSAODDownloader:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"Bearer {self.token}"})
+        self.stats = {
+            "granules_found": 0,
+            "skipped": 0,
+            "downloaded": 0,
+            "failed": [],
+        }
 
     def _get_filepath(self, granule_name: str) -> Path:
         try:
@@ -202,6 +244,7 @@ class VIIRSAODDownloader:
     def download(self, granule: dict, overwrite: bool = False) -> Optional[Path]:
         filepath = self._get_filepath(granule["name"])
         if filepath.exists() and not overwrite:
+            self.stats["skipped"] += 1
             return filepath
 
         logger.info("Downloading: %s", granule["name"])
@@ -211,7 +254,9 @@ class VIIRSAODDownloader:
 
             ctype = resp.headers.get("Content-Type", "")
             if "html" in ctype or "text" in ctype:
-                logger.error("Got HTML instead of NetCDF — check token")
+                reason = "Got HTML instead of NetCDF — check token"
+                logger.error("%s: %s", granule["name"], reason)
+                self.stats["failed"].append({"file": granule["name"], "reason": reason})
                 return None
 
             with open(filepath, "wb") as f:
@@ -221,20 +266,25 @@ class VIIRSAODDownloader:
             with open(filepath, "rb") as f:
                 magic = f.read(4)
             if magic[:3] not in (b"CDF", b"\x89HD"):
-                logger.error("Invalid file: %s", granule["name"])
+                reason = "Invalid file format (not NetCDF/HDF)"
+                logger.error("%s: %s", granule["name"], reason)
+                self.stats["failed"].append({"file": granule["name"], "reason": reason})
                 filepath.unlink()
                 return None
 
+            self.stats["downloaded"] += 1
             logger.info("Saved: %s (%.1f MB)", granule["name"], filepath.stat().st_size / 1e6)
             return filepath
 
         except Exception as e:
             logger.error("Download failed %s: %s", granule["name"], e)
+            self.stats["failed"].append({"file": granule["name"], "reason": str(e)})
             if filepath.exists():
                 filepath.unlink()
             return None
 
     def download_all(self, granules: list[dict], overwrite: bool = False) -> list[Path]:
+        self.stats["granules_found"] = len(granules)
         existing = sum(1 for g in granules if self._get_filepath(g["name"]).exists())
         to_download = len(granules) - existing if not overwrite else len(granules)
         logger.info("Granules: %d total, %d already exist, %d to download",
@@ -266,6 +316,12 @@ class VIIRSAODProcessor:
         self.bbox = bbox or BBOX
         self.stations = stations or STATIONS
         self.qa_threshold = qa_threshold
+        self.process_stats = {
+            "files_total": 0,
+            "files_processed": 0,
+            "files_no_data": 0,
+            "files_error": [],
+        }
 
     def _read_variable(self, ds, var_name):
         """Find a variable in the dataset (top-level or in groups)."""
@@ -340,18 +396,19 @@ class VIIRSAODProcessor:
     # -----------------------------------------------------------------------
     # L2 methods
     # -----------------------------------------------------------------------
-    def read_granule_l2(self, filepath: Path) -> Optional[dict]:
+    def read_granule_l2(self, filepath: Path) -> tuple[Optional[dict], Optional[str]]:
+        """Returns (data, error_msg). error_msg is None for success or no-data-in-bbox."""
         try:
             ds = nc.Dataset(str(filepath), "r")
         except Exception as e:
             logger.error("Cannot open %s: %s", filepath.name, e)
-            return None
+            return None, f"Cannot open: {e}"
 
         try:
             lat_var = self._read_variable(ds, "Latitude") or self._read_variable(ds, "latitude")
             lon_var = self._read_variable(ds, "Longitude") or self._read_variable(ds, "longitude")
             if lat_var is None or lon_var is None:
-                return None
+                return None, "Missing Latitude/Longitude variables"
 
             lat = np.array(lat_var[:], dtype=np.float32)
             lon = np.array(lon_var[:], dtype=np.float32)
@@ -379,7 +436,7 @@ class VIIRSAODProcessor:
                 & (lon >= self.bbox["lon_min"]) & (lon <= self.bbox["lon_max"])
             )
             if not np.any(mask):
-                return None
+                return None, None  # no data in bbox — not an error
 
             dt = self._parse_datetime_from_filename(filepath)
 
@@ -395,11 +452,11 @@ class VIIRSAODProcessor:
             if aod_all is not None:
                 result["aod_all"] = aod_all[mask]
                 result["n_valid_all"] = int(np.sum(~np.isnan(aod_all[mask])))
-            return result
+            return result, None
 
         except Exception as e:
             logger.error("Error %s: %s", filepath.name, e)
-            return None
+            return None, str(e)
         finally:
             ds.close()
 
@@ -523,14 +580,20 @@ class VIIRSAODProcessor:
 
     def process_l2(self, data_dir: Path, radius_km: float = 25.0) -> dict:
         nc_files = sorted(data_dir.rglob("*.nc"))
+        self.process_stats["files_total"] = len(nc_files)
         logger.info("L2: processing %d files from %s", len(nc_files), data_dir)
 
         radius_raw, radius_filt = [], []
         nearest_raw, nearest_filt = [], []
 
         for i, f in enumerate(nc_files):
-            granule = self.read_granule_l2(f)
-            if granule is not None:
+            granule, err = self.read_granule_l2(f)
+            if err is not None:
+                self.process_stats["files_error"].append({"file": f.name, "reason": err})
+            elif granule is None:
+                self.process_stats["files_no_data"] += 1
+            else:
+                self.process_stats["files_processed"] += 1
                 r_raw, r_filt = self.extract_station_l2(granule, radius_km)
                 radius_raw.extend(r_raw)
                 radius_filt.extend(r_filt)
@@ -539,7 +602,6 @@ class VIIRSAODProcessor:
                 nearest_raw.extend(n_raw)
                 nearest_filt.extend(n_filt)
 
-            # --- OOM fix: free memory ---
             del granule
             if (i + 1) % GC_EVERY == 0:
                 gc.collect()
@@ -567,40 +629,29 @@ class VIIRSAODProcessor:
     # -----------------------------------------------------------------------
     # D3 methods  — OOM-fixed
     # -----------------------------------------------------------------------
-    def read_granule_d3(self, filepath: Path) -> Optional[dict]:
-        """
-        Read a D3 granule, extracting ONLY the bbox subset.
-
-        KEY FIX: Use 'Latitude_1D' / 'Longitude_1D' (shape 180 / 360)
-        instead of 'Latitude' / 'Longitude' (shape 180x360).
-        Then slice AOD variables with [lat_slice, lon_slice] to read
-        only the ~2 cells we need, not the entire global grid.
-        """
+    def read_granule_d3(self, filepath: Path) -> tuple[Optional[dict], Optional[str]]:
+        """Returns (data, error_msg). error_msg is None for success or no-data-in-bbox."""
         try:
             ds = nc.Dataset(str(filepath), "r")
         except Exception as e:
             logger.error("Cannot open %s: %s", filepath.name, e)
-            return None
+            return None, f"Cannot open: {e}"
 
         try:
-            # --- FIX: prefer 1D coordinate variables ---
             lat_1d_var = self._read_variable(ds, "Latitude_1D")
             lon_1d_var = self._read_variable(ds, "Longitude_1D")
 
-            # Fallback to 2D if 1D not available (shouldn't happen for D3)
             if lat_1d_var is None or lon_1d_var is None:
                 lat_2d_var = self._read_variable(ds, "Latitude") or self._read_variable(ds, "latitude")
                 lon_2d_var = self._read_variable(ds, "Longitude") or self._read_variable(ds, "longitude")
                 if lat_2d_var is None or lon_2d_var is None:
-                    return None
-                # Extract 1D from 2D: first column for lat, first row for lon
+                    return None, "Missing Latitude/Longitude variables"
                 lat_1d = np.array(lat_2d_var[:, 0], dtype=np.float32)
                 lon_1d = np.array(lon_2d_var[0, :], dtype=np.float32)
             else:
                 lat_1d = np.array(lat_1d_var[:], dtype=np.float32)
                 lon_1d = np.array(lon_1d_var[:], dtype=np.float32)
 
-            # Filter to bbox indices
             lat_idx = np.where(
                 (lat_1d >= self.bbox["lat_min"]) & (lat_1d <= self.bbox["lat_max"])
             )[0]
@@ -609,12 +660,10 @@ class VIIRSAODProcessor:
             )[0]
 
             if len(lat_idx) == 0 or len(lon_idx) == 0:
-                return None
+                return None, None  # no data in bbox
 
-            # Build small meshgrid of only the bbox cells
             lon_sub, lat_sub = np.meshgrid(lon_1d[lon_idx], lat_1d[lat_idx])
 
-            # Read ONLY the bbox subset from NetCDF (not the full 180x360!)
             lat_sl = slice(int(lat_idx[0]), int(lat_idx[-1]) + 1)
             lon_sl = slice(int(lon_idx[0]), int(lon_idx[-1]) + 1)
 
@@ -625,7 +674,6 @@ class VIIRSAODProcessor:
 
             dt = self._parse_datetime_from_filename(filepath)
 
-            # Flatten — extract_station_d3 expects 1-D arrays
             return {
                 "filepath": str(filepath),
                 "datetime": dt,
@@ -638,10 +686,10 @@ class VIIRSAODProcessor:
                 "n_pixels_bbox": int(lat_sub.size),
                 "n_valid": (int(np.sum(~np.isnan(aod_mean.ravel())))
                             if aod_mean is not None else 0),
-            }
+            }, None
         except Exception as e:
             logger.error("Error %s: %s", filepath.name, e)
-            return None
+            return None, str(e)
         finally:
             ds.close()
 
@@ -693,16 +741,22 @@ class VIIRSAODProcessor:
 
     def process_d3(self, data_dir: Path) -> pd.DataFrame:
         nc_files = sorted(data_dir.rglob("*.nc"))
+        self.process_stats["files_total"] = len(nc_files)
         logger.info("D3: processing %d files from %s", len(nc_files), data_dir)
 
         all_records = []
         for i, f in enumerate(nc_files):
-            granule = self.read_granule_d3(f)
-            records = self.extract_station_d3(granule)
-            all_records.extend(records)
+            granule, err = self.read_granule_d3(f)
+            if err is not None:
+                self.process_stats["files_error"].append({"file": f.name, "reason": err})
+            elif granule is None:
+                self.process_stats["files_no_data"] += 1
+            else:
+                self.process_stats["files_processed"] += 1
+                records = self.extract_station_d3(granule)
+                all_records.extend(records)
 
-            # --- OOM fix: free memory ---
-            del granule, records
+            del granule
             if (i + 1) % GC_EVERY == 0:
                 gc.collect()
                 logger.info("D3: %d/%d files, %d records",
@@ -718,7 +772,7 @@ class VIIRSAODProcessor:
         if not records:
             return pd.DataFrame()
         df = pd.DataFrame(records)
-        df["datetime"] = pd.to_datetime(df["datetime"])
+        df["datetime"] = pd.to_datetime(df["datetime"]) + pd.Timedelta(hours=7)
         df.sort_values(["datetime", "station"], inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
@@ -729,11 +783,9 @@ class VIIRSAODProcessor:
 # ---------------------------------------------------------------------------
 import yaml
 
-with open("config.yaml", "r") as f:
-    data = yaml.safe_load(f)
-
-TOKEN = data['token']
-
+with open("config/config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+TOKEN = config["VIIRS"]["TOKEN"]
 
 def run_viirs_aod(
     product: str = "deep_blue_noaa20",
@@ -747,6 +799,8 @@ def run_viirs_aod(
     overwrite: bool = False,
     actions: list = None,
     qa_threshold: int = 2,
+    bbox: dict = None,
+    stations: dict = None,
 ):
     """
     Download & process VIIRS AOD.
@@ -757,6 +811,10 @@ def run_viirs_aod(
     """
     if actions is None:
         actions = ["download", "process"]
+    if bbox is None:
+        bbox = BBOX
+    if stations is None:
+        stations = STATIONS
 
     level, product_config = get_product_config(product)
     platform = product_config["platform"]
@@ -775,18 +833,32 @@ def run_viirs_aod(
 
     data_dir = Path(base_dir) / level / platform
 
+    run_stats = {
+        "product": product,
+        "level": level,
+        "platform": platform,
+        "start": start_date.strftime("%Y-%m-%d"),
+        "end": end_date.strftime("%Y-%m-%d"),
+        "download": None,
+        "process": None,
+        "station_summary": {},
+    }
+
     # --- DOWNLOAD ---
+    downloader = None
     if "download" in actions:
-        searcher = CMRSearcher(product_key=product, bbox=BBOX)
+        searcher = CMRSearcher(product_key=product, bbox=bbox)
         granules = searcher.search(start_date, end_date)
         if not granules:
             logger.warning("No granules found.")
+            run_stats["download"] = {"granules_found": 0, "skipped": 0, "downloaded": 0, "failed": []}
         else:
             downloader = VIIRSAODDownloader(
                 token=token, output_dir=base_dir,
                 level=level, platform=platform,
             )
             downloader.download_all(granules, overwrite=overwrite)
+            run_stats["download"] = downloader.stats.copy()
 
     # --- PROCESS ---
     df_raw, df_filt = pd.DataFrame(), pd.DataFrame()
@@ -794,8 +866,8 @@ def run_viirs_aod(
 
     if "process" in actions:
         processor = VIIRSAODProcessor(
-            product_key=product, bbox=BBOX,
-            stations=STATIONS, qa_threshold=qa_threshold,
+            product_key=product, bbox=bbox,
+            stations=stations, qa_threshold=qa_threshold,
         )
 
         if level == "L2":
@@ -857,7 +929,6 @@ def run_viirs_aod(
             df_filt = df_raw.copy()
 
             if not df_raw.empty:
-                # Save per station
                 for station in df_raw["station"].unique():
                     folder_name = (
                         station.replace(":", "")
@@ -871,30 +942,156 @@ def run_viirs_aod(
                     s_df = df_raw[df_raw["station"] == station].reset_index(drop=True)
                     s_df.to_csv(station_dir / "data.csv", index=False)
 
-                # Combined
                 d3_csv = os.path.join(output_dir, f"{prefix}.csv")
                 df_raw.to_csv(d3_csv, index=False)
                 logger.info("Saved: %s (%d records)", d3_csv, len(df_raw))
 
-    return df_raw, df_filt
+        run_stats["process"] = processor.process_stats.copy()
+
+        # Build per-station summary from result data
+        result_df = df_raw if not df_raw.empty else df_filt
+        if not result_df.empty and "station" in result_df.columns:
+            for station, grp in result_df.groupby("station"):
+                run_stats["station_summary"][station] = {
+                    "records": len(grp),
+                    "date_min": grp["datetime"].min().strftime("%Y-%m-%d"),
+                    "date_max": grp["datetime"].max().strftime("%Y-%m-%d"),
+                }
+
+    return df_raw, df_filt, run_stats
+
+
+timestamp = datetime.now().strftime("%Y%m%d")
+JOB_LOG = Path(__file__).parent / f"{timestamp}_job.log"
+
+def write_job_report(
+    all_run_stats: list[dict],
+    stations: dict,
+    log_path: Path = JOB_LOG,
+):
+    city_groups = group_stations_by_city(stations)
+    lines = []
+    w = lines.append
+
+    w("=" * 70)
+    w(f"VIIRS AOD Job Report — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    w("=" * 70)
+    w("")
+
+    # --- Station overview ---
+    w(f"STATIONS: {len(stations)} stations in {len(city_groups)} cities")
+    w("-" * 70)
+    for city, members in sorted(city_groups.items()):
+        w(f"  {city} ({len(members)} station(s)):")
+        for name, info in members.items():
+            w(f"    - [{info['lat']:.4f}, {info['lon']:.4f}] {name}")
+    w("")
+
+    # --- Per-product run ---
+    for run in all_run_stats:
+        product = run["product"]
+        w(f"PRODUCT: {product}  ({run['level']}/{run['platform']})")
+        w(f"  Period: {run['start']} → {run['end']}")
+        w("-" * 70)
+
+        # Download
+        dl = run.get("download")
+        if dl:
+            w(f"  DOWNLOAD:")
+            w(f"    Granules found:      {dl['granules_found']}")
+            w(f"    Already exist (skip): {dl['skipped']}")
+            w(f"    Downloaded:           {dl['downloaded']}")
+            w(f"    Failed:               {len(dl['failed'])}")
+            if dl["failed"]:
+                for err in dl["failed"][:50]:
+                    w(f"      ✗ {err['file']}")
+                    w(f"        → {err['reason']}")
+                if len(dl["failed"]) > 50:
+                    w(f"      ... and {len(dl['failed']) - 50} more")
+        else:
+            w("  DOWNLOAD: skipped")
+        w("")
+
+        # Process
+        pr = run.get("process")
+        if pr:
+            w(f"  PROCESS:")
+            w(f"    Files total:     {pr['files_total']}")
+            w(f"    Processed OK:    {pr['files_processed']}")
+            w(f"    No data in bbox: {pr['files_no_data']}")
+            w(f"    Errors:          {len(pr['files_error'])}")
+            if pr["files_error"]:
+                for err in pr["files_error"][:50]:
+                    w(f"      ✗ {err['file']}")
+                    w(f"        → {err['reason']}")
+                if len(pr["files_error"]) > 50:
+                    w(f"      ... and {len(pr['files_error']) - 50} more")
+        else:
+            w("  PROCESS: skipped")
+        w("")
+
+        # Station data summary
+        ss = run.get("station_summary", {})
+        if ss:
+            w(f"  STATION DATA ({len(ss)} stations with data):")
+
+            # Group by city
+            city_station_stats = {}
+            for sname, sinfo in ss.items():
+                city = stations.get(sname, {}).get("city", "Unknown")
+                if city not in city_station_stats:
+                    city_station_stats[city] = []
+                city_station_stats[city].append((sname, sinfo))
+
+            for city in sorted(city_station_stats):
+                members = city_station_stats[city]
+                total_records = sum(s["records"] for _, s in members)
+                date_min = min(s["date_min"] for _, s in members)
+                date_max = max(s["date_max"] for _, s in members)
+                w(f"    {city}: {total_records} records ({date_min} → {date_max})")
+                for sname, sinfo in members:
+                    short_name = sname.split(":")[-1].strip()[:40]
+                    w(f"      - {short_name}: {sinfo['records']} records "
+                      f"({sinfo['date_min']} → {sinfo['date_max']})")
+
+            # Stations with NO data
+            stations_with_data = set(ss.keys())
+            stations_without = set(stations.keys()) - stations_with_data
+            if stations_without:
+                w(f"\n  NO DATA ({len(stations_without)} stations):")
+                for sname in sorted(stations_without):
+                    w(f"    - {sname}")
+        else:
+            w("  STATION DATA: no records extracted")
+
+        w("")
+        w("=" * 70)
+        w("")
+
+    report = "\n".join(lines)
+    log_path.write_text(report, encoding="utf-8")
+    logger.info("Job report written to %s", log_path)
+    return report
 
 
 # ===========================================================================
 # RUN
 # ===========================================================================
+if __name__ == "__main__":
+    city_groups = group_stations_by_city(STATIONS)
+    logger.info("Loaded %d stations in %d cities", len(STATIONS), len(city_groups))
+    for city, members in city_groups.items():
+        logger.info("  %s: %d station(s)", city, len(members))
 
-# D3 NOAA20
-run_viirs_aod(
-    product="deep_blue_noaa20_d3",
-    start="2022-01-01",
-    base_dir="/home/slow_data/Air_Quality/VIIRS",
-    actions=["process"],
-)
+    all_stats = []
+    for product_key in ["deep_blue_noaa20", "deep_blue_noaa20_d3"]:
+        _, _, stats = run_viirs_aod(
+            product=product_key,
+            start="2022-01-01",
+            base_dir="/home/slow_data/Air_Quality/VIIRS",
+            actions=["process"],
+        )
+        all_stats.append(stats)
 
-# D3 SNPP
-run_viirs_aod(
-    product="deep_blue_snpp_d3",
-    start="2022-01-01",
-    base_dir="/home/slow_data/Air_Quality/VIIRS",
-    actions=["process"],
-)
+    write_job_report(all_stats, STATIONS)
+

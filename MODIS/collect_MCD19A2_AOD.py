@@ -35,7 +35,7 @@ SERVER = 'https://ladsweb.modaps.eosdis.nasa.gov/archive/allData/61/MCD19A2'
 DOWNLOAD_DIR = r'/home/slow_data/Air_Quality/MODIS_MCD19A2'
 TOKEN = modis_config.TOKEN
 
-START_DATE_STR = "2024-01-03"
+START_DATE_STR = "2022-09-01"
 print(f"📅 Using date: {START_DATE_STR}")
 
 TILES = ["h27v06", "h28v06", "h27v07", "h28v07", "h28v08"]

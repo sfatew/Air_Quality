@@ -1,0 +1,77 @@
+{('Bac_Giang', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Bac_Giang', '20'): Empty DataFrame
+Columns: []
+Index: [], ('Bac_Lieu', '10'):       AERONET_Site Date(dd:mm:yyyy) Time(hh:mm:ss)  Day_of_Year  ...            datetime      site  site_lat  site_lon
+0         Bac_Lieu       20:04:2022       23:38:46          110  ... 2022-04-21 06:38:46  Bac_Lieu      9.28    105.73
+1         Bac_Lieu       20:04:2022       23:48:56          110  ... 2022-04-21 06:48:56  Bac_Lieu      9.28    105.73
+2         Bac_Lieu       21:04:2022       00:00:15          111  ... 2022-04-21 07:00:15  Bac_Lieu      9.28    105.73
+3         Bac_Lieu       21:04:2022       00:02:18          111  ... 2022-04-21 07:02:18  Bac_Lieu      9.28    105.73
+4         Bac_Lieu       21:04:2022       00:04:21          111  ... 2022-04-21 07:04:21  Bac_Lieu      9.28    105.73
+...            ...              ...            ...          ...  ...                 ...       ...       ...       ...
+15735     Bac_Lieu       22:08:2025       02:21:09          234  ... 2025-08-22 09:21:09  Bac_Lieu      9.28    105.73
+15736     Bac_Lieu       22:08:2025       02:31:09          234  ... 2025-08-22 09:31:09  Bac_Lieu      9.28    105.73
+15737     Bac_Lieu       22:08:2025       02:41:10          234  ... 2025-08-22 09:41:10  Bac_Lieu      9.28    105.73
+15738     Bac_Lieu       22:08:2025       02:51:10          234  ... 2025-08-22 09:51:10  Bac_Lieu      9.28    105.73
+15739     Bac_Lieu       22:08:2025       03:16:10          234  ... 2025-08-22 10:16:10  Bac_Lieu      9.28    105.73
+
+[15740 rows x 118 columns], ('Bac_Lieu', '20'):     AERONET_Site Date(dd:mm:yyyy) Time(hh:mm:ss)  Day_of_Year  AOD_1640nm  ...  Site_Elevation(m)            datetime      site  site_lat  site_lon
+0       Bac_Lieu       21:04:2022       12:00:00          111    0.177189  ...               10.0 2022-04-21 19:00:00  Bac_Lieu      9.28    105.73
+1       Bac_Lieu       22:04:2022       12:00:00          112    0.083368  ...               10.0 2022-04-22 19:00:00  Bac_Lieu      9.28    105.73
+2       Bac_Lieu       23:04:2022       12:00:00          113    0.024999  ...               10.0 2022-04-23 19:00:00  Bac_Lieu      9.28    105.73
+3       Bac_Lieu       24:04:2022       12:00:00          114    0.027113  ...               10.0 2022-04-24 19:00:00  Bac_Lieu      9.28    105.73
+4       Bac_Lieu       25:04:2022       12:00:00          115    0.052292  ...               10.0 2022-04-25 19:00:00  Bac_Lieu      9.28    105.73
+..           ...              ...            ...          ...         ...  ...                ...                 ...       ...       ...       ...
+604     Bac_Lieu       10:08:2025       12:00:00          222    0.141282  ...               10.0 2025-08-10 19:00:00  Bac_Lieu      9.28    105.73
+605     Bac_Lieu       18:08:2025       12:00:00          230    0.059485  ...               10.0 2025-08-18 19:00:00  Bac_Lieu      9.28    105.73
+606     Bac_Lieu       19:08:2025       12:00:00          231    0.048841  ...               10.0 2025-08-19 19:00:00  Bac_Lieu      9.28    105.73
+607     Bac_Lieu       20:08:2025       12:00:00          232    0.062653  ...               10.0 2025-08-20 19:00:00  Bac_Lieu      9.28    105.73
+608     Bac_Lieu       22:08:2025       12:00:00          234    0.037169  ...               10.0 2025-08-22 19:00:00  Bac_Lieu      9.28    105.73
+
+[609 rows x 86 columns], ('Bach_Long_Vy', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Bach_Long_Vy', '20'): Empty DataFrame
+Columns: []
+Index: [], ('NGHIA_DO', '10'):       AERONET_Site Date(dd:mm:yyyy) Time(hh:mm:ss)  Day_of_Year  ...            datetime      site  site_lat  site_lon
+0         NGHIA_DO       23:02:2022       06:56:22           54  ... 2022-02-23 13:56:22  NGHIA_DO    21.048     105.8
+1         NGHIA_DO       23:02:2022       07:01:22           54  ... 2022-02-23 14:01:22  NGHIA_DO    21.048     105.8
+2         NGHIA_DO       23:02:2022       07:06:22           54  ... 2022-02-23 14:06:22  NGHIA_DO    21.048     105.8
+3         NGHIA_DO       23:02:2022       07:11:22           54  ... 2022-02-23 14:11:22  NGHIA_DO    21.048     105.8
+4         NGHIA_DO       23:02:2022       07:20:52           54  ... 2022-02-23 14:20:52  NGHIA_DO    21.048     105.8
+...            ...              ...            ...          ...  ...                 ...       ...       ...       ...
+13470     NGHIA_DO       22:04:2026       07:21:02          112  ... 2026-04-22 14:21:02  NGHIA_DO    21.048     105.8
+13471     NGHIA_DO       22:04:2026       07:46:01          112  ... 2026-04-22 14:46:01  NGHIA_DO    21.048     105.8
+13472     NGHIA_DO       23:04:2026       10:31:48          113  ... 2026-04-23 17:31:48  NGHIA_DO    21.048     105.8
+13473     NGHIA_DO       23:04:2026       10:33:49          113  ... 2026-04-23 17:33:49  NGHIA_DO    21.048     105.8
+13474     NGHIA_DO       23:04:2026       10:35:51          113  ... 2026-04-23 17:35:51  NGHIA_DO    21.048     105.8
+
+[13475 rows x 118 columns], ('NGHIA_DO', '20'):     AERONET_Site Date(dd:mm:yyyy) Time(hh:mm:ss)  Day_of_Year  AOD_1640nm  ...  Site_Elevation(m)            datetime      site  site_lat  site_lon
+0       NGHIA_DO       23:02:2022       12:00:00           54    0.098443  ...               40.0 2022-02-23 19:00:00  NGHIA_DO    21.048     105.8
+1       NGHIA_DO       24:02:2022       12:00:00           55    0.081263  ...               40.0 2022-02-24 19:00:00  NGHIA_DO    21.048     105.8
+2       NGHIA_DO       25:02:2022       12:00:00           56    0.147133  ...               40.0 2022-02-25 19:00:00  NGHIA_DO    21.048     105.8
+3       NGHIA_DO       26:02:2022       12:00:00           57    0.115789  ...               40.0 2022-02-26 19:00:00  NGHIA_DO    21.048     105.8
+4       NGHIA_DO       03:03:2022       12:00:00           62    0.177668  ...               40.0 2022-03-03 19:00:00  NGHIA_DO    21.048     105.8
+..           ...              ...            ...          ...         ...  ...                ...                 ...       ...       ...       ...
+534     NGHIA_DO       16:04:2026       12:00:00          106    0.423764  ...               40.0 2026-04-16 19:00:00  NGHIA_DO    21.048     105.8
+535     NGHIA_DO       20:04:2026       12:00:00          110    0.185774  ...               40.0 2026-04-20 19:00:00  NGHIA_DO    21.048     105.8
+536     NGHIA_DO       21:04:2026       12:00:00          111    0.240787  ...               40.0 2026-04-21 19:00:00  NGHIA_DO    21.048     105.8
+537     NGHIA_DO       22:04:2026       12:00:00          112    0.291595  ...               40.0 2026-04-22 19:00:00  NGHIA_DO    21.048     105.8
+538     NGHIA_DO       23:04:2026       12:00:00          113    0.139091  ...               40.0 2026-04-23 19:00:00  NGHIA_DO    21.048     105.8
+
+[539 rows x 86 columns], ('NhaTrang', '10'): Empty DataFrame
+Columns: []
+Index: [], ('NhaTrang', '20'): Empty DataFrame
+Columns: []
+Index: [], ('Red_River_Delta', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Red_River_Delta', '20'): Empty DataFrame
+Columns: []
+Index: [], ('Son_La', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Son_La', '20'): Empty DataFrame
+Columns: []
+Index: [], ('Yen_Bai', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Yen_Bai', '20'): Empty DataFrame
+Columns: []
+Index: []}

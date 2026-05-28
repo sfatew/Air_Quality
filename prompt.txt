@@ -1,151 +1,132 @@
-You are a senior Data Scientist and Remote Sensing expert with strong experience in atmospheric science, satellite AOD products, and time-series analysis in Python.
+based on the result of  /home/work1/projects/Air_Quality/EDA/AOD_Comparision/AOD_Comparison_v3.ipynb for comparing aod between modis, himawari, viirs vs aeronet
 
-Your task is to build a complete Jupyter Notebook to compare Aerosol Optical Depth (AOD) between satellite datasets and AERONET ground-based data.
-Note: VIIRS extract AOD at 550nm
+edit the following latex, if need image for visualization, u need to declare what image should use (image in cell number ?), u can declare the place should put image like
 
----
+begin[H]
+\includegraphic(image_1)
 
-## 📁 DATA (RAW SAMPLES — DO NOT MODIFY)
+and you should tell me image_1 in what shell in the original code:
 
-These are samples record from datasets:
-
-ARRONET:
-path = /home/slow_data/Air_Quality/AERONET/NGHIA_DO/aeronet_NGHIA_DO_L15_2022-01-01_2026-04-01.csv
-Sample datas
-AERONET_Site,Date(dd:mm:yyyy),Time(hh:mm:ss),Day_of_Year,Day_of_Year(Fraction),AOD_1640nm,AOD_1020nm,AOD_870nm,AOD_865nm,AOD_779nm,AOD_675nm,AOD_667nm,AOD_620nm,AOD_560nm,AOD_555nm,AOD_551nm,AOD_532nm,AOD_531nm,AOD_510nm,AOD_500nm,AOD_490nm,AOD_443nm,AOD_440nm,AOD_412nm,AOD_400nm,AOD_380nm,AOD_340nm,Precipitable_Water(cm),AOD_681nm,AOD_709nm,AOD_Empty,AOD_Empty.1,AOD_Empty.2,AOD_Empty.3,AOD_Empty.4,Triplet_Variability_1640,Triplet_Variability_1020,Triplet_Variability_870,Triplet_Variability_865,Triplet_Variability_779,Triplet_Variability_675,Triplet_Variability_667,Triplet_Variability_620,Triplet_Variability_560,Triplet_Variability_555,Triplet_Variability_551,Triplet_Variability_532,Triplet_Variability_531,Triplet_Variability_510,Triplet_Variability_500,Triplet_Variability_490,Triplet_Variability_443,Triplet_Variability_440,Triplet_Variability_412,Triplet_Variability_400,Triplet_Variability_380,Triplet_Variability_340,Triplet_Variability_Precipitable_Water(cm),Triplet_Variability_681,Triplet_Variability_709,Triplet_Variability_AOD_Empty,Triplet_Variability_AOD_Empty.1,Triplet_Variability_AOD_Empty.2,Triplet_Variability_AOD_Empty.3,Triplet_Variability_AOD_Empty.4,440-870_Angstrom_Exponent,380-500_Angstrom_Exponent,440-675_Angstrom_Exponent,500-870_Angstrom_Exponent,340-440_Angstrom_Exponent,440-675_Angstrom_Exponent[Polar],Data_Quality_Level,AERONET_Instrument_Number,AERONET_Site_Name,Site_Latitude(Degrees),Site_Longitude(Degrees),Site_Elevation(m),Solar_Zenith_Angle(Degrees),Optical_Air_Mass,Sensor_Temperature(Degrees_C),Ozone(Dobson),NO2(Dobson),Last_Date_Processed,Number_of_Wavelengths,Exact_Wavelengths_of_AOD(um)_1640nm,Exact_Wavelengths_of_AOD(um)_1020nm,Exact_Wavelengths_of_AOD(um)_870nm,Exact_Wavelengths_of_AOD(um)_865nm,Exact_Wavelengths_of_AOD(um)_779nm,Exact_Wavelengths_of_AOD(um)_675nm,Exact_Wavelengths_of_AOD(um)_667nm,Exact_Wavelengths_of_AOD(um)_620nm,Exact_Wavelengths_of_AOD(um)_560nm,Exact_Wavelengths_of_AOD(um)_555nm,Exact_Wavelengths_of_AOD(um)_551nm,Exact_Wavelengths_of_AOD(um)_532nm,Exact_Wavelengths_of_AOD(um)_531nm,Exact_Wavelengths_of_AOD(um)_510nm,Exact_Wavelengths_of_AOD(um)_500nm,Exact_Wavelengths_of_AOD(um)_490nm,Exact_Wavelengths_of_AOD(um)_443nm,Exact_Wavelengths_of_AOD(um)_440nm,Exact_Wavelengths_of_AOD(um)_412nm,Exact_Wavelengths_of_AOD(um)_400nm,Exact_Wavelengths_of_AOD(um)_380nm,Exact_Wavelengths_of_AOD(um)_340nm,Exact_Wavelengths_of_PW(um)_935nm,Exact_Wavelengths_of_AOD(um)_681nm,Exact_Wavelengths_of_AOD(um)_709nm,Exact_Wavelengths_of_AOD(um)_Empty,Exact_Wavelengths_of_AOD(um)_Empty.1,Exact_Wavelengths_of_AOD(um)_Empty.2,Exact_Wavelengths_of_AOD(um)_Empty.3,Exact_Wavelengths_of_AOD(um)_Empty.4,datetime,site,site_lat,site_lon
-NGHIA_DO,23:02:2022,06:56:22,54,54.289144,0.092119,0.208603,0.28626,,,0.438226,,,,,,,,,0.668412,,,0.764435,,,0.875786,0.932228,1.907578,,,,,,,,0.001086,0.00121,0.002902,,,0.005299,,,,,,,,,0.010124,,,0.011705,,,0.015255,0.015931,0.016436,,,,,,,,1.445485,0.989871,1.316554,1.525846,0.786835,,lev15,817,NGHIA_DO,21.04778,105.79964,40.0,40.393225,1.311787,19.8,257.935669,0.201394,20:12:2024,9,1.6394,1.0195,0.8694,,,0.6744,,,,,,,,,0.4994,,,0.4392,,,0.3802,0.3404,0.937,,,,,,,,2022-02-23 06:56:22,NGHIA_DO,21.048,105.8
-
-HIMAWARI L2:
-File
-/home/slow_data/Air_Quality/Himawari/station_aod/envisoft_stations/Hà Nội: 556 Nguyễn Văn Cừ.csv
-/home/slow_data/Air_Quality/Himawari/station_aod/envisoft_stations/Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến.csv
-/home/slow_data/Air_Quality/Himawari/station_aod/envisoft_stations/Hà Nội: ĐHBK cổng Parabol đường Giải Phóng.csv
-
-Samples data of 1 file
-timestamp,AOT,Uncertainty,AE,QA_flag,SSA,RF
-20250101_0000,,,,5112.0,,
-20250101_0010,,,,5112.0,,
-20250101_0020,,,,5112.0,,
-20250101_0030,,,,5112.0,,
-20250101_0040,,,,5112.0,,
-
-HIMAWARI L3:
-/home/slow_data/Air_Quality/Himawari/station_aod/L3_envisoft_stations/Hà Nội: 556 Nguyễn Văn Cừ.csv
-/home/slow_data/Air_Quality/Himawari/station_aod/L3_envisoft_stations/Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến.csv
-/home/slow_data/Air_Quality/Himawari/station_aod/L3_envisoft_stations/Hà Nội: ĐHBK cổng Parabol đường Giải Phóng.csv
-
-timestamp,AOT_Merged,AOT_Pure,AOT_Merged_uncertainty,AOT_Pure_uncertainty,AE_Merged,AE_Pure,QA_flag_Merged,QA_flag_Pure,AOT_L2_Mean,AOT_L2_SDV,AOT_L2_Num,AE_L2_Mean,AE_L2_SDV,AE_L2_Num
-20220901_0000,-9999.0,-9999.0,-9999.0,-9999.0,-9999.0,-9999.0,1533.0,1533.0,-9999.0,-9999.0,0.0,-9999.0,-9999.0,0.0
-20220901_0100,-9999.0,-9999.0,-9999.0,-9999.0,-9999.0,-9999.0,509.0,509.0,-9999.0,-9999.0,0.0,-9999.0,-9999.0,0.0
-
-VIIIRS:
-/home/slow_data/Air_Quality/VIIRS/output/viirs_aod_L2_NOAA20_nearest_filtered.csv
-datetime,station,station_lat,station_lon,pixel_lat,pixel_lon,dist_km,aod,qa,qa_threshold,source_sds
-2022-01-18 05:36:00,HN: 556 Nguyễn Văn Cừ,21.0491,105.8831,21.043651580810547,105.91069030761719,2.9264104546329035,0.25345876812934875,3,2,Best_Estimate
-2022-01-18 05:36:00,HN: CV Nhân Chính,21.0031,105.7947,21.013572692871094,105.75652313232422,4.130531474744647,0.3075835704803467,3,2,Best_Estimate
-2022-01-18 05:36:00,HN: ĐHBK Giải Phóng,21.0052,105.8418,21.028724670410156,105.8340835571289,2.735665201584352,0.24527579545974731,3,2,Best_Estimate
-2022-01-19 05:18:00,HN: 556 Nguyễn Văn Cừ,21.0491,105.8831,21.033658981323242,105.91387176513672,3.6256330177463925,0.4278935194015503,3,2,Best_Estimate
-2022-01-19 05:18:00,HN: CV Nhân Chính,21.0031,105.7947,20.992067337036133,105.76883697509766,2.951896722782548,0.4930678606033325,3,2,Best_Estimate
-2022-01-19 05:18:00,HN: ĐHBK Giải Phóng,21.0052,105.8418,21.009592056274414,105.84617614746094,0.6672485447862149,0.43496498465538025,3,2,Best_Estimate
-2022-02-23 06:00:00,HN: CV Nhân Chính,21.0031,105.7947,21.011354446411133,105.77439880371094,2.29864676561734,0.5796471834182739,3,2,Best_Estimate
-2022-02-23 06:00:00,HN: ĐHBK Giải Phóng,21.0052,105.8418,21.020668029785156,105.83365631103516,1.9163810838472815,0.23545266687870026,2,2,Best_Estimate
-2022-02-24 05:42:00,HN: 556 Nguyễn Văn Cừ,21.0491,105.8831,21.059633255004883,105.8940658569336,1.6327679734241836,0.4919922351837158,3,2,Best_Estimate
-
-/home/slow_data/Air_Quality/VIIRS/output/viirs_aod_D3_NOAA20.csv
-datetime,station,station_lat,station_lon,aod_mean,aod_count,aod_min,aod_max,grid_lat,grid_lon,dist_deg,source
-2022-01-02,HN: 556 Nguyễn Văn Cừ,21.0491,105.8831,0.4276176989078522,10.0,0.34399381279945374,0.5035058856010437,21.5,105.5,0.5916734337806702,D3_daily_1deg
-2022-01-02,HN: CV Nhân Chính,21.0031,105.7947,0.4276176989078522,10.0,0.34399381279945374,0.5035058856010437,21.5,105.5,0.5777184367179871,D3_daily_1deg
-2022-01-02,HN: ĐHBK Giải Phóng,21.0052,105.8418,0.4276176989078522,10.0,0.34399381279945374,0.5035058856010437,21.5,105.5,0.6013756990432739,D3_daily_1deg
-2022-01-18,HN: 556 Nguyễn Văn Cừ,21.0491,105.8831,0.2099667340517044,74.0,0.12448302656412125,0.42594021558761597,21.5,105.5,0.5916734337806702,D3_daily_1deg
-2022-01-18,HN: CV Nhân Chính,21.0031,105.7947,0.2099667340517044,74.0,0.12448302656412125,0.42594021558761597,21.5,105.5,0.5777184367179871,D3_daily_1deg
-2022-01-18,HN: ĐHBK Giải Phóng,21.0052,105.8418,0.2099667340517044,74.0,0.12448302656412125,0.42594021558761597,21.5,105.5,0.6013756990432739,D3_daily_1deg
-2022-01-19,HN: 556 Nguyễn Văn Cừ,21.0491,105.8831,0.4818681478500366,41.0,0.2988103926181793,0.7697449922561646,21.5,105.5,0.5916734337806702,D3_daily_1deg
-2022-01-19,HN: CV Nhân Chính,21.0031,105.7947,0.4818681478500366,41.0,0.2988103926181793,0.7697449922561646,21.5,105.5,0.5777184367179871,D3_daily_1deg
-2022-01-19,HN: ĐHBK Giải Phóng,21.0052,105.8418,0.4818681478500366,41.0,0.2988103926181793,0.7697449922561646,21.5,105.5,0.6013756990432739,D3_daily_1deg
-2022-02-23,HN: 556 Nguyễn Văn Cừ,21.0491,105.8831,0.4154444634914398,15.0,0.23545266687870026,0.592328667640686,21.5,105.5,0.5916734337806702,D3_daily_1deg
-2022-02-23,HN: CV Nhân Chính,21.0031,105.7947,0.4154444634914398,15.0,0.23545266687870026,0.592328667640686,21.5,105.5,0.5777184367179871,D3_daily_1deg
+edit directly the latex behind to give me the final latex
+=====
 
 
-MODIS:
-/home/slow_data/Air_Quality/MODIS_MCD19A2/stations_aod/MODIS_AQI_28560877461938780203765592307.csv
-Nguyễn Văn Cừ
-ID,timestamp,Timestamp_MODIS_str,Optical_Depth_047,Optical_Depth_055,AOD_Uncertainty,Column_WV,AngstromExp_470-780,AOD_QA,FineModeFraction,Injection_Height,cosSZA,cosVZA,RelAZ,Scattering_Angle,Glint_Angle,Source,Timestamp,Name,Latitude,Longitude,AQI,PM2.5,PM10,CO,NO2,O3,SO2,Temperature,Humidity,Pressure,Wind Speed,Timestamp_DT
-28560877461938780203765592307,2022-09-05 13:25:00,20220905_1325,0.002,0.001,0.0591,4.631,,1.0,5.0,,0.8992,0.9993,171.32,156.05,27.93,,,Hà Nội: 556 Nguyễn Văn Cừ (KK),,,,,,,,,,,,,,
-28560877461938780203765592307,2022-10-11 12:50:00,20221011_1250,0.066,0.049,0.0124,3.113,,1.0,5.0,,0.8429000000000001,0.5472,46.23,98.61,39.39,,,Hà Nội: 556 Nguyễn Văn Cừ (KK),,,,,,,,,,,,,,
-28560877461938780203765592307,2022-10-12 13:35:00,20221012_1335,0.195,0.145,0.0397,3.098,,1.0,5.0,,0.7747,0.95,144.71,153.77,54.89,,,Hà Nội: 556 Nguyễn Văn Cừ (KK),,,,,,,,,,,,,,
-28560877461938780203765592307,2022-10-14 13:20:00,20221014_1320,0.004,0.003,0.0553,2.003,,1.0,5.0,,0.7904,0.9809,38.78,133.04,29.74,,,Hà Nội: 556 Nguyễn Văn Cừ (KK),,,,,,,,,,,,,,
+\subsection{Validation of Satellite AOD Against AERONET}
 
-Cổng Parabol:
-/home/slow_data/Air_Quality/MODIS_MCD19A2/stations_aod/MODIS_AQI_31390903576425084107499649578.csv
-ID,timestamp,Timestamp_MODIS_str,Optical_Depth_047,Optical_Depth_055,AOD_Uncertainty,Column_WV,AngstromExp_470-780,AOD_QA,FineModeFraction,Injection_Height,cosSZA,cosVZA,RelAZ,Scattering_Angle,Glint_Angle,Source,Timestamp,Name,Latitude,Longitude,AQI,PM2.5,PM10,CO,NO2,O3,SO2,Temperature,Humidity,Pressure,Wind Speed,Timestamp_DT
-31390903576425084107499649578,2022-09-05 10:30:00,20220905_1030,0.087,0.064,0.0618,4.956,,1057.0,5.0,,0.9106,0.9481,24.3,138.04,10.54,,,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),,,,,,,,,,,,,,
-31390903576425084107499649578,2022-09-06 14:10:00,20220906_1410,0.444,0.336,0.0149,2.598,,1089.0,5.0,,0.8168000000000001,0.4335,165.8,149.09,98.61,,,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),,,,,,,,,,,,,,
-31390903576425084107499649578,2022-10-11 12:50:00,20221011_1250,0.186,0.139,0.0123,3.084,,1.0,5.0,,0.8432000000000001,0.5456,45.36,98.26,39.05,,,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),,,,,,,,,,,,,,
-31390903576425084107499649578,2022-10-12 13:35:00,20221012_1335,0.192,0.143,0.0465,3.111,,1.0,5.0,,0.7752,0.952,146.23,153.99,54.73,,,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),,,,,,,,,,,,,,
-31390903576425084107499649578,2022-10-14 13:20:00,20221014_1320,0.144,0.108,0.0478,1.76,,1.0,5.0,,0.7909,0.9799,37.41,132.7,29.32,,,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),,,,,,,,,,,,,,
+% ── Figure: L2 scatter validation (all sensors vs AERONET) ──
+% image_1 = Cell 15, 1st output figure (NGHIA_DO: Himawari L2 + MODIS + VIIRS scatter panels)
+% image_2 = Cell 15, 2nd output figure (Bac_Lieu: Himawari L2 + MODIS + VIIRS scatter panels)
 
+\subsubsection{Northern Vietnam — Nghia Do, Hanoi}
 
-/home/slow_data/Air_Quality/MODIS_MCD19A2/stations_aod/MODIS_AQI_31390908889087377344742439468.csv
-Công viên nhân chính:
-ID,timestamp,Timestamp_MODIS_str,Optical_Depth_047,Optical_Depth_055,AOD_Uncertainty,Column_WV,AngstromExp_470-780,AOD_QA,FineModeFraction,Injection_Height,cosSZA,cosVZA,RelAZ,Scattering_Angle,Glint_Angle,Source,Timestamp,Name,Latitude,Longitude,AQI,PM2.5,PM10,CO,NO2,O3,SO2,Temperature,Humidity,Pressure,Wind Speed,Timestamp_DT
-31390908889087377344742439468,2022-09-06 14:10:00,20220906_1410,0.4,0.303,0.0141,2.851,,1089.0,5.0,,0.8176,0.4372,165.77,149.25,98.29,,,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),,,,,,,,,,,,,,
-31390908889087377344742439468,2022-10-11 12:50:00,20221011_1250,0.136,0.101,0.0134,3.142,,1.0,5.0,,0.8433,0.544,46.17,98.43,39.55,,,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),,,,,,,,,,,,,,
-31390908889087377344742439468,2022-10-12 13:35:00,20221012_1335,0.016,0.012,0.0443,3.168,,865.0,5.0,,0.7756000000000001,0.9539,143.79,153.20000000000002,54.04,,,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),,,,,,,,,,,,,,
-31390908889087377344742439468,2022-10-14 13:20:00,20221014_1320,0.315,0.238,0.1119,1.854,,865.0,5.0,,0.7913,0.9783,41.45,132.78,29.65,,,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),,,,,,,,,,,,,,
-31390908889087377344742439468,2022-10-15 14:05:00,20221015_1405,0.247,0.186,0.0124,2.626,,1.0,5.0,,0.7030000000000001,0.5052,148.83,151.68,99.78,,,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),,,,,,,,,,,,,,
+The Nghia Do AERONET station (21.048°N, 105.800°E) recorded 13{,}172 quality-assured
+observations (Feb 2022--Apr 2026) with a mean AOD$_{550}$ of 0.699. Among Level-2
+products, VIIRS NOAA-20 achieved the strongest agreement ($R = 0.915$,
+$R^2 = 0.837$, RMSE $= 0.271$, Bias $= +0.022$, \%EE $= 65.0$\%, $N = 103$),
+using the nearest-pixel extraction (distance $\leq 25$~km).
+MODIS MCD19A2 yielded $R = 0.856$ ($R^2 = 0.733$) with a negative bias
+of $-0.146$ (RMSE~$= 0.295$; \%EE $= 56.9$\%; $N = 239$). Himawari-8 Level-2
+contributed the largest sample ($N = 9{,}756$) but the weakest instantaneous
+correlation ($R = 0.701$, RMSE $= 0.481$, \%EE $= 34.5$\%).
+For the aggregated product, Himawari-8 Level-3 achieved $R = 0.869$
+($R^2 = 0.756$, $N = 182$), though with the largest negative bias ($-0.316$)
+and a low \%EE of 24.7\%, suggesting systematic underestimation of daily mean AOD.
+All polar-orbit sensors exhibit negative biases consistent with
+cloud-screening-induced removal of high-AOD retrievals during the summer monsoon
+(Table~\ref{tab:hanoi_validation}).
 
----
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{image_1}
+    \caption{L2-level scatter validation at Nghia Do, Hanoi: Himawari-8 L2, MODIS MCD19A2, and VIIRS NOAA-20 vs.\ AERONET AOD$_{550}$. Grey shading denotes the expected error (EE) envelope $\pm(0.05 + 0.15 \times \text{AOD}_{\text{AERONET}})$.}
+    \label{fig:hanoi_scatter}
+\end{figure}
+% image_1 = Cell 15, 1st output (NGHIA_DO L2 scatter: 3 panels for Himawari L2, MODIS, VIIRS)
 
-## 🎯 TASK
+\begin{table*}[t]
+    \centering
+    \caption{Validation metrics at Nghia Do, Hanoi (21.048°N, 105.800°E). L2 products matched within $\pm 30$~min; L3 uses daily-mean aggregation. VIIRS uses nearest-pixel extraction ($\leq 25$~km).}
+    \label{tab:hanoi_validation}
+    \renewcommand{\arraystretch}{1.2}
+    \setlength{\extrarowheight}{2pt}
+    \begin{tabularx}{\textwidth}{X c c c c c c c c}
+        \hline
+        \textbf{Satellite Product} & \textbf{Level} & \textbf{$N$} & \textbf{$R$} & \textbf{$R^2$} & \textbf{RMSE} & \textbf{MAE} & \textbf{Bias} & \textbf{\%EE} \\
+        \hline
+        VIIRS (NOAA-20) & L2 & 103     & 0.915 & 0.837 & 0.271 & 0.163 & $+0.022$ & 65.0 \\
+        MODIS MCD19A2   & L2 & 239     & 0.856 & 0.733 & 0.295 & 0.182 & $-0.146$ & 56.9 \\
+        Himawari-8      & L2 & 9,756   & 0.701 & 0.491 & 0.481 & 0.326 & $-0.117$ & 34.5 \\
+        Himawari-8      & L3 & 182     & 0.869 & 0.756 & 0.444 & 0.324 & $-0.316$ & 24.7 \\
+        \hline
+    \end{tabularx}
+\end{table*}
 
-I need to compare AOD between satellite data and ground-based AERONET data.
+\subsubsection{Central Vietnam}
 
-Requirements:
+Central Vietnam lacks a permanent AERONET station. Inter-sensor agreement between
+MODIS and Himawari-8 provides a consistency proxy: $R^2 = 0.474$ with a positive
+bias of $+0.118$ ($N = 480$), substantially weaker than the Northern result
+($R^2 = 0.621$, Bias $= -0.038$, $N = 1{,}712$). This degradation reflects complex
+orographic terrain, heterogeneous aerosol compositions (maritime, biomass burning,
+and urban), and Himawari-8's sensitivity to coastal surface reflectance artefacts.
+Establishing a permanent AERONET station near Đà Nẵng or Huế is strongly
+recommended to constrain these uncertainties.
 
-* Use multiple visualization methods
-* Handle time mismatch:
+\subsubsection{Southern Vietnam — Bac Lieu}
 
-  * VIIRS: sparse (~4–6 AM)
-  * AERONET: full-day (1–24h)
+The Bac Lieu AERONET station (9.30°N, 105.70°E) recorded 15{,}690 measurements
+(Apr 2022--Aug 2025) with a mean AOD$_{550}$ of 0.212. Himawari-8 Level-2 achieved
+$R = 0.733$ (RMSE $= 0.150$, Bias $= -0.021$, \%EE $= 53.6$\%) over 14{,}092
+co-located observations---a marked improvement over the previous subset
+($N = 4{,}142$), confirming robust performance of the geostationary sensor in
+low-AOD maritime environments. MODIS MCD19A2 showed weaker performance
+($R = 0.411$, $N = 413$), likely due to challenges over highly reflective
+agricultural surfaces. VIIRS NOAA-20 achieved
+$R = 0.845$ ($R^2 = 0.714$, RMSE $= 0.143$, Bias $= +0.085$, \%EE $= 45.4$\%,
+$N = 207$).
+Himawari-8 Level-3 achieved the highest correlation at this site
+($R = 0.824$, RMSE $= 0.120$, \%EE $= 67.8$\%, $N = 295$),
+demonstrating that temporal aggregation is particularly beneficial in low-AOD
+environments where scan-to-scan noise dominates (Table~\ref{tab:validation_metrics}).
 
----
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{image_2}
+    \caption{L2-level scatter validation at Bac Lieu: Himawari-8 L2, MODIS MCD19A2, and VIIRS NOAA-20 vs.\ AERONET AOD$_{550}$. Grey shading denotes the expected error (EE) envelope.}
+    \label{fig:baclieu_scatter}
+\end{figure}
+% image_2 = Cell 15, 2nd output (Bac_Lieu L2 scatter: 3 panels for Himawari L2, MODIS, VIIRS)
 
-## ⚠️ CONSTRAINTS
+\begin{table*}[t]
+    \caption{Validation metrics at Bac Lieu (9.30°N, 105.70°E), Southern Vietnam. L2 products matched within $\pm 30$~min; L3 uses daily-mean aggregation.}
+    \label{tab:validation_metrics}
+    \centering
+    \renewcommand{\arraystretch}{1.2}
+    \setlength{\extrarowheight}{2pt}
+    \begin{tabularx}{\textwidth}{X c c c c c c c c}
+        \hline
+        \textbf{Satellite Product} & \textbf{Level} & \textbf{$N$} & \textbf{$R$} & \textbf{$R^2$} & \textbf{RMSE} & \textbf{MAE} & \textbf{Bias} & \textbf{\%EE} \\
+        \hline
+        VIIRS (NOAA-20) & L2 & 207     & 0.845 & 0.714 & 0.143 & 0.111 & $+0.085$ & 45.4 \\
+        Himawari-8      & L2 & 14,092  & 0.733 & 0.537 & 0.150 & 0.103 & $-0.021$ & 53.6 \\
+        MODIS MCD19A2   & L2 & 413     & 0.411 & 0.169 & 0.155 & 0.120 & $+0.013$ & 42.4 \\
+        Himawari-8      & L3 & 295     & 0.824 & 0.678 & 0.120 & 0.082 & $+0.005$ & 67.8 \\
+        \hline
+    \end{tabularx}
+\end{table*}
 
-* Only compare same level:
+\subsubsection{Combined Multi-Sensor Overview}
 
-  * L2 ↔ L2 ↔ AERONET
-  * L3 ↔ D3 ↔ AERONET
-* DO NOT compare L2 with D3
+Figure~\ref{fig:combined_scatter} presents all L2 satellite retrievals overlaid on
+a single scatter plot per station, facilitating direct visual comparison of sensor
+performance. At Nghia Do, VIIRS points cluster tightly around the 1:1 line while
+Himawari-8 exhibits wider scatter; at Bac Lieu, VIIRS and Himawari-8 show
+complementary strengths at different AOD regimes.
 
----
-
-## 🧠 REQUIREMENTS
-
-* Use scientific methods from AOD validation papers
-* Implement:
-
-  * time matching (nearest / averaging)
-  * scatter plot + regression
-  * metrics: R, RMSE, MAE, Bias
-  * time series comparison
-
----
-
-## 📤 OUTPUT
-
-Write full Jupyter Notebook code to:
-
-/home/work1/projects/Air_Quality/VIIRS/AOD_Comparison.ipynb
-
-* Use real file paths
-* Clean, modular code
-* Include markdown explanations
-* Do not load unnecessary full data
-
----
-
-## 🚫 IMPORTANT
-
-* Do NOT modify sample data above
-* Use them to correctly understand schema
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{image_3}
+    \caption{Combined scatter of all L2 sensors vs.\ AERONET AOD$_{550}$ at Nghia Do (left) and Bac Lieu (right).}
+    \label{fig:combined_scatter}
+\end{figure}
+% image_3 = Cell 34 output (all L2 sensors overlaid per station)

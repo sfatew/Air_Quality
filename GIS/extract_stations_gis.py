@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 # ---------------------------------------------------------------------------
 
 STATIONS_FILE = "/home/work1/projects/Air_Quality/Masterdata/envisoft_station_map.csv"
-OUTPUT_DIR    = "/home/slow_data/Air_Quality/GIS/station_gis_extracted"
+OUTPUT_DIR    = "/home/slow_data/Air_Quality/GIS/station_gis_extracted_ver2"
 
 # ---------------------------------------------------------------------------
 # Run-type TIF field definitions

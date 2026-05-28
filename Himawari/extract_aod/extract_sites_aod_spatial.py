@@ -37,21 +37,21 @@ from tqdm import tqdm
 #  Configuration — adjust these paths to your workstation
 # ══════════════════════════════════════════════════════════════════════
 
-STATION_CSV   = "/home/work1/projects/Air_Quality/Masterdata/envisoft_station_map.csv"
+STATION_CSV   = "/home/work1/projects/Air_Quality/Masterdata/AERONET_sites.csv"
 LOG_DIR       = "/home/slow_data/Air_Quality/Himawari/logs"
 
 # ── L2 configuration ───────────────────────────────────────────────────
 L2_AOD_DIR    = "/home/slow_data/Air_Quality/Himawari/L2_AOD"
-L2_OUTPUT_DIR = "/home/slow_data/Air_Quality/Himawari/station_aod_v3/L2"
+L2_OUTPUT_DIR = "/home/slow_data/Air_Quality/Himawari/sites_aod_v3/L2"
 L2_GLOB_TEMPLATE = r'{year}??/??/??/aod_vietnam_NC_H??_*_L2ARP031_FLDK.*.tif'
 
 # 5×5 for primary AOD; exact pixel for retrieval metadata
-L2_GRID_BANDS  = {'AOT': 1, 'Uncertainty': 2, 'AE': 3, 'QA_flag': 4, 'SSA': 5, 'RF': 6}
-L2_EXACT_BANDS = {}
+L2_GRID_BANDS  = {'AOT': 1}
+L2_EXACT_BANDS = {'Uncertainty': 2, 'AE': 3, 'QA_flag': 4, 'SSA': 5, 'RF': 6}
 
 # ── L3 configuration ───────────────────────────────────────────────────
 L3_AOD_DIR    = "/home/slow_data/Air_Quality/Himawari/L3_AOD"
-L3_OUTPUT_DIR = "/home/slow_data/Air_Quality/Himawari/station_aod_v3/L3"
+L3_OUTPUT_DIR = "/home/slow_data/Air_Quality/Himawari/sites_aod_v3/L3"
 L3_GLOB_TEMPLATE = r'{year}??/*/aod_vietnam_H??_*_1HARP031_FLDK.*.tif'
 
 # Band index starts at 2 for L3 (band 1 is unused / a different variable)

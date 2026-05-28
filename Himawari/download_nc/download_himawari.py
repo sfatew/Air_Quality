@@ -13,12 +13,16 @@ root_dir = current_path.parents[2]
 
 sys.path.append(str(root_dir))
 
-from config.config import aod_config
 
 # --- FTP Configuration ---
-FTP_HOST = "ftp.ptree.jaxa.jp"
-FTP_USER = aod_config.FTP_USER
-FTP_PASS = aod_config.FTP_PASS
+import yaml
+
+with open("config/config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+
+FTP_HOST = config['HIMAWARI']['FTP_HOST']
+FTP_USER = config['HIMAWARI']['FTP_USER']
+FTP_PASS = config['HIMAWARI']['FTP_PASS']
 
 MAX_CONSECUTIVE_MISSING = 24
 LOG_DIR = "/home/slow_data/Air_Quality/Himawari/logs"

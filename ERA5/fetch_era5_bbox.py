@@ -43,7 +43,9 @@ import calendar
 import glob
 import os
 import tempfile
+import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cdsapi
 import numpy as np
@@ -52,8 +54,16 @@ import xarray as xr
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 BBOX         = [23.5, 102.0, 8.0, 110.0]   # [N, W, S, E] — CDS convention
-START        = (2022, 9)
+START        = (2026, 3)
 END          = (2026, 4)
+
+# How many months to download concurrently.
+# CDS fair-use limit is ~20 active jobs per user; 2 jobs per month → keep ≤8.
+MAX_WORKERS  = 2
+
+# Retry settings for CDS queue-rejection errors
+MAX_RETRIES  = 5      # max attempts per month
+RETRY_DELAY  = 120    # seconds before first retry (doubles each attempt)
 
 OUTPUT_DIR   = "/home/slow_data/Air_Quality/ERA5"
 OUTPUT_FILE  = os.path.join(OUTPUT_DIR, "Vietnam_ERA5_bbox.nc")
@@ -116,21 +126,26 @@ def _build_request(year: int, month: int, variables: list[str]) -> dict:
     }
 
 
-def download_month(c: cdsapi.Client, year: int, month: int,
+def download_month(year: int, month: int,
                    out_instant: str, out_accum: str) -> None:
-    """Submit two separate CDS requests (instant / accum) for one month."""
-    print(f"    → requesting instant variables …")
-    c.retrieve(
-        "reanalysis-era5-single-levels",
-        _build_request(year, month, CDS_INSTANT_VARS),
-        out_instant,
-    )
-    print(f"    → requesting accumulated variables …")
-    c.retrieve(
-        "reanalysis-era5-single-levels",
-        _build_request(year, month, CDS_ACCUM_VARS),
-        out_accum,
-    )
+    """
+    Submit instant and accumulated CDS requests concurrently for one month.
+    Each thread gets its own cdsapi.Client so sessions are not shared.
+    """
+    def _fetch(variables, out_path):
+        # quiet=True suppresses per-request progress spam when many months run
+        client = cdsapi.Client(quiet=True)
+        client.retrieve(
+            "reanalysis-era5-single-levels",
+            _build_request(year, month, variables),
+            out_path,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fi = ex.submit(_fetch, CDS_INSTANT_VARS, out_instant)
+        fa = ex.submit(_fetch, CDS_ACCUM_VARS,   out_accum)
+        fi.result()   # re-raises any exception from the thread
+        fa.result()
 
 
 # ── Open a CDS download (zip or plain nc) ─────────────────────────────────────
@@ -176,12 +191,40 @@ def open_month_datasets(instant_path: str, accum_path: str) -> xr.Dataset:
     ds_instant = _open_one_file(instant_path)
     ds_accum   = _open_one_file(accum_path)
 
-    # Sanity-check time alignment before merging
+    t_i = ds_instant.time.values
+    t_a = ds_accum.time.values
+
     if not ds_instant.time.equals(ds_accum.time):
-        raise ValueError(
-            "Time axes of instant and accum downloads do not match — "
-            "CDS may have returned inconsistent data."
+        # Diagnose the mismatch before deciding what to do
+        _safe_print(
+            f"    ⚠ time mismatch: instant has {len(t_i)} steps "
+            f"({t_i[0]} … {t_i[-1]}), "
+            f"accum has {len(t_a)} steps ({t_a[0]} … {t_a[-1]})"
         )
+        # Tolerate a minor tail difference (CDS sometimes returns N vs N±1 hours
+        # for the most recent months).  Take the intersection.
+        common = np.intersect1d(t_i, t_a)
+        if len(common) == 0:
+            msg = (
+                "Time axes of instant and accum downloads share no common timestamps"
+                " — CDS returned completely inconsistent data.\n"
+                f"  instant: {len(t_i)} steps  {t_i[0]} ... {t_i[-1]}\n"
+                f"  accum  : {len(t_a)} steps  {t_a[0]} ... {t_a[-1]}"
+            )
+            raise ValueError(msg)
+        dropped = max(len(t_i), len(t_a)) - len(common)
+        _safe_print(f"    → using {len(common)} common timestamps (dropped {dropped} non-overlapping)")
+        ds_instant = ds_instant.sel(time=common)
+        ds_accum   = ds_accum.sel(time=common)
+
+    # Drop CDS metadata variables that differ between instant/accum files
+    # (expver = experiment version, changes for recent near-real-time data)
+    for drop_var in ("expver", "number"):
+        if drop_var in ds_instant:
+            ds_instant = ds_instant.drop_vars(drop_var)
+        if drop_var in ds_accum:
+            ds_accum = ds_accum.drop_vars(drop_var)
+
     return xr.merge([ds_instant, ds_accum], compat="no_conflicts")
 
 
@@ -312,49 +355,114 @@ def postprocess(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def fetch_bbox() -> None:
-    months = list(iter_months(START, END))
-    print(f"ERA5 bounding-box download: {len(months)} months")
-    print(f"Bbox : N={BBOX[0]} W={BBOX[1]} S={BBOX[2]} E={BBOX[3]}")
-    print(f"Range: {START[0]}-{START[1]:02d}  →  {END[0]}-{END[1]:02d}\n")
+# ── Per-month worker (called from thread pool) ────────────────────────────────
+_print_lock = threading.Lock()
 
-    c = cdsapi.Client()
+def _safe_print(*args, **kwargs):
+    with _print_lock:
+        print(*args, **kwargs)
 
-    for i, (year, month) in enumerate(months):
-        tag      = f"{year}{month:02d}"
-        clean_nc = os.path.join(MONTHLY_DIR, f"era5_{tag}.nc")
 
-        if os.path.exists(clean_nc):
-            print(f"[{i+1:2d}/{len(months)}] {year}-{month:02d}  skip (cached)")
-            continue
+def _process_month(i: int, total: int, year: int, month: int) -> str:
+    """
+    Download + post-process one month.  Returns the path to the clean .nc file.
+    Retries up to MAX_RETRIES times on CDS queue-rejection errors.
+    Designed to be called from a ThreadPoolExecutor worker.
+    """
+    import time
 
-        raw_instant = os.path.join(MONTHLY_DIR, f"era5_{tag}_instant.nc")
-        raw_accum   = os.path.join(MONTHLY_DIR, f"era5_{tag}_accum.nc")
+    tag      = f"{year}{month:02d}"
+    clean_nc = os.path.join(MONTHLY_DIR, f"era5_{tag}.nc")
 
-        print(f"[{i+1:2d}/{len(months)}] {year}-{month:02d}  requesting …")
-        download_month(c, year, month, raw_instant, raw_accum)
+    if os.path.exists(clean_nc):
+        _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  skip (cached)")
+        return clean_nc
 
-        print(f"    → post-processing …")
-        ds_raw   = open_month_datasets(raw_instant, raw_accum)
-        ds_clean = postprocess(ds_raw)   # ← still in UTC here
+    raw_instant = os.path.join(MONTHLY_DIR, f"era5_{tag}_instant.nc")
+    raw_accum   = os.path.join(MONTHLY_DIR, f"era5_{tag}_accum.nc")
 
-        # Shift timestamps to UTC+7 (Vietnam Standard Time) AFTER deaccumulation
-        times_utc7 = ds_clean.time.values + np.timedelta64(7 * 3600, "s")
-        ds_clean   = ds_clean.assign_coords(time=times_utc7)
-        ds_clean.time.attrs = {
-            "long_name": "time",
-            "note":      "UTC+7 (Asia/Bangkok), timezone-naive",
-        }
-
-        ds_clean.to_netcdf(clean_nc)
-
-        # Clean up raw downloads only after successful save
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        # Clean up any partial downloads from a previous attempt
         for f in (raw_instant, raw_accum):
             if os.path.exists(f):
                 os.remove(f)
 
-        print(f"    → saved  → {os.path.basename(clean_nc)}")
+        try:
+            if attempt == 1:
+                _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  requesting …")
+            else:
+                delay = RETRY_DELAY * (2 ** (attempt - 2))  # 120 s, 240 s, 480 s …
+                _safe_print(
+                    f"[{i:2d}/{total}] {year}-{month:02d}  retry {attempt}/{MAX_RETRIES} "
+                    f"(waiting {delay}s) …"
+                )
+                time.sleep(delay)
+
+            download_month(year, month, raw_instant, raw_accum)
+            last_exc = None
+            break  # success — exit retry loop
+
+        except Exception as exc:
+            last_exc = exc
+            # Only retry on CDS queue-limit rejections; re-raise anything else
+            if "temporarily limited" not in str(exc) and "rejected" not in str(exc).lower():
+                raise
+
+    if last_exc is not None:
+        raise last_exc
+
+    _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  post-processing …")
+    ds_raw   = open_month_datasets(raw_instant, raw_accum)
+    ds_clean = postprocess(ds_raw)
+
+    # Shift timestamps to UTC+7 AFTER deaccumulation
+    times_utc7 = ds_clean.time.values + np.timedelta64(7 * 3600, "s")
+    ds_clean   = ds_clean.assign_coords(time=times_utc7)
+    ds_clean.time.attrs = {
+        "long_name": "time",
+        "note":      "UTC+7 (Asia/Bangkok), timezone-naive",
+    }
+
+    ds_clean.to_netcdf(clean_nc)
+
+    for f in (raw_instant, raw_accum):
+        if os.path.exists(f):
+            os.remove(f)
+
+    _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  saved → {os.path.basename(clean_nc)}")
+    return clean_nc
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def fetch_bbox() -> None:
+    months = list(iter_months(START, END))
+    total  = len(months)
+    print(f"ERA5 bounding-box download: {total} months  (MAX_WORKERS={MAX_WORKERS})")
+    print(f"Bbox : N={BBOX[0]} W={BBOX[1]} S={BBOX[2]} E={BBOX[3]}")
+    print(f"Range: {START[0]}-{START[1]:02d}  →  {END[0]}-{END[1]:02d}\n")
+
+    # Download up to MAX_WORKERS months concurrently.
+    # Each month itself downloads its 2 CDS jobs (instant + accum) in parallel,
+    # so the total active CDS jobs = MAX_WORKERS * 2.  Keep MAX_WORKERS ≤ 8.
+    failed = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(_process_month, i + 1, total, y, m): (y, m)
+            for i, (y, m) in enumerate(months)
+        }
+        for fut in as_completed(futures):
+            y, m = futures[fut]
+            try:
+                fut.result()
+            except Exception as exc:
+                _safe_print(f"  ✗  {y}-{m:02d} FAILED: {exc}")
+                failed.append((y, m))
+
+    if failed:
+        print(f"\nWarning: {len(failed)} month(s) failed and will be missing from the merge:")
+        for y, m in sorted(failed):
+            print(f"  {y}-{m:02d}")
 
     # ── Merge monthly files ────────────────────────────────────────────────────
     monthly_files = sorted(glob.glob(os.path.join(MONTHLY_DIR, "era5_??????.nc")))
@@ -363,15 +471,21 @@ def fetch_bbox() -> None:
         return
 
     print(f"\nMerging {len(monthly_files)} monthly files → {OUTPUT_FILE}")
-    ds_all = xr.open_mfdataset(monthly_files, combine="by_coords")
+    # open_mfdataset requires dask; use a plain loop instead
+    datasets = []
+    for fp in monthly_files:
+        ds = xr.open_dataset(fp, engine="netcdf4")
+        # Drop CDS metadata coords that vary across files and block concat
+        for drop_var in ("expver", "number"):
+            if drop_var in ds:
+                ds = ds.drop_vars(drop_var)
+        datasets.append(ds)
+    ds_all = xr.concat(datasets, dim="time")
 
-    # FIX: use calendar.monthrange to get the true last day of END month,
-    # instead of hardcoding day 28 which drops data in months with 29–31 days.
     last_day = calendar.monthrange(END[0], END[1])[1]
     t_end    = pd.Timestamp(f"{END[0]}-{END[1]:02d}-{last_day:02d} 23:00")
     ds_all   = ds_all.sel(time=slice(None, t_end))
 
-    # Normalise spatial dimension names (CDS uses 'latitude'/'longitude')
     rename_dims = {}
     if "latitude"  not in ds_all.dims and "lat" in ds_all.dims:
         rename_dims["lat"] = "latitude"

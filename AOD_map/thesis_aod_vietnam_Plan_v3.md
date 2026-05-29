@@ -68,7 +68,7 @@ What is genuinely new:
 
 | Parameter                  | Value                                                                                |
 | -------------------------- | ------------------------------------------------------------------------------------ |
-| Spatial domain             | Vietnam + ~2° buffer (8°N–24°N, 100°E–110°E)                                         |
+| Spatial domain             | Vietnam + ~2° buffer (8°N–23.5°N, 102°E–110°E)                                         |
 | Output grid                | 0.05° × 0.05° (~5.5 km)                                                              |
 | Native temporal resolution | 30-minute slots (48 files/day)                                                       |
 | Aggregated outputs         | Daily, monthly, seasonal                                                             |

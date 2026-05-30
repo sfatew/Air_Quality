@@ -17,7 +17,17 @@ import requests
 import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from config.config import modis_config
+import yaml
+
+yaml_path = os.path.join(parent_dir, 'config', 'config.yaml')
+with open(yaml_path, 'r') as file:
+    config_data = yaml.safe_load(file)
+
+# Access your modis configuration from the YAML structure
+# (Adjust the key 'modis_config' based on how your YAML file is structured)
+modis_config = config_data.get('MODIS')
+
+# print(modis_config)
 
 try:
     from StringIO import StringIO   # python2
@@ -32,10 +42,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 ################################################################################
 
 SERVER = 'https://ladsweb.modaps.eosdis.nasa.gov/archive/allData/61/MCD19A2'
-DOWNLOAD_DIR = r'/home/slow_data/Air_Quality/MODIS_MCD19A2'
-TOKEN = modis_config.TOKEN
+DOWNLOAD_DIR = r'/home/slow_data/Air_Quality/MODIS_MCD19A2/raw'
+TOKEN = modis_config.get('TOKEN')
 
-START_DATE_STR = "2022-09-01"
+START_DATE_STR = "2026-03-01"
 print(f"📅 Using date: {START_DATE_STR}")
 
 TILES = ["h27v06", "h28v06", "h27v07", "h28v07", "h28v08"]

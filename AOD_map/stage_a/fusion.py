@@ -30,6 +30,13 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    import cupy as cp
+    _xp = cp
+except ImportError:
+    cp = None
+    _xp = np
+
 from config import (
     SENSOR_RMSE_PRIOR,
     MODIS_SOUTH_WEIGHT_FACTOR,
@@ -108,25 +115,6 @@ def _assign_confidence(
     return flag
 
 
-# ── Region weight modifier ────────────────────────────────────────────────────
-
-def _region_weight_modifier(
-    sensor: str,
-    lat_2d: np.ndarray,
-) -> np.ndarray:
-    """Return a (NLAT, NLON) multiplicative modifier for sensor–region interactions.
-
-    Applies:
-      • MODIS MAIAC in the south: multiply weight by MODIS_SOUTH_WEIGHT_FACTOR
-        (R=0.41 at Bac Lieu makes it unreliable in the Mekong Delta).
-    """
-    modifier = np.ones((NLAT, NLON), dtype=np.float32)
-    if sensor == 'modis_maiac':
-        south = lat_2d < CENTRAL_SOUTH_LAT
-        modifier[south] = MODIS_SOUTH_WEIGHT_FACTOR
-    return modifier
-
-
 # ── Main fusion function ──────────────────────────────────────────────────────
 
 def fuse(
@@ -155,84 +143,82 @@ def fuse(
     if rmse_dict is None:
         rmse_dict = load_rmse()
 
+    xp     = _xp
     season = 'dry' if month in DRY_MONTHS else 'wet'
     shape  = (NLAT, NLON)
 
-    # --- build per-sensor weight grids and track presence ---
-    weighted_sum  = np.zeros(shape, dtype=np.float64)
-    weight_total  = np.zeros(shape, dtype=np.float64)
-    weighted_sq   = np.zeros(shape, dtype=np.float64)   # for std dev
-    dominant_wt   = np.zeros(shape, dtype=np.float64)
-    dominant_code = np.zeros(shape, dtype=np.int8)
-    n_sensors     = np.zeros(shape, dtype=np.int8)
+    # Region codes on GPU: 0=south, 1=central, 2=north (avoids string arrays)
+    region_code = np.where(lat_2d >= NORTH_CENTRAL_LAT, 2,
+                           np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1)).astype(np.int8)
+    region_code_d = xp.asarray(region_code)
+
+    weighted_sum_d  = xp.zeros(shape, dtype=np.float64)
+    weight_total_d  = xp.zeros(shape, dtype=np.float64)
+    weighted_sq_d   = xp.zeros(shape, dtype=np.float64)
+    dominant_wt_d   = xp.zeros(shape, dtype=np.float64)
+    dominant_code_d = xp.zeros(shape, dtype=np.int8)
+    n_sensors_d     = xp.zeros(shape, dtype=np.int8)
     sensor_has_data: dict[str, np.ndarray] = {}
 
-    # Assign a coarse region label per grid cell for RMSE look-up
-    region_grid = np.where(
-        lat_2d >= NORTH_CENTRAL_LAT, 'north',
-        np.where(lat_2d < CENTRAL_SOUTH_LAT, 'south', 'central')
-    )
+    _reg_codes = ((0, 'south'), (1, 'central'), (2, 'north'))
 
     for sensor, aod in sensor_grids.items():
         if aod is None:
             continue
         has = np.isfinite(aod) & (aod >= 0)
         sensor_has_data[sensor] = has
-
         if not np.any(has):
             continue
 
-        # Look up RMSE per cell using vectorised region mapping
-        # Majority of cells: look up from 3 possible region values
-        rmse_arr = np.full(shape, np.nan, dtype=np.float64)
-        for reg in ('north', 'central', 'south'):
+        # Build per-cell RMSE on GPU using integer region codes
+        rmse_arr_d = xp.full(shape, np.nan, dtype=np.float64)
+        for code, reg in _reg_codes:
             key = (sensor, reg)
             rmse_val = rmse_dict.get(key, rmse_dict.get((sensor, 'north'), np.nan))
-            rmse_arr[region_grid == reg] = rmse_val
+            rmse_arr_d[region_code_d == code] = rmse_val
 
-        # ICW weight = 1 / RMSE²
-        w_base = np.where(np.isfinite(rmse_arr) & (rmse_arr > 0),
-                          1.0 / rmse_arr**2, 0.0)
-        # Region modifier (e.g. MAIAC downweighted in south)
-        w = w_base * _region_weight_modifier(sensor, lat_2d)
+        # ICW weight = 1 / RMSE²; apply MODIS south downweight inline
+        w_d = xp.where(xp.isfinite(rmse_arr_d) & (rmse_arr_d > 0),
+                       1.0 / rmse_arr_d ** 2, 0.0)
+        if sensor == 'modis_maiac':
+            w_d = xp.where(region_code_d == 0, w_d * MODIS_SOUTH_WEIGHT_FACTOR, w_d)
 
-        valid_w = has & (w > 0)
-        code = SENSOR_CODES.get(sensor, 0)
+        aod_d     = xp.asarray(aod)
+        has_d     = xp.asarray(has)
+        valid_w_d = has_d & (w_d > 0)
+        s_code    = SENSOR_CODES.get(sensor, 0)
 
-        np.add.at(weighted_sum,  np.where(valid_w, 1, 0).astype(bool), 0)  # dummy
-        # Vectorised update
-        weighted_sum[valid_w]  += w[valid_w] * aod[valid_w]
-        weight_total[valid_w]  += w[valid_w]
-        weighted_sq[valid_w]   += w[valid_w] * aod[valid_w]**2
-        n_sensors[valid_w]     += 1
+        weighted_sum_d[valid_w_d]  += w_d[valid_w_d] * aod_d[valid_w_d]
+        weight_total_d[valid_w_d]  += w_d[valid_w_d]
+        weighted_sq_d[valid_w_d]   += w_d[valid_w_d] * aod_d[valid_w_d] ** 2
+        n_sensors_d[valid_w_d]     += 1
 
-        # Track dominant sensor (highest weight)
-        update = valid_w & (w > dominant_wt)
-        dominant_wt[update]   = w[update]
-        dominant_code[update] = code
+        update_d = valid_w_d & (w_d > dominant_wt_d)
+        dominant_wt_d[update_d]   = w_d[update_d]
+        dominant_code_d[update_d] = s_code
 
-    # Merged AOD (safe division: avoid 0/0 warning from np.where eager evaluation)
-    has_any = weight_total > 0
-    safe_w  = np.where(has_any, weight_total, 1.0)   # replace 0 → 1 to avoid divide
-    aod_merged = np.where(has_any, weighted_sum / safe_w, np.nan).astype(np.float32)
+    has_any_d = weight_total_d > 0
+    safe_w_d  = xp.where(has_any_d, weight_total_d, 1.0)
+    aod_merged = np.asarray(
+        xp.where(has_any_d, weighted_sum_d / safe_w_d, np.nan).astype(np.float32)
+    )
 
-    # Cross-sensor spread (weighted std dev)
-    # Var = E[w·x²]/E[w] - (E[w·x]/E[w])²
-    variance = np.where(
-        has_any & (n_sensors > 1),
-        weighted_sq / safe_w - (weighted_sum / safe_w) ** 2,
+    variance_d = xp.where(
+        has_any_d & (n_sensors_d > 1),
+        weighted_sq_d / safe_w_d - (weighted_sum_d / safe_w_d) ** 2,
         np.nan,
     )
-    variance   = np.clip(variance, 0, None)
-    aod_std    = np.where(np.isfinite(variance), np.sqrt(variance), np.nan).astype(np.float32)
+    variance_d = xp.clip(variance_d, 0, None)
+    aod_std = np.asarray(
+        xp.where(xp.isfinite(variance_d), xp.sqrt(variance_d), np.nan).astype(np.float32)
+    )
 
-    # Confidence flag
     conf_flag = _assign_confidence(sensor_has_data)
 
     return {
-        'aod_merged':       aod_merged,
-        'aod_std':          aod_std,
-        'n_sensors':        n_sensors.astype(np.int8),
-        'dominant_sensor':  dominant_code,
-        'confidence_flag':  conf_flag,
+        'aod_merged':      aod_merged,
+        'aod_std':         aod_std,
+        'n_sensors':       np.asarray(n_sensors_d),
+        'dominant_sensor': np.asarray(dominant_code_d),
+        'confidence_flag': conf_flag,
     }

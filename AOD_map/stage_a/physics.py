@@ -32,6 +32,13 @@ import numpy as np
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
 
+try:
+    import cupy as cp
+    _xp = cp
+except ImportError:
+    cp = None
+    _xp = np
+
 from config import (
     ERA5_FILE, GAMMA, PBLH_MIN,
     LATS, LONS, NLAT, NLON,
@@ -174,13 +181,18 @@ def apply_physics_correction(
         rh   = era5['RH']
         pblh = era5['PBLH']
 
-    hygro_factor = np.power(1.0 - rh / 100.0, GAMMA, dtype=np.float64)
-    hygro_factor = np.clip(hygro_factor, 0.0, 1.0).astype(np.float32)
+    xp       = _xp
+    rh_d     = xp.asarray(rh.astype(np.float64))
+    pblh_d   = xp.asarray(pblh.astype(np.float64))
+    aod_d    = xp.asarray(aod.astype(np.float64))
 
-    aod_phys = aod.astype(np.float64) * hygro_factor / pblh
-    aod_phys = np.where(np.isfinite(aod), aod_phys, np.nan).astype(np.float32)
+    hygro_d  = xp.power(1.0 - rh_d / 100.0, GAMMA)
+    hygro_d  = xp.clip(hygro_d, 0.0, 1.0)
 
-    return aod_phys, rh, pblh
+    aod_phys_d = aod_d * hygro_d / pblh_d
+    aod_phys_d = xp.where(xp.isfinite(aod_d), aod_phys_d, np.nan).astype(np.float32)
+
+    return np.asarray(aod_phys_d), rh, pblh
 
 
 def close_era5() -> None:

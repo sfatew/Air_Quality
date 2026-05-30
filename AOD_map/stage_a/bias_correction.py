@@ -34,6 +34,13 @@ from typing import Optional
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
+try:
+    import cupy as cp
+    _xp = cp
+except ImportError:
+    cp = None
+    _xp = np
+
 from config import (
     AERONET_SITES, DRY_MONTHS,
     CDF_N_QUANTILES, CDF_MIN_PAIRS,
@@ -47,11 +54,15 @@ from config import (
 def _haversine_km(lat1: float, lon1: float, lat2: np.ndarray,
                   lon2: np.ndarray) -> np.ndarray:
     """Vectorised great-circle distance (km)."""
-    R = EARTH_RADIUS_KM
-    dlat = np.radians(lat2 - lat1)
-    dlon = np.radians(lon2 - lon1)
-    a = np.sin(dlat / 2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon / 2)**2
-    return R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    xp   = _xp
+    lat2 = xp.asarray(lat2)
+    lon2 = xp.asarray(lon2)
+    cos_lat1 = float(np.cos(np.radians(lat1)))
+    R    = EARTH_RADIUS_KM
+    dlat = xp.radians(lat2 - lat1)
+    dlon = xp.radians(lon2 - lon1)
+    a = xp.sin(dlat / 2) ** 2 + cos_lat1 * xp.cos(xp.radians(lat2)) * xp.sin(dlon / 2) ** 2
+    return R * 2 * xp.arctan2(xp.sqrt(a), xp.sqrt(1 - a))
 
 
 # ── Stratum helpers ───────────────────────────────────────────────────────────
@@ -201,8 +212,9 @@ def _idw_weights(lat_2d: np.ndarray, lon_2d: np.ndarray,
                  anchor_lat: float, anchor_lon: float,
                  power: float = 2.0) -> np.ndarray:
     """Return IDW weight array (1 / d^power) for a single anchor site."""
+    xp   = _xp
     dist = _haversine_km(anchor_lat, anchor_lon, lat_2d, lon_2d)
-    dist = np.maximum(dist, 0.001)  # avoid zero-distance singularity
+    dist = xp.maximum(dist, 0.001)
     return 1.0 / dist ** power
 
 
@@ -259,19 +271,20 @@ def apply_correction_grid(
         out[valid] = corr_N.apply(aod_grid[valid])
         return out
 
-    # Both anchors available: IDW blend
+    # Both anchors available: IDW blend (weights on GPU, corrections stay CPU)
+    xp     = _xp
     nghia  = AERONET_SITES['NGHIA_DO']
     bac    = AERONET_SITES['Bac_Lieu']
-    w_N    = _idw_weights(lat_2d, lon_2d, nghia['lat'], nghia['lon'])
-    w_S    = _idw_weights(lat_2d, lon_2d, bac['lat'],  bac['lon'])
+    w_N    = _idw_weights(lat_2d, lon_2d, nghia['lat'], nghia['lon'])  # GPU array
+    w_S    = _idw_weights(lat_2d, lon_2d, bac['lat'],  bac['lon'])     # GPU array
     w_total = w_N + w_S
 
-    corr_n_vals = corr_N.apply(aod_grid)   # (NLAT, NLON)
-    corr_s_vals = corr_S.apply(aod_grid)   # (NLAT, NLON)
+    corr_n_vals = xp.asarray(corr_N.apply(aod_grid))   # PchipInterpolator on CPU → GPU
+    corr_s_vals = xp.asarray(corr_S.apply(aod_grid))
 
     blended = (w_N * corr_n_vals + w_S * corr_s_vals) / w_total
-    out = np.where(valid, blended, np.nan).astype(np.float32)
-    return out
+    out = xp.where(xp.asarray(valid), blended, np.nan).astype(np.float32)
+    return np.asarray(out)
 
 
 # ── Convenience: load all corrections for a sensor set ───────────────────────

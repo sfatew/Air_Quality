@@ -19,6 +19,13 @@ from typing import Optional
 
 import numpy as np
 
+try:
+    import cupy as cp
+    _xp = cp
+except ImportError:
+    cp = None
+    _xp = np
+
 from config import (
     LATS, LONS, NLAT, NLON, GRID_RES,
     LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
@@ -91,47 +98,45 @@ def bin_to_grid(
     if sza is not None: sza = sza[valid]
     if ae  is not None: ae  = ae[valid]
 
-    n_pixels = np.zeros(shape, dtype=np.int16)
-    aod_sum  = np.zeros(shape, dtype=np.float64)
-    aod_sq   = np.zeros(shape, dtype=np.float64)
-    vza_sum  = np.zeros(shape, dtype=np.float64) if vza is not None else None
-    sza_sum  = np.zeros(shape, dtype=np.float64) if sza is not None else None
-    ae_sum   = np.zeros(shape, dtype=np.float64) if ae  is not None else None
+    # GPU-accelerated accumulation via linearised bincount (replaces np.add.at)
+    xp      = _xp
+    rows_d  = xp.asarray(rows)
+    cols_d  = xp.asarray(cols)
+    aod_d   = xp.asarray(aod.astype(np.float64))
+    linear  = (rows_d * NLON + cols_d).astype(np.int64)
+    minlen  = NLAT * NLON
 
-    # Accumulate using numpy add.at (handles repeated indices correctly)
-    np.add.at(n_pixels, (rows, cols), 1)
-    np.add.at(aod_sum,  (rows, cols), aod)
-    np.add.at(aod_sq,   (rows, cols), aod ** 2)
-    if vza is not None:
-        np.add.at(vza_sum, (rows, cols), vza)
-    if sza is not None:
-        np.add.at(sza_sum, (rows, cols), sza)
-    if ae is not None:
-        np.add.at(ae_sum,  (rows, cols), ae)
+    n_pix_d   = xp.bincount(linear, minlength=minlen).reshape(shape)
+    aod_sum_d = xp.bincount(linear, weights=aod_d,      minlength=minlen).reshape(shape)
+    aod_sq_d  = xp.bincount(linear, weights=aod_d ** 2, minlength=minlen).reshape(shape)
+    vza_sum_d = (xp.bincount(linear, weights=xp.asarray(vza.astype(np.float64)), minlength=minlen).reshape(shape)
+                 if vza is not None else None)
+    sza_sum_d = (xp.bincount(linear, weights=xp.asarray(sza.astype(np.float64)), minlength=minlen).reshape(shape)
+                 if sza is not None else None)
+    ae_sum_d  = (xp.bincount(linear, weights=xp.asarray(ae.astype(np.float64)),  minlength=minlen).reshape(shape)
+                 if ae  is not None else None)
 
-    has_data = n_pixels > 0
-    n = n_pixels.astype(np.float64)
-    n[~has_data] = np.nan
+    has_data = n_pix_d > 0
+    n_d = xp.where(has_data, n_pix_d.astype(np.float64), np.nan)
 
-    aod_mean = np.where(has_data, aod_sum / n, np.nan).astype(np.float32)
+    aod_mean = np.asarray(xp.where(has_data, aod_sum_d / n_d, np.nan).astype(np.float32))
 
-    # Population std dev: E[X²] - (E[X])²
-    variance = np.where(has_data, aod_sq / n - (aod_sum / n) ** 2, np.nan)
-    variance = np.clip(variance, 0, None)  # numerical safety
-    aod_std  = np.where(n_pixels >= 2, np.sqrt(variance), np.nan).astype(np.float32)
+    variance = xp.where(has_data, aod_sq_d / n_d - (aod_sum_d / n_d) ** 2, np.nan)
+    variance = xp.clip(variance, 0, None)
+    aod_std  = np.asarray(xp.where(n_pix_d >= 2, xp.sqrt(variance), np.nan).astype(np.float32))
 
-    def _mean_optional(arr_sum, flag):
-        if arr_sum is None:
+    def _mean_optional(arr_sum_d, flag):
+        if arr_sum_d is None:
             return np.full(shape, np.nan, dtype=np.float32)
-        return np.where(flag, arr_sum / n, np.nan).astype(np.float32)
+        return np.asarray(xp.where(flag, arr_sum_d / n_d, np.nan).astype(np.float32))
 
     return {
         'aod_mean': aod_mean,
         'aod_std':  aod_std,
-        'n_pixels': n_pixels,
-        'vza_mean': _mean_optional(vza_sum, has_data),
-        'sza_mean': _mean_optional(sza_sum, has_data),
-        'ae_mean':  _mean_optional(ae_sum,  has_data),
+        'n_pixels': np.asarray(n_pix_d.astype(np.int16)),
+        'vza_mean': _mean_optional(vza_sum_d, has_data),
+        'sza_mean': _mean_optional(sza_sum_d, has_data),
+        'ae_mean':  _mean_optional(ae_sum_d,  has_data),
     }
 
 
@@ -166,26 +171,26 @@ def daily_max_valid(daily_grids: list[dict[str, np.ndarray]]) -> dict[str, np.nd
     shape = (NLAT, NLON)
     n     = len(daily_grids)
 
-    stack = np.full((n, NLAT, NLON), np.nan, dtype=np.float32)
+    xp    = _xp
+    stack = xp.full((n, NLAT, NLON), np.nan, dtype=np.float32)
     for i, g in enumerate(daily_grids):
         aod = g.get('aod_mean')
         if aod is not None:
-            stack[i] = aod
+            stack[i] = xp.asarray(aod)
 
-    n_valid    = np.sum(~np.isnan(stack), axis=0).astype(np.int16)
-    aod_mean   = np.nanmean(stack, axis=0).astype(np.float32)
-    aod_std    = np.nanstd(stack,  axis=0).astype(np.float32)
-    aod_max    = np.nanmax(stack,  axis=0).astype(np.float32)
-    # slot index of max (first occurrence in ties)
-    hour_of_max = np.argmax(
-        np.where(np.isnan(stack), -np.inf, stack), axis=0
+    n_valid_d   = xp.sum(~xp.isnan(stack), axis=0).astype(np.int16)
+    aod_mean_d  = xp.nanmean(stack, axis=0).astype(np.float32)
+    aod_std_d   = xp.nanstd(stack,  axis=0).astype(np.float32)
+    aod_max_d   = xp.nanmax(stack,  axis=0).astype(np.float32)
+    hour_d      = xp.argmax(
+        xp.where(xp.isnan(stack), -np.inf, stack), axis=0
     ).astype(np.int8)
-    hour_of_max[n_valid == 0] = -1
+    hour_d[n_valid_d == 0] = -1
 
     return {
-        'aod_daily_mean':  aod_mean,
-        'aod_daily_std':   aod_std,
-        'n_valid_slots':   n_valid,
-        'aod_daily_max':   aod_max,
-        'hour_of_max':     hour_of_max,
+        'aod_daily_mean': np.asarray(aod_mean_d),
+        'aod_daily_std':  np.asarray(aod_std_d),
+        'n_valid_slots':  np.asarray(n_valid_d),
+        'aod_daily_max':  np.asarray(aod_max_d),
+        'hour_of_max':    np.asarray(hour_d),
     }

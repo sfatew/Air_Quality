@@ -196,6 +196,39 @@ Stage A produces the 30-min merged product (analogue of Ahn 2021's hourly compos
 
 ## 7. Methodology Detail
 
+### 7.0 Satellite–AERONET colocation protocol
+
+#### 7.0.1 Spatial matching
+
+Each satellite product uses a tiered neighbourhood approach adapted to its native grid geometry (Ichoku et al. 2002; Levy et al. 2010):
+
+1. **Exact pixel (primary):** The pixel or grid cell whose centre contains the AERONET station coordinates is extracted. For grid-based sensors (Himawari 0.05°, MODIS MAIAC 1 km) this is a direct cell-index lookup; no distance metric is needed.
+2. **3×3 neighbourhood (Fallback 1):** If the exact pixel has no valid retrieval, the mean of all valid pixels within one native-cell radius in each direction is used (a 3×3 box of native cells centred on the station cell). This is consistent with the 5×5 MODIS-pixel neighbourhood of Ichoku et al. (2002) scaled to each sensor's native resolution.
+3. **5×5 neighbourhood (Fallback 2):** Applied only when a particular (sensor × region × season) stratum would otherwise fall below the minimum sample size for CDF fitting (N < CDF_MIN_PAIRS). These matchups carry `spatial_flag = 2` and are held separate during bias-correction training.
+
+Each matchup record stores `spatial_flag` (0 = exact, 1 = 3×3, 2 = 5×5) and `box_std` (within-neighbourhood AOD standard deviation).
+
+**Scene homogeneity filter:** A matchup is rejected if `box_std > 0.3` at the first tier that yields any valid data (Levy et al. 2010, §3.2). This discards retrievals contaminated by cloud edges, mixed land/water, or sub-pixel aerosol gradients. No wider neighbourhood is tried after a heterogeneity rejection.
+
+**Sensor-specific spatial details:**
+
+| Sensor | Grid type | Exact pixel | 3×3 radius | 5×5 radius |
+|--------|-----------|-------------|------------|------------|
+| Himawari L2/L3 | Fixed 0.05° raster | Cell-index lookup via rasterio | ±1 cell (~5.5 km) | ±2 cells (~11 km) |
+| MODIS MAIAC | Fixed 1 km sinusoidal | Cell-index lookup ≡ distance < 0.5 km | distance < 1.5 km (±1 cell) | distance < 2.5 km (±2 cells) |
+| VIIRS SNPP/NOAA-20 | Raw swath ~6 km aggregated | distance < 3.0 km | distance < 9.0 km | distance < 15.0 km |
+
+#### 7.0.2 Temporal matching
+
+| Sensor | Matched to | Time window | Rationale |
+|--------|-----------|------------|-----------|
+| Himawari L2 | Each AERONET observation | ±30 min | Ichoku et al. (2002) ±30 min criterion; multiple 10-min slots averaged |
+| VIIRS SNPP / NOAA-20 | Each AERONET observation | ±30 min | Overpass UTC parsed from filename field `.A{YYYY}{DOY}.{HHMM}.` |
+| MODIS MAIAC | Each AERONET observation | ±30 min **per orbit** | Per-orbit UTC read from HDF `Orbit_time_stamp` global attribute (`YYYYDDDHHMM{T\|A}` tokens); only the matching orbit layer(s) are extracted from the multi-orbit 3-D SDS array. Falls back to all orbits if the attribute is absent. |
+| Himawari L3 | Daily mean AERONET AOD | Whole day (all hourly composites) | L3 is itself a daily composite product; per-observation matching would introduce sub-daily sampling noise inconsistent with the L3 aggregation. |
+
+The per-orbit MODIS approach avoids confounding diurnal aerosol variation with retrieval bias: Terra (~10:30 LT) and Aqua (~13:30 LT) overpasses are matched independently against only the AERONET observations measured within ±30 min of each orbit, rather than against a daily mean that mixes morning and afternoon aerosol loading.
+
 ### 7.1 Step A1 — Quality filtering
 
 **Himawari AHI** (most aggressive filtering, since this is where filtering pays off):

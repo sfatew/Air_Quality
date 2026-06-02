@@ -62,6 +62,63 @@ def _modis_files_for_date(date: datetime) -> list[Path]:
     ]
 
 
+def _read_modis_orbit_times(hdf_path: str) -> list[datetime]:
+    """Parse per-orbit UTC datetimes from MCD19A2 HDF global attribute.
+
+    The ``Orbit_time_stamp`` attribute looks like::
+
+        20250010220T  20250010700A  20250010705A
+
+    Each whitespace-delimited token has the format YYYYDDDHHMM{T|A}, where
+    DDD is day-of-year, and the trailing letter identifies the platform
+    (T = Terra, A = Aqua).  Returns an empty list on any error or if the
+    attribute is absent (caller should fall back to daily matching).
+    """
+    stamp = ''
+
+    # Preferred path: pyhdf gives direct access to HDF4 global attributes
+    try:
+        from pyhdf.SD import SD, SDC
+        hdf = SD(hdf_path, SDC.READ)
+        stamp = str(hdf.attributes().get('Orbit_time_stamp', '')).strip()
+        hdf.end()
+    except Exception:
+        pass
+
+    # Fallback: GDAL metadata exposed through rasterio
+    if not stamp:
+        try:
+            ref_sds = (
+                f'HDF4_EOS:EOS_GRID:"{hdf_path}":grid1km:Optical_Depth_055'
+            )
+            with rasterio.open(ref_sds) as src:
+                for domain in (None, 'EOS_METADATA', 'HDF_GLOBAL'):
+                    tags = src.tags() if domain is None else src.tags(domain)
+                    if 'Orbit_time_stamp' in tags:
+                        stamp = tags['Orbit_time_stamp'].strip()
+                        break
+        except Exception:
+            pass
+
+    times: list[datetime] = []
+    for token in stamp.split():
+        # Token: YYYYDDDHHMM{T|A} — 12 characters total
+        if len(token) < 12:
+            continue
+        try:
+            year   = int(token[0:4])
+            doy    = int(token[4:7])
+            hour   = int(token[7:9])
+            minute = int(token[9:11])
+            times.append(
+                datetime(year, 1, 1)
+                + timedelta(days=doy - 1, hours=hour, minutes=minute)
+            )
+        except (ValueError, IndexError):
+            continue
+    return times
+
+
 def _load_sds(hdf_path: str, sds_name: str) -> tuple[np.ndarray, dict]:
     """Load an SDS from a MAIAC HDF file, applying scale/fill and returning float array."""
     grid = 'grid5km' if sds_name in _GRID5KM_SDS else 'grid1km'
@@ -106,8 +163,18 @@ def _tile_pixel_latlon(hdf_path: str) -> tuple[np.ndarray, np.ndarray]:
     return lat, lon
 
 
-def _read_modis_tile(hdf_path: str) -> Optional[dict[str, np.ndarray]]:
+def _read_modis_tile(
+    hdf_path: str,
+    orbit_indices: Optional[list[int]] = None,
+) -> Optional[dict[str, np.ndarray]]:
     """Extract QA-filtered pixel data from one MCD19A2 HDF tile.
+
+    Parameters
+    ----------
+    hdf_path      : path to the MCD19A2 HDF file
+    orbit_indices : if given, only process these orbit layers (0-based index
+                    matching the order in ``_read_modis_orbit_times``).
+                    Pass ``None`` to include all orbits.
 
     Returns None if no valid pixels overlap the Vietnam domain.
     Returns a dict with flat 1-D arrays: lat, lon, aod, ae, sza, vza, orbit_idx.
@@ -122,14 +189,18 @@ def _read_modis_tile(hdf_path: str) -> Optional[dict[str, np.ndarray]]:
         return None
 
     # Ensure 3-D (orbits, H, W) for multi-orbit SDS
-    for name, arr in (('aod', aod_3d), ('qa', qa_3d), ('ae', ae_3d)):
-        pass  # just checking; reshape below
     if aod_3d.ndim == 2:
         aod_3d = aod_3d[np.newaxis]
         qa_3d  = qa_3d[np.newaxis]
         ae_3d  = ae_3d[np.newaxis]
 
     n_orbits, H, W = aod_3d.shape
+
+    # Guard against out-of-range indices silently
+    if orbit_indices is not None:
+        orbit_indices = [i for i in orbit_indices if 0 <= i < n_orbits]
+        if not orbit_indices:
+            return None
 
     # Resize 5 km SZA/VZA to 1 km (repeat nearest, integer factor ~5×)
     from scipy.ndimage import zoom
@@ -155,7 +226,8 @@ def _read_modis_tile(hdf_path: str) -> Optional[dict[str, np.ndarray]]:
         return None
 
     parts: list[dict] = []
-    for orb in range(n_orbits):
+    _orb_iter = orbit_indices if orbit_indices is not None else range(n_orbits)
+    for orb in _orb_iter:
         aod_2d = aod_3d[orb]
         qa_2d  = qa_3d[orb].astype(np.int32)
         ae_2d  = ae_3d[orb]

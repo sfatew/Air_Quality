@@ -30,7 +30,7 @@ WET_MONTHS = frozenset({5, 6, 7, 8, 9})             # May–Sep
 # ── AERONET sites used as bias-correction anchors ────────────────────────────
 AERONET_SITES = {
     'NGHIA_DO': {'lat': 21.048, 'lon': 105.800, 'region': 'north'},
-    'Bac_Lieu':  {'lat': 9.300,  'lon': 105.700, 'region': 'south'},
+    'Bac_Lieu':  {'lat': 9.280,  'lon': 105.730, 'region': 'south'},
 }
 
 # ── Pre-correction sensor RMSE from Nguyen et al. 2025 (Table 2 & 3) ─────────
@@ -96,11 +96,37 @@ GEO_ORBIT_KM     = 42164.0   # geostationary orbit radius from Earth centre
 # ── Temporal parameters ───────────────────────────────────────────────────────
 TZ_OFFSET_HOURS = 7    # Vietnam local time = UTC + 7
 SLOT_MINUTES    = 30   # 30-min merged product cadence
-LEO_WINDOW_MIN  = 30   # ±minutes window for LEO–AERONET co-location
+LEO_WINDOW_MIN   = 30   # ±minutes window for Himawari L2 / VIIRS–AERONET co-location
+MODIS_WINDOW_MIN = 30   # ±minutes window for per-orbit MODIS–AERONET co-location
 
 # ── CDF bias-correction parameters (Ahn et al. 2021) ─────────────────────────
 CDF_N_QUANTILES = 200   # quantile points used to build empirical CDF
 CDF_MIN_PAIRS   = 100   # minimum matched pairs to fit CDF; fall back to linear below
+
+# ── Collocation spatial sampling (Ichoku et al. 2002; Levy et al. 2010) ───────
+# Flag values written to the spatial_flag column of collocated CSVs
+COLLOCATE_SPATIAL_FLAG_EXACT = 0   # station falls in the exact pixel/grid cell
+COLLOCATE_SPATIAL_FLAG_3X3   = 1   # 3×3 native-cell neighbourhood mean (fallback)
+COLLOCATE_SPATIAL_FLAG_5X5   = 2   # 5×5 native-cell neighbourhood (low-N stratum fallback)
+
+# Reject matchup if within-neighbourhood AOD std-dev exceeds this threshold
+# (cloud edges, mixed surfaces, or residual aerosol gradients across the box)
+COLLOCATE_BOX_STD_MAX = 0.3
+
+# Himawari and MODIS MAIAC are on fixed grids; neighbourhoods use cell-index half-widths
+# (half_width 0 = exact cell, 1 = 3×3 box, 2 = 5×5 box).
+
+# VIIRS uses raw swath data → distance-based neighbourhood using aggregated pixel size
+VIIRS_PIXEL_KM     = 6.0               # aggregated L2 pixel at nadir (~6 km × 6 km)
+VIIRS_EXACT_MAX_KM = VIIRS_PIXEL_KM / 2        #  3.0 km — exact pixel
+VIIRS_3X3_MAX_KM   = VIIRS_PIXEL_KM * 1.5      #  9.0 km — 3×3 VIIRS cells
+VIIRS_5X5_MAX_KM   = VIIRS_PIXEL_KM * 2.5      # 15.0 km — 5×5 VIIRS cells
+
+# MODIS MAIAC is on a 1 km sinusoidal grid; distance thresholds ≡ ±N cells
+MODIS_PIXEL_KM     = 1.0               # MAIAC native 1 km pixel
+MODIS_EXACT_MAX_KM = MODIS_PIXEL_KM / 2        # 0.5 km — exact 1 km cell
+MODIS_3X3_MAX_KM   = MODIS_PIXEL_KM * 1.5      # 1.5 km — ±1 cell (3×3)
+MODIS_5X5_MAX_KM   = MODIS_PIXEL_KM * 2.5      # 2.5 km — ±2 cells (5×5)
 
 # ── Data paths ────────────────────────────────────────────────────────────────
 DATA_ROOT        = Path('/home/slow_data/Air_Quality')

@@ -1,25 +1,24 @@
 """Extract satellite AOD at AERONET station coordinates and build matched pairs.
 
-For each AERONET observation, find the satellite pixel that contains the
-station's coordinates (nearest-pixel, no spatial fallback) and record the
-pair (satellite_aod, aeronet_aod) together with metadata needed for
-bias-correction stratum assignment (sensor, region, season, month, lat, lon).
+Spatial strategy (Ichoku et al. 2002; Levy et al. 2010):
+    Primary   — exact pixel / grid cell containing the station coordinates.
+    Fallback 1 — 3×3 native-cell neighbourhood mean of valid pixels.
+    Fallback 2 — 5×5 neighbourhood (flagged; used only for low-N strata).
+    Rejection  — matchup dropped if within-box AOD std > COLLOCATE_BOX_STD_MAX.
 
-Collocation strategy per sensor:
-    Himawari L2 : already on 0.05° grid → read pixel at station lat/lon.
-                  Match: all 10-min files within ±30 min of AERONET observation.
-    Himawari L3 : same grid → read pixel.
-                  Match: L3 hourly composite whose timestamp is within ±30 min.
-    VIIRS       : L2 swath → find pixel with minimum distance to station (no ring).
-                  Match: granules within ±30 min of AERONET observation.
-    MODIS MAIAC : 1 km L2 → find pixel with minimum distance to station.
-                  Match: any orbit in the MCD19A2 file for that date (daily file).
+Temporal strategy per sensor:
+    Himawari L2 : each AERONET observation; all 10-min files within ±LEO_WINDOW_MIN.
+    Himawari L3 : daily mean AERONET AOD vs. all L3 hourly composites for the day.
+    VIIRS       : each AERONET observation; granules within ±LEO_WINDOW_MIN.
+    MODIS MAIAC : each AERONET observation; per-orbit UTC from HDF Orbit_time_stamp
+                  attribute; only orbits within ±MODIS_WINDOW_MIN are used.
 
 Output:
     One CSV per (sensor, site) at COLLOCATE_DIR / {sensor}_{site}.csv
     Columns: sensor, site, region, season, month, lat, lon, date,
              timestamp_aeronet, timestamp_satellite,
-             satellite_aod, aeronet_aod, dist_km, vza, sza
+             satellite_aod, aeronet_aod, dist_km, vza, sza,
+             spatial_flag, box_std
 """
 
 from __future__ import annotations
@@ -50,7 +49,11 @@ from config import (
     HIMAWARI_L2_DIR, HIMAWARI_L3_DIR,
     COLLOCATE_DIR, EARTH_RADIUS_KM,
     LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
-    LEO_WINDOW_MIN,
+    LEO_WINDOW_MIN, MODIS_WINDOW_MIN,
+    COLLOCATE_SPATIAL_FLAG_EXACT, COLLOCATE_SPATIAL_FLAG_3X3, COLLOCATE_SPATIAL_FLAG_5X5,
+    COLLOCATE_BOX_STD_MAX,
+    VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
+    MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM,
 )
 from aeronet   import load_aeronet, window_mean
 from himawari  import (
@@ -58,7 +61,7 @@ from himawari  import (
     _parse_l2_utc, _parse_l3_utc, _read_band,
 )
 from viirs     import _viirs_files_in_window, _read_viirs_file, _parse_viirs_utc
-from modis     import _modis_files_for_date, _read_modis_tile
+from modis     import _modis_files_for_date, _read_modis_tile, _read_modis_orbit_times
 
 
 # ── Haversine distance ────────────────────────────────────────────────────────
@@ -84,6 +87,93 @@ def _station_pixel(station_lat: float, station_lon: float
     return None
 
 
+# ── Spatial-sampling helpers ─────────────────────────────────────────────────
+
+_GRID_TIERS = (
+    (0, COLLOCATE_SPATIAL_FLAG_EXACT),
+    (1, COLLOCATE_SPATIAL_FLAG_3X3),
+    (2, COLLOCATE_SPATIAL_FLAG_5X5),
+)
+
+
+def _sample_grid_aod(
+    aod_2d: np.ndarray,
+    row: int,
+    col: int,
+    nrows: int,
+    ncols: int,
+    std_max: float = COLLOCATE_BOX_STD_MAX,
+) -> 'tuple[float, float, int, int] | None':
+    """Sample a 2-D AOD grid at (row, col) with tiered neighbourhood fallback.
+
+    Tries exact cell → 3×3 → 5×5.  Returns ``(mean, std, n_valid, spatial_flag)``
+    for the first tier that has at least one valid (finite, non-negative) value
+    and whose within-box std does not exceed *std_max*.  Returns ``None`` if the
+    scene is heterogeneous at the first populated tier, or if no data exist.
+
+    Used for Himawari (0.05° grid) and MODIS MAIAC when a 2-D array is
+    available (e.g. after loading an orbit layer).
+    """
+    for hw, flag in _GRID_TIERS:
+        r0 = max(0, row - hw)
+        r1 = min(nrows, row + hw + 1)
+        c0 = max(0, col - hw)
+        c1 = min(ncols, col + hw + 1)
+        patch = aod_2d[r0:r1, c0:c1].ravel()
+        vals  = patch[np.isfinite(patch) & (patch >= 0)]
+        if len(vals) == 0:
+            continue
+        std_v = float(np.std(vals, ddof=0))
+        if std_v > std_max:
+            return None   # scene too heterogeneous at this scale
+        return float(np.mean(vals)), std_v, int(len(vals)), flag
+    return None
+
+
+def _sample_swath_aod(
+    swath_lat: np.ndarray,
+    swath_lon: np.ndarray,
+    swath_aod: np.ndarray,
+    station_lat: float,
+    station_lon: float,
+    exact_km: float,
+    r3x3_km: float,
+    r5x5_km: float,
+    std_max: float = COLLOCATE_BOX_STD_MAX,
+) -> 'tuple[float, float, float, int, int] | None':
+    """Sample ungridded swath pixels near a station with tiered neighbourhood fallback.
+
+    Tries exact pixel → 3×3-equivalent radius → 5×5-equivalent radius.
+    Returns ``(mean_aod, std_aod, mean_dist_km, n_valid, spatial_flag)`` for the
+    first tier that has data and passes the heterogeneity filter, or ``None``.
+
+    Used for VIIRS (raw swath) and MODIS when flat pixel arrays are used.
+    """
+    dist = _haversine_km(station_lat, station_lon, swath_lat, swath_lon)
+    valid_aod = np.isfinite(swath_aod) & (swath_aod >= 0)
+
+    for max_km, flag in (
+        (exact_km, COLLOCATE_SPATIAL_FLAG_EXACT),
+        (r3x3_km,  COLLOCATE_SPATIAL_FLAG_3X3),
+        (r5x5_km,  COLLOCATE_SPATIAL_FLAG_5X5),
+    ):
+        mask = valid_aod & (dist <= max_km)
+        vals = swath_aod[mask]
+        if len(vals) == 0:
+            continue
+        std_v = float(np.std(vals, ddof=0))
+        if std_v > std_max:
+            return None
+        return (
+            float(np.mean(vals)),
+            std_v,
+            float(np.mean(dist[mask])),
+            int(len(vals)),
+            flag,
+        )
+    return None
+
+
 # ── Per-sensor collocators ────────────────────────────────────────────────────
 
 def _collocate_himawari_l2(
@@ -93,19 +183,15 @@ def _collocate_himawari_l2(
     station_lon: float,
     window_min: int = LEO_WINDOW_MIN,
 ) -> list[dict]:
-    """Match Himawari L2 10-min files to AERONET observations.
+    """Match Himawari L2 10-min files to individual AERONET observations.
 
-    For each AERONET time, gather all L2 files within ±window_min, read Band 1
-    (AOT) at the station's grid cell, and average them.  A record is only kept
-    when the pixel is non-NaN (i.e. a valid retrieval exists at that cell).
+    Spatial strategy: exact grid cell → 3×3 → 5×5 neighbourhood (cell indices).
+    For each AERONET time, all L2 files within ±window_min are collected; the
+    neighbourhood mean is computed per file and then averaged across files.
+    Records where the within-box std exceeds COLLOCATE_BOX_STD_MAX are dropped.
     """
     records = []
-    rc = _station_pixel(station_lat, station_lon)
-    if rc is None:
-        return records
-    row, col = rc
 
-    # Group AERONET observations by slot to avoid redundant file reads
     for _, aer_row in aeronet_df.iterrows():
         aer_dt  = aer_row['datetime']
         aer_aod = float(aer_row['aod_550'])
@@ -114,18 +200,32 @@ def _collocate_himawari_l2(
         if not files:
             continue
 
-        sat_vals = []
+        per_file_means: list[float] = []
+        best_flag = COLLOCATE_SPATIAL_FLAG_5X5  # track the smallest neighbourhood used
+
         for fpath in files:
             try:
                 with rasterio.open(str(fpath)) as src:
+                    # Locate station in TIF coordinates via the file's own georeference
+                    tif_row, tif_col = rasterio.transform.rowcol(
+                        src.transform, station_lon, station_lat
+                    )
+                    if not (0 <= tif_row < src.height and 0 <= tif_col < src.width):
+                        continue
                     aot_band = _read_band(src, 1)
-                    val = float(aot_band[row, col])
-                    if np.isfinite(val) and val >= 0:
-                        sat_vals.append(val)
+                    H, W = src.height, src.width
             except Exception:
                 continue
 
-        if not sat_vals:
+            result = _sample_grid_aod(aot_band, tif_row, tif_col, H, W)
+            if result is None:
+                continue
+            mean_v, _std, _n, flag = result
+            per_file_means.append(mean_v)
+            if flag < best_flag:
+                best_flag = flag
+
+        if not per_file_means:
             continue
 
         records.append({
@@ -138,12 +238,14 @@ def _collocate_himawari_l2(
             'lon':                 station_lon,
             'date':                aer_dt.date().isoformat(),
             'timestamp_aeronet':   aer_dt.isoformat(),
-            'timestamp_satellite': aer_dt.isoformat(),  # approximate (averaged window)
-            'satellite_aod':       float(np.mean(sat_vals)),
+            'timestamp_satellite': aer_dt.isoformat(),
+            'satellite_aod':       float(np.mean(per_file_means)),
             'aeronet_aod':         aer_aod,
-            'dist_km':             0.0,   # station is inside the pixel
+            'dist_km':             0.0,
             'vza':                 np.nan,
             'sza':                 np.nan,
+            'spatial_flag':        best_flag,
+            'box_std':             float(np.std(per_file_means, ddof=0)),
         })
     return records
 
@@ -153,16 +255,14 @@ def _collocate_himawari_l3(
     site: str,
     station_lat: float,
     station_lon: float,
-    window_min: int = LEO_WINDOW_MIN,
 ) -> list[dict]:
-    """Match Himawari L3 hourly composites to AERONET daily means."""
-    records = []
-    rc = _station_pixel(station_lat, station_lon)
-    if rc is None:
-        return records
-    row, col = rc
+    """Match Himawari L3 hourly composites to AERONET daily means.
 
-    # L3 is an hourly composite; match by daily mean for the plan's validation
+    L3 is a daily composite product; temporal matching is whole-day.
+    Spatial strategy: exact grid cell → 3×3 → 5×5 neighbourhood (cell indices).
+    """
+    records = []
+
     aeronet_daily = (aeronet_df.groupby(aeronet_df['datetime'].dt.date)
                                 ['aod_550'].mean().reset_index())
     aeronet_daily.columns = ['date', 'aod_550']
@@ -173,22 +273,34 @@ def _collocate_himawari_l3(
             continue
         aer_aod = float(aer_aod_row['aod_550'].values[0])
 
-        # Gather all L3 files for that day
         day_dt = datetime(date_obj.year, date_obj.month, date_obj.day, 6, 0)
-        files = _l3_files_in_window(day_dt, window_min=720)  # whole day window
+        files  = _l3_files_in_window(day_dt, window_min=720)  # whole-day window
 
-        sat_vals = []
+        per_file_means: list[float] = []
+        best_flag = COLLOCATE_SPATIAL_FLAG_5X5
+
         for fpath in files:
             try:
                 with rasterio.open(str(fpath)) as src:
+                    tif_row, tif_col = rasterio.transform.rowcol(
+                        src.transform, station_lon, station_lat
+                    )
+                    if not (0 <= tif_row < src.height and 0 <= tif_col < src.width):
+                        continue
                     band2 = _read_band(src, 2)   # AOT_Merged
-                    val = float(band2[row, col])
-                    if np.isfinite(val) and val >= 0:
-                        sat_vals.append(val)
+                    H, W  = src.height, src.width
             except Exception:
                 continue
 
-        if not sat_vals:
+            result = _sample_grid_aod(band2, tif_row, tif_col, H, W)
+            if result is None:
+                continue
+            mean_v, _std, _n, flag = result
+            per_file_means.append(mean_v)
+            if flag < best_flag:
+                best_flag = flag
+
+        if not per_file_means:
             continue
 
         dt_repr = datetime(date_obj.year, date_obj.month, date_obj.day)
@@ -203,11 +315,13 @@ def _collocate_himawari_l3(
             'date':                date_obj.isoformat(),
             'timestamp_aeronet':   dt_repr.isoformat(),
             'timestamp_satellite': dt_repr.isoformat(),
-            'satellite_aod':       float(np.mean(sat_vals)),
+            'satellite_aod':       float(np.mean(per_file_means)),
             'aeronet_aod':         aer_aod,
             'dist_km':             0.0,
             'vza':                 np.nan,
             'sza':                 np.nan,
+            'spatial_flag':        best_flag,
+            'box_std':             float(np.std(per_file_means, ddof=0)),
         })
     return records
 
@@ -220,11 +334,13 @@ def _collocate_viirs(
     station_lon: float,
     window_min: int = LEO_WINDOW_MIN,
 ) -> list[dict]:
-    """Match VIIRS granules to AERONET observations.
+    """Match VIIRS granules to individual AERONET observations.
 
-    Nearest-pixel strategy: find the pixel in the granule with smallest
-    haversine distance to the station.  No ring search — if the nearest pixel
-    is invalid, the observation is discarded.
+    Spatial strategy: exact pixel → 3×3 → 5×5 neighbourhood, defined by
+    distance thresholds based on the ~6 km aggregated VIIRS L2 pixel size
+    (VIIRS_EXACT_MAX_KM / VIIRS_3X3_MAX_KM / VIIRS_5X5_MAX_KM).  All pixels
+    from all granules within ±window_min are pooled per AERONET observation
+    before neighbourhood sampling.
     """
     records = []
 
@@ -233,42 +349,70 @@ def _collocate_viirs(
         aer_aod = float(aer_row['aod_550'])
 
         files = _viirs_files_in_window(sensor, aer_dt, window_min)
+        if not files:
+            continue
+
+        # Pool all valid pixels from all granules in the time window
+        all_lat, all_lon, all_aod, all_vza, all_sza = [], [], [], [], []
+        sat_ts = ''
         for fpath in files:
             px = _read_viirs_file(fpath)
             if px is None:
                 continue
+            all_lat.append(px['lat'])
+            all_lon.append(px['lon'])
+            all_aod.append(px['aod'])
+            all_vza.append(px['vza'])
+            all_sza.append(px['sza'])
+            if not sat_ts:
+                fdt = _parse_viirs_utc(fpath.name) if hasattr(fpath, 'name') else None
+                if fdt:
+                    sat_ts = fdt.isoformat()
 
-            dist = _haversine_km(station_lat, station_lon, px['lat'], px['lon'])
-            idx  = int(np.argmin(dist))
-            nearest_dist = float(dist[idx])
+        if not all_lat:
+            continue
 
-            # Accept only if nearest pixel is within ~25 km (≈ 4 grid cells)
-            if nearest_dist > 25.0:
-                continue
+        lat_arr = np.concatenate(all_lat)
+        lon_arr = np.concatenate(all_lon)
+        aod_arr = np.concatenate(all_aod)
+        vza_arr = np.concatenate(all_vza)
+        sza_arr = np.concatenate(all_sza)
 
-            sat_aod = float(px['aod'][idx])
-            if not np.isfinite(sat_aod) or sat_aod < 0:
-                continue
+        result = _sample_swath_aod(
+            lat_arr, lon_arr, aod_arr,
+            station_lat, station_lon,
+            VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
+        )
+        if result is None:
+            continue
+        mean_aod, box_std, mean_dist, _n, flag = result
 
-            fdt = _parse_viirs_utc(fpath.name) if hasattr(fpath, 'name') else None
+        # Mean VZA/SZA of contributing pixels
+        dist_arr = _haversine_km(station_lat, station_lon, lat_arr, lon_arr)
+        max_km = (VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM)[flag]
+        hood   = dist_arr <= max_km
+        mean_vza = float(np.nanmean(vza_arr[hood])) if np.any(hood) else np.nan
+        mean_sza = float(np.nanmean(sza_arr[hood])) if np.any(hood) else np.nan
 
-            records.append({
-                'sensor':              sensor,
-                'site':                site,
-                'region':              AERONET_SITES[site]['region'],
-                'season':              'dry' if aer_dt.month in DRY_MONTHS else 'wet',
-                'month':               aer_dt.month,
-                'lat':                 station_lat,
-                'lon':                 station_lon,
-                'date':                aer_dt.date().isoformat(),
-                'timestamp_aeronet':   aer_dt.isoformat(),
-                'timestamp_satellite': fdt.isoformat() if fdt else '',
-                'satellite_aod':       sat_aod,
-                'aeronet_aod':         aer_aod,
-                'dist_km':             nearest_dist,
-                'vza':                 float(px['vza'][idx]),
-                'sza':                 float(px['sza'][idx]),
-            })
+        records.append({
+            'sensor':              sensor,
+            'site':                site,
+            'region':              AERONET_SITES[site]['region'],
+            'season':              'dry' if aer_dt.month in DRY_MONTHS else 'wet',
+            'month':               aer_dt.month,
+            'lat':                 station_lat,
+            'lon':                 station_lon,
+            'date':                aer_dt.date().isoformat(),
+            'timestamp_aeronet':   aer_dt.isoformat(),
+            'timestamp_satellite': sat_ts,
+            'satellite_aod':       mean_aod,
+            'aeronet_aod':         aer_aod,
+            'dist_km':             mean_dist,
+            'vza':                 mean_vza,
+            'sza':                 mean_sza,
+            'spatial_flag':        flag,
+            'box_std':             box_std,
+        })
     return records
 
 
@@ -278,61 +422,101 @@ def _collocate_modis(
     station_lat: float,
     station_lon: float,
 ) -> list[dict]:
-    """Match MODIS MAIAC to AERONET daily means (one value per orbit per day)."""
+    """Match MODIS MAIAC orbits to individual AERONET observations.
+
+    Temporal strategy: for each AERONET observation, find MCD19A2 orbit layers
+    whose UTC overpass time (read from the HDF ``Orbit_time_stamp`` attribute)
+    falls within ±MODIS_WINDOW_MIN.  If orbit times cannot be parsed, all orbits
+    from the daily file are used as a fallback.
+
+    Spatial strategy: exact MAIAC pixel → 3×3 → 5×5 neighbourhood, defined by
+    distance thresholds matched to the 1 km MAIAC native grid
+    (MODIS_EXACT_MAX_KM / MODIS_3X3_MAX_KM / MODIS_5X5_MAX_KM).
+    """
     records = []
 
-    # Aggregate AERONET to daily mean for MODIS match (daily overpass)
-    aeronet_daily = (aeronet_df.groupby(aeronet_df['datetime'].dt.date)
-                                ['aod_550'].mean().reset_index())
-    aeronet_daily.columns = ['date', 'aod_550']
+    for _, aer_row in aeronet_df.iterrows():
+        aer_dt  = aer_row['datetime']
+        aer_aod = float(aer_row['aod_550'])
 
-    for date_obj in sorted(set(aeronet_df['datetime'].dt.date)):
-        aer_row = aeronet_daily[aeronet_daily['date'] == date_obj]
-        if aer_row.empty:
-            continue
-        aer_aod = float(aer_row['aod_550'].values[0])
-
-        dt = datetime(date_obj.year, date_obj.month, date_obj.day)
-        files = _modis_files_for_date(dt)
+        files = _modis_files_for_date(aer_dt)
         if not files:
             continue
 
-        sat_vals = []
-        min_dist = np.inf
+        # Collect pixels from all tiles, filtering to matching orbits
+        all_lat, all_lon, all_aod, all_vza, all_sza = [], [], [], [], []
+        sat_ts = ''
+
         for fpath in files:
-            px = _read_modis_tile(str(fpath))
+            orbit_times = _read_modis_orbit_times(str(fpath))
+
+            if orbit_times:
+                matching = [
+                    i for i, t in enumerate(orbit_times)
+                    if abs((t - aer_dt).total_seconds()) <= MODIS_WINDOW_MIN * 60
+                ]
+                if not matching:
+                    continue
+                if not sat_ts and matching:
+                    sat_ts = orbit_times[matching[0]].isoformat()
+                orb_filter = matching
+            else:
+                # Orbit times unavailable — use all orbits for this day
+                orb_filter = None
+                if not sat_ts:
+                    sat_ts = aer_dt.date().isoformat()
+
+            px = _read_modis_tile(str(fpath), orbit_indices=orb_filter)
             if px is None:
                 continue
-            dist = _haversine_km(station_lat, station_lon, px['lat'], px['lon'])
-            idx  = int(np.argmin(dist))
-            nearest = float(dist[idx])
-            if nearest > 1.5:   # 1 km pixel, accept ≤ 1.5 km
-                continue
-            val = float(px['aod'][idx])
-            if np.isfinite(val) and val >= 0:
-                sat_vals.append(val)
-                if nearest < min_dist:
-                    min_dist = nearest
+            all_lat.append(px['lat'])
+            all_lon.append(px['lon'])
+            all_aod.append(px['aod'])
+            all_vza.append(px['vza'])
+            all_sza.append(px['sza'])
 
-        if not sat_vals:
+        if not all_lat:
             continue
+
+        lat_arr = np.concatenate(all_lat)
+        lon_arr = np.concatenate(all_lon)
+        aod_arr = np.concatenate(all_aod)
+        vza_arr = np.concatenate(all_vza)
+        sza_arr = np.concatenate(all_sza)
+
+        result = _sample_swath_aod(
+            lat_arr, lon_arr, aod_arr,
+            station_lat, station_lon,
+            MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM,
+        )
+        if result is None:
+            continue
+        mean_aod, box_std, mean_dist, _n, flag = result
+
+        dist_arr = _haversine_km(station_lat, station_lon, lat_arr, lon_arr)
+        max_km   = (MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM)[flag]
+        hood     = dist_arr <= max_km
+        mean_vza = float(np.nanmean(vza_arr[hood])) if np.any(hood) else np.nan
+        mean_sza = float(np.nanmean(sza_arr[hood])) if np.any(hood) else np.nan
 
         records.append({
             'sensor':              'modis_maiac',
             'site':                site,
             'region':              AERONET_SITES[site]['region'],
-            'season':              'dry' if date_obj.month in DRY_MONTHS else 'wet',
-            'month':               date_obj.month,
+            'season':              'dry' if aer_dt.month in DRY_MONTHS else 'wet',
+            'month':               aer_dt.month,
             'lat':                 station_lat,
             'lon':                 station_lon,
-            'date':                date_obj.isoformat(),
-            'timestamp_aeronet':   dt.isoformat(),
-            'timestamp_satellite': dt.isoformat(),
-            'satellite_aod':       float(np.mean(sat_vals)),
+            'date':                aer_dt.date().isoformat(),
+            'timestamp_aeronet':   aer_dt.isoformat(),
+            'timestamp_satellite': sat_ts,
+            'satellite_aod':       mean_aod,
             'aeronet_aod':         aer_aod,
-            'dist_km':             min_dist if np.isfinite(min_dist) else np.nan,
-            'vza':                 np.nan,
-            'sza':                 np.nan,
+            'dist_km':             mean_dist,
+            'vza':                 mean_vza,
+            'sza':                 mean_sza,
+            'spatial_flag':        flag,
+            'box_std':             box_std,
         })
     return records
 

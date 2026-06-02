@@ -57,7 +57,7 @@ from himawari  import (
     _l2_files_in_window, _l3_files_in_window,
     _parse_l2_utc, _parse_l3_utc, _read_band,
 )
-from viirs     import _viirs_files_in_window, _read_viirs_file
+from viirs     import _viirs_files_in_window, _read_viirs_file, _parse_viirs_utc
 from modis     import _modis_files_for_date, _read_modis_tile
 
 
@@ -227,7 +227,6 @@ def _collocate_viirs(
     is invalid, the observation is discarded.
     """
     records = []
-    from viirs import _SENSOR_DIRS, _viirs_files_for_date
 
     for _, aer_row in aeronet_df.iterrows():
         aer_dt  = aer_row['datetime']
@@ -299,17 +298,21 @@ def _collocate_modis(
             continue
 
         sat_vals = []
+        min_dist = np.inf
         for fpath in files:
             px = _read_modis_tile(str(fpath))
             if px is None:
                 continue
             dist = _haversine_km(station_lat, station_lon, px['lat'], px['lon'])
             idx  = int(np.argmin(dist))
-            if dist[idx] > 1.5:   # 1 km pixel, accept ≤ 1.5 km
+            nearest = float(dist[idx])
+            if nearest > 1.5:   # 1 km pixel, accept ≤ 1.5 km
                 continue
             val = float(px['aod'][idx])
             if np.isfinite(val) and val >= 0:
                 sat_vals.append(val)
+                if nearest < min_dist:
+                    min_dist = nearest
 
         if not sat_vals:
             continue
@@ -327,13 +330,7 @@ def _collocate_modis(
             'timestamp_satellite': dt.isoformat(),
             'satellite_aod':       float(np.mean(sat_vals)),
             'aeronet_aod':         aer_aod,
-            'dist_km':             float(np.min([
-                _haversine_km(station_lat, station_lon,
-                              _read_modis_tile(str(f))['lat'],
-                              _read_modis_tile(str(f))['lon']).min()
-                for f in files
-                if _read_modis_tile(str(f)) is not None
-            ], default=np.nan)),
+            'dist_km':             min_dist if np.isfinite(min_dist) else np.nan,
             'vza':                 np.nan,
             'sza':                 np.nan,
         })

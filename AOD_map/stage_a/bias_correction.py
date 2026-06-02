@@ -41,6 +41,19 @@ except ImportError:
     cp = None
     _xp = np
 
+try:
+    from tqdm import tqdm as _tqdm_cls
+    _HAS_TQDM = True
+except ImportError:
+    _tqdm_cls = None  # type: ignore[assignment]
+    _HAS_TQDM = False
+
+
+def _make_bar(iterable, **kwargs):
+    if _HAS_TQDM and _tqdm_cls is not None:
+        return _tqdm_cls(iterable, **kwargs)
+    return None
+
 from config import (
     AERONET_SITES, DRY_MONTHS,
     CDF_N_QUANTILES, CDF_MIN_PAIRS,
@@ -322,7 +335,7 @@ def train_all_corrections(
 
     Expects one CSV per (sensor, site) combination in collocated_csv_dir,
     named {sensor}_{site}.csv, with columns:
-        satellite_aod, aeronet_aod, month, lat, lon
+        satellite_aod, aeronet_aod, month, region, season
 
     Returns the dict of fitted CDFCorrection objects.
     """
@@ -334,39 +347,75 @@ def train_all_corrections(
     regions = ('north', 'south')
     seasons = ('dry', 'wet')
 
-    # Collect all collocated data
-    all_frames = []
-    for fpath in sorted(collocated_csv_dir.glob('*.csv')):
+    # ── Load all collocated CSVs ───────────────────────────────────────────
+    csv_files = sorted(collocated_csv_dir.glob('*.csv'))
+    print(f'[bias_correction] Loading {len(csv_files)} collocated CSV file(s) …')
+
+    all_frames: list = []
+    csv_bar = _make_bar(csv_files, desc='  Loading CSVs', unit='file',
+                        ncols=72, leave=False)
+    for fpath in (csv_bar if csv_bar is not None else csv_files):
         try:
-            df = pd.read_csv(fpath)
-            all_frames.append(df)
+            all_frames.append(pd.read_csv(fpath))
         except Exception:
             continue
+    if csv_bar is not None:
+        csv_bar.close()
 
     if not all_frames:
         print('[bias_correction] No collocated CSVs found; skipping training.')
         return {}
 
     df_all = pd.concat(all_frames, ignore_index=True)
+    print(f'  Total pairs: {len(df_all):,}  '
+          f'(sensors in data: {sorted(df_all["sensor"].unique())})')
 
-    corrections = {}
-    for sensor in sensors:
-        df_s = df_all[df_all['sensor'] == sensor].copy()
-        if df_s.empty:
-            continue
+    # ── Fit one CDFCorrection per (sensor, region, season) stratum ─────────
+    strata = [
+        (sensor, region, season)
+        for sensor in sensors
+        for region in regions
+        for season in seasons
+    ]
 
-        for region in regions:
-            for season in seasons:
-                mask = (df_s['region'] == region) & (df_s['season'] == season)
-                df_st = df_s[mask]
+    corrections: dict[tuple[str, str, str], CDFCorrection] = {}
+    fit_bar = _make_bar(strata, desc='Training strata', unit='stratum', ncols=72)
 
-                c = CDFCorrection(sensor, region, season)
-                c.fit(
-                    df_st['satellite_aod'].values,
-                    df_st['aeronet_aod'].values,
-                )
-                c.save(output_dir)
-                corrections[(sensor, region, season)] = c
-                print(f'  {c}')
+    for sensor, region, season in (fit_bar if fit_bar is not None else strata):
+        if fit_bar is not None:
+            fit_bar.set_description(f'  {sensor[:12]}/{region[:5]}/{season[:3]}')
+
+        mask  = ((df_all['sensor'] == sensor)
+                 & (df_all['region'] == region)
+                 & (df_all['season'] == season))
+        df_st = df_all[mask]
+
+        c = CDFCorrection(sensor, region, season)
+        c.fit(df_st['satellite_aod'].values, df_st['aeronet_aod'].values)
+        c.save(output_dir)
+        corrections[(sensor, region, season)] = c
+
+        msg = f'  trained: {c}'
+        if fit_bar is not None:
+            fit_bar.write(msg)
+        else:
+            print(msg)
+
+    if fit_bar is not None:
+        fit_bar.close()
+
+    # ── RMSE improvement summary ───────────────────────────────────────────
+    if corrections:
+        col_w = 15
+        print(f'\n[bias_correction] Summary — {len(corrections)} strata trained:')
+        hdr = (f"  {'Sensor':<{col_w}} {'Region':<8} {'Season':<5} "
+               f"{'Type':<13} {'N':>6}  {'RMSE_before':>11} → {'RMSE_after':<10}")
+        print(hdr)
+        print('  ' + '─' * (len(hdr) - 2))
+        for (s, reg, sea), c in sorted(corrections.items()):
+            rmse_b = f'{c.rmse_before:.4f}' if not np.isnan(c.rmse_before) else '   N/A'
+            rmse_a = f'{c.rmse_after:.4f}'  if not np.isnan(c.rmse_after)  else '   N/A'
+            print(f'  {s:<{col_w}} {reg:<8} {sea:<5} '
+                  f'{c.correction_type:<13} {c.n_pairs:>6}  {rmse_b:>11} → {rmse_a}')
 
     return corrections

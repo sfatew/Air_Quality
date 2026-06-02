@@ -32,6 +32,19 @@ import numpy as np
 import pandas as pd
 import rasterio
 
+try:
+    from tqdm import tqdm as _tqdm_cls
+    _HAS_TQDM = True
+except ImportError:
+    _tqdm_cls = None  # type: ignore[assignment]
+    _HAS_TQDM = False
+
+
+def _make_bar(iterable, **kwargs):
+    if _HAS_TQDM and _tqdm_cls is not None:
+        return _tqdm_cls(iterable, **kwargs)
+    return None
+
 from config import (
     AERONET_SITES, AERONET_DIR, DRY_MONTHS,
     HIMAWARI_L2_DIR, HIMAWARI_L3_DIR,
@@ -365,7 +378,9 @@ def collocate_site(
 
     results: dict[str, pd.DataFrame] = {}
 
-    for sensor in sensors:
+    sensor_bar = _make_bar(list(sensors), desc=f'  {site} sensors', unit='sensor',
+                           ncols=72, leave=False)
+    for sensor in (sensor_bar if sensor_bar is not None else sensors):
         records: list[dict] = []
 
         if sensor == 'himawari_l2':

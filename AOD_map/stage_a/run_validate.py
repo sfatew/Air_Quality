@@ -34,6 +34,7 @@ Output files are written to OUTPUT_DIR / 'validation' / <timestamp>/ :
 from __future__ import annotations
 import argparse
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -58,6 +59,43 @@ SPLIT_DATES = {
     'train': (date(2022, 9, 1),  date(2024, 12, 31)),
     'full':  (date(2022, 9, 1),  date(2026, 4, 30)),
 }
+
+
+# ── Environment banner ────────────────────────────────────────────────────────
+
+def _print_env_banner() -> None:
+    """Print library versions to stdout."""
+    W = 64
+    print("=" * W)
+    print("Stage A — Validation — Runtime Environment")
+    print("-" * W)
+    print(f"  {'Python':<12} {sys.version.split()[0]}")
+
+    _libs = [
+        ("numpy",   "NumPy"),
+        ("pandas",  "pandas"),
+        ("scipy",   "SciPy"),
+        ("sklearn", "scikit-learn"),
+        ("netCDF4", "netCDF4"),
+        ("tqdm",    "tqdm"),
+    ]
+    for mod_name, label in _libs:
+        try:
+            mod = __import__(mod_name)
+            ver = getattr(mod, "__version__", "?")
+            print(f"  {label:<14} {ver}")
+        except ImportError:
+            print(f"  {label:<14} not installed")
+
+    print("=" * W)
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds >= 60:
+        m = int(seconds // 60)
+        s = seconds - m * 60
+        return f"{m}m {s:.1f}s"
+    return f"{seconds:.1f}s"
 
 
 # ── Report helpers ────────────────────────────────────────────────────────────
@@ -194,9 +232,12 @@ def main():
     run_dir = Path(args.out) if args.out else VALID_DIR / f'{args.split}_{run_tag}'
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    _print_env_banner()
+
     print(f'Stage A Validation')
-    print(f'  Period: {start} → {end}  ({args.split})')
-    print(f'  Output: {run_dir}')
+    print(f'  Period : {start} → {end}  ({args.split})')
+    print(f'  Mode   : {args.mode}')
+    print(f'  Output : {run_dir}')
 
     from validate import (
         extract_aeronet_pairs,
@@ -208,14 +249,16 @@ def main():
         spatial_coverage_stats,
     )
 
-    # ── §8.1 AERONET pairs ─────────────────────────────────────────────────
+    wall_t0    = time.perf_counter()
     pairs      = pd.DataFrame()
     metrics_df = pd.DataFrame()
 
+    # ── §8.1 AERONET pairs ─────────────────────────────────────────────────
     if args.mode in ('all', 'aeronet', 'precip', 'ransac', 'baseline'):
         print('\n[§8.1] Extracting AERONET matched pairs …')
+        t0    = time.perf_counter()
         pairs = extract_aeronet_pairs(start, end)
-        print(f'  → {len(pairs)} matched pairs')
+        print(f'  → {len(pairs)} matched pairs  [{_fmt_duration(time.perf_counter() - t0)}]')
 
         if pairs.empty:
             print('  No pairs found. Check MERGED_DIR or date range.')
@@ -236,7 +279,9 @@ def main():
 
     if args.mode in ('all', 'consistency'):
         print('\n[§8.2] Inter-sensor consistency check …')
+        t0             = time.perf_counter()
         consistency_df = inter_sensor_consistency(start, end)
+        print(f'  [{_fmt_duration(time.perf_counter() - t0)}]')
         if not consistency_df.empty:
             consistency_df.to_csv(run_dir / 'inter_sensor_consistency.csv', index=False)
             _print_table(consistency_df, '§8.2  Inter-sensor R² vs Nguyen 2025 baseline')
@@ -246,7 +291,9 @@ def main():
     # ── §8.3 Precipitation-aware ──────────────────────────────────────────
     if args.mode in ('all', 'precip') and not pairs.empty:
         print('\n[§8.3] Precipitation-aware validation …')
+        t0        = time.perf_counter()
         precip_df = precip_aware_validation(pairs)
+        print(f'  [{_fmt_duration(time.perf_counter() - t0)}]')
         if not precip_df.empty:
             precip_df.to_csv(run_dir / 'precip_aware.csv', index=False)
             _print_table(precip_df[['site', 'wet_flag', 'N', 'R', 'RMSE', 'Bias', 'pct_EE']],
@@ -257,7 +304,9 @@ def main():
     # ── §8.5 Baseline comparison ──────────────────────────────────────────
     if args.mode in ('all', 'baseline') and not pairs.empty:
         print('\n[§8.5] Baseline comparison (merged vs VIIRS-only) …')
+        t0          = time.perf_counter()
         baseline_df = baseline_comparison(pairs)
+        print(f'  [{_fmt_duration(time.perf_counter() - t0)}]')
         if not baseline_df.empty:
             baseline_df.to_csv(run_dir / 'baseline_comparison.csv', index=False)
             _print_table(baseline_df[['site', 'product', 'N', 'R', 'RMSE', 'Bias', 'pct_EE']],
@@ -268,7 +317,9 @@ def main():
 
     if args.mode in ('all', 'ransac') and not pairs.empty:
         print('\n[§8.6] RANSAC diagnostic …')
+        t0        = time.perf_counter()
         ransac_df = ransac_diagnostic(pairs)
+        print(f'  [{_fmt_duration(time.perf_counter() - t0)}]')
         if not ransac_df.empty:
             ransac_df.to_csv(run_dir / 'ransac_diagnostic.csv', index=False)
             _print_table(
@@ -282,7 +333,9 @@ def main():
 
     if args.mode in ('all', 'coverage'):
         print('\n[Coverage] Computing daily spatial coverage …')
+        t0          = time.perf_counter()
         coverage_df = spatial_coverage_stats(start, end)
+        print(f'  [{_fmt_duration(time.perf_counter() - t0)}]')
         if not coverage_df.empty:
             coverage_df.to_csv(run_dir / 'coverage_daily.csv', index=False)
             monthly = coverage_df.groupby('month')['coverage_pct'].agg(['mean', 'min', 'max'])
@@ -292,7 +345,9 @@ def main():
     if args.mode == 'all':
         _write_summary(run_dir, metrics_df, consistency_df, coverage_df, ransac_df)
 
-    print(f'\nDone. Results → {run_dir}')
+    print(f'\n{"─" * 64}')
+    print(f'Done.  [total: {_fmt_duration(time.perf_counter() - wall_t0)}]')
+    print(f'Results → {run_dir}')
 
 
 if __name__ == '__main__':

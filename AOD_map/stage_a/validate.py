@@ -34,6 +34,19 @@ import netCDF4 as nc
 from scipy import stats
 from sklearn.linear_model import RANSACRegressor, LinearRegression
 
+try:
+    from tqdm import tqdm as _tqdm_cls
+    _HAS_TQDM = True
+except ImportError:
+    _tqdm_cls = None  # type: ignore[assignment]
+    _HAS_TQDM = False
+
+
+def _make_bar(iterable, **kwargs):
+    if _HAS_TQDM and _tqdm_cls is not None:
+        return _tqdm_cls(iterable, **kwargs)
+    return None
+
 from config import (
     AERONET_SITES, DRY_MONTHS,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
@@ -126,10 +139,11 @@ def extract_aeronet_pairs(
     # Pre-compute station pixel indices
     station_rc = {site: _station_rc(site) for site in AERONET_SITES}
 
-    records = []
-    files   = _merged_files_for_range(start, end)
+    records  = []
+    files    = _merged_files_for_range(start, end)
+    bar      = _make_bar(files, desc='Matching AERONET pairs', unit='file', ncols=80)
 
-    for fpath in files:
+    for fpath in (bar if bar is not None else files):
         slot = _parse_slot_utc(fpath)
         if slot is None:
             continue
@@ -316,8 +330,9 @@ def inter_sensor_consistency(
     region_names = {0: 'north', 1: 'central', 2: 'south'}
 
     files = _merged_files_for_range(start, end)
+    bar   = _make_bar(files, desc='Sensor overlap scan', unit='file', ncols=80)
 
-    for fpath in files:
+    for fpath in (bar if bar is not None else files):
         try:
             with nc.Dataset(fpath) as ds:
                 available = list(ds.variables.keys())
@@ -576,17 +591,23 @@ def spatial_coverage_stats(start: date, end: date) -> pd.DataFrame:
 
     Reports daily, monthly, and seasonal mean coverage.
     """
-    records = []
+    records     = []
     total_cells = NLAT * NLON
 
+    all_days: list[date] = []
     d = start
     while d <= end:
+        all_days.append(d)
+        d += timedelta(days=1)
+
+    bar = _make_bar(all_days, desc='Coverage scan', unit='day', ncols=80)
+
+    for d in (bar if bar is not None else all_days):
         day_files = sorted(glob.glob(str(
             MERGED_DIR / d.strftime('%Y') / d.strftime('%m') /
             d.strftime('%d') / 'merged_*.nc'
         )))
         if not day_files:
-            d += timedelta(days=1)
             continue
 
         daily_valid = set()  # (row, col) cells valid in ANY slot
@@ -613,6 +634,5 @@ def spatial_coverage_stats(start: date, end: date) -> pd.DataFrame:
             'n_valid_cells': n_valid,
             'coverage_pct':  coverage,
         })
-        d += timedelta(days=1)
 
     return pd.DataFrame(records)

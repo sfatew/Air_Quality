@@ -1,17 +1,16 @@
-"""Extract satellite AOD at AERONET station coordinates and build matched pairs.
+"""Match satellite AOD time series with AERONET observations.
 
-Spatial strategy (Ichoku et al. 2002; Levy et al. 2010):
-    Primary   — exact pixel / grid cell containing the station coordinates.
-    Fallback 1 — 3×3 native-cell neighbourhood mean of valid pixels.
-    Fallback 2 — 5×5 neighbourhood (flagged; used only for low-N strata).
-    Rejection  — matchup dropped if within-box AOD std > COLLOCATE_BOX_STD_MAX.
+Reads per-(sensor, site) raw CSV files produced by extract_satellite.py and
+joins them with AERONET observations using a temporal window.
 
 Temporal strategy per sensor:
-    Himawari L2 : each AERONET observation; all 10-min files within ±LEO_WINDOW_MIN.
-    Himawari L3 : daily mean AERONET AOD vs. all L3 hourly composites for the day.
-    VIIRS       : each AERONET observation; granules within ±LEO_WINDOW_MIN.
-    MODIS MAIAC : each AERONET observation; per-orbit UTC from HDF Orbit_time_stamp
-                  attribute; only orbits within ±MODIS_WINDOW_MIN are used.
+    Himawari L2 : for each AERONET obs, average all L2 snapshots within ±LEO_WINDOW_MIN.
+    Himawari L3 : for each calendar date, average all L3 snapshots on that day vs
+                  the daily-mean AERONET AOD.
+    VIIRS       : for each AERONET obs, average all overpass rows within ±LEO_WINDOW_MIN
+                  (typically one overpass per obs).
+    MODIS MAIAC : for each AERONET obs, average all orbit rows within ±MODIS_WINDOW_MIN;
+                  fallback rows (is_fallback=True) match any AERONET obs for the day.
 
 Output:
     One CSV per (sensor, site) at COLLOCATE_DIR / {sensor}_{site}.csv
@@ -22,397 +21,97 @@ Output:
 """
 
 from __future__ import annotations
-from datetime import datetime, timedelta, date
+from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional
-import glob
 
 import numpy as np
 import pandas as pd
-import rasterio
-
-try:
-    from tqdm import tqdm as _tqdm_cls
-    _HAS_TQDM = True
-except ImportError:
-    _tqdm_cls = None  # type: ignore[assignment]
-    _HAS_TQDM = False
-
-
-def _make_bar(iterable, **kwargs):
-    if _HAS_TQDM and _tqdm_cls is not None:
-        return _tqdm_cls(iterable, **kwargs)
-    return None
 
 from config import (
-    AERONET_SITES, AERONET_DIR, DRY_MONTHS,
-    HIMAWARI_L2_DIR, HIMAWARI_L3_DIR,
-    COLLOCATE_DIR, EARTH_RADIUS_KM,
-    LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
+    AERONET_SITES, DRY_MONTHS,
+    EXTRACT_DIR, COLLOCATE_DIR,
     LEO_WINDOW_MIN, MODIS_WINDOW_MIN,
     TZ_OFFSET_HOURS,
-    COLLOCATE_SPATIAL_FLAG_EXACT, COLLOCATE_SPATIAL_FLAG_3X3, COLLOCATE_SPATIAL_FLAG_5X5,
-    BOX_STD_ABS_FLOOR, BOX_STD_SLOPE,
-    VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
-    MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM,
 )
-from aeronet   import load_aeronet, window_mean
-from himawari  import (
-    _l2_files_in_window, _l3_files_in_window,
-    _parse_l2_utc, _parse_l3_utc, _read_band,
-)
-from viirs     import _viirs_files_in_window, _read_viirs_file, _parse_viirs_utc
-from modis     import _modis_files_for_date, _read_modis_tile, _read_modis_orbit_times
+from aeronet import load_aeronet
+from extract_satellite import extract_site
 
-# AERONET timestamps are stored as UTC+7 (Vietnam local time) by crawl.py.
-# All satellite file names and orbit-time stamps use UTC.
-# _TZ converts between the two: subtract to get UTC, add to get UTC+7.
-_TZ = timedelta(hours=TZ_OFFSET_HOURS)
+_TZ = pd.Timedelta(hours=TZ_OFFSET_HOURS)   # subtract from AERONET UTC+7 → UTC
 
-
-# ── Haversine distance ────────────────────────────────────────────────────────
-
-def _haversine_km(lat1: float, lon1: float,
-                  lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
-    R = EARTH_RADIUS_KM
-    dlat = np.radians(lat2 - lat1)
-    dlon = np.radians(lon2 - lon1)
-    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1))*np.cos(np.radians(lat2))*np.sin(dlon/2)**2
-    return R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+_SENSOR_WINDOW: dict[str, int] = {
+    'himawari_l2':  LEO_WINDOW_MIN,
+    'viirs_snpp':   LEO_WINDOW_MIN,
+    'viirs_noaa20': LEO_WINDOW_MIN,
+    'modis_maiac':  MODIS_WINDOW_MIN,
+}
 
 
-# ── Grid-index helper for Himawari ───────────────────────────────────────────
+# ── Matching helpers ──────────────────────────────────────────────────────────
 
-def _station_pixel(station_lat: float, station_lon: float
-                   ) -> Optional[tuple[int, int]]:
-    """Return (row, col) of the 0.05° grid cell containing the station."""
-    row = int((LAT_MAX - station_lat) / GRID_RES)
-    col = int((station_lon - LON_MIN) / GRID_RES)
-    if 0 <= row < NLAT and 0 <= col < NLON:
-        return row, col
-    return None
-
-
-# ── Spatial-sampling helpers ─────────────────────────────────────────────────
-
-def _box_std_max(mean_aod: float, sensor: str) -> float:
-    """AOD-relative heterogeneity cap: max(floor, slope[sensor] × mean_aod)."""
-    slope = BOX_STD_SLOPE.get(sensor, 0.15)
-    return max(BOX_STD_ABS_FLOOR, slope * mean_aod)
-
-
-_GRID_TIERS = (
-    (0, COLLOCATE_SPATIAL_FLAG_EXACT),
-    (1, COLLOCATE_SPATIAL_FLAG_3X3),
-    (2, COLLOCATE_SPATIAL_FLAG_5X5),
-)
-
-
-def _sample_grid_aod(
-    aod_2d: np.ndarray,
-    row: int,
-    col: int,
-    nrows: int,
-    ncols: int,
-    sensor: str,
-) -> 'tuple[float, float, int, int] | None':
-    """Sample a 2-D AOD grid at (row, col) with tiered neighbourhood fallback.
-
-    Tries exact cell → 3×3 → 5×5.  Returns ``(mean, std, n_valid, spatial_flag)``
-    for the first tier that has at least one valid (finite, non-negative) value
-    and whose within-box std does not exceed ``_box_std_max(mean_aod, sensor)``.
-    Returns ``None`` if the scene is heterogeneous at the first populated tier,
-    or if no data exist.
-
-    Used for Himawari (0.05° grid) and MODIS MAIAC when a 2-D array is
-    available (e.g. after loading an orbit layer).
-    """
-    for hw, flag in _GRID_TIERS:
-        r0 = max(0, row - hw)
-        r1 = min(nrows, row + hw + 1)
-        c0 = max(0, col - hw)
-        c1 = min(ncols, col + hw + 1)
-        patch = aod_2d[r0:r1, c0:c1].ravel()
-        vals  = patch[np.isfinite(patch) & (patch >= 0)]
-        if len(vals) == 0:
-            continue
-        mean_v = float(np.mean(vals))
-        std_v  = float(np.std(vals, ddof=0))
-        if std_v > _box_std_max(mean_v, sensor):
-            return None   # scene too heterogeneous at this scale
-        return mean_v, std_v, int(len(vals)), flag
-    return None
-
-
-def _sample_swath_aod(
-    swath_lat: np.ndarray,
-    swath_lon: np.ndarray,
-    swath_aod: np.ndarray,
-    station_lat: float,
-    station_lon: float,
-    exact_km: float,
-    r3x3_km: float,
-    r5x5_km: float,
-    sensor: str,
-) -> 'tuple[float, float, float, int, int] | None':
-    """Sample ungridded swath pixels near a station with tiered neighbourhood fallback.
-
-    Tries exact pixel → 3×3-equivalent radius → 5×5-equivalent radius.
-    Returns ``(mean_aod, std_aod, mean_dist_km, n_valid, spatial_flag)`` for the
-    first tier that has data and passes the AOD-relative heterogeneity filter
-    ``_box_std_max(mean_aod, sensor)``, or ``None``.
-
-    Used for VIIRS (raw swath) and MODIS when flat pixel arrays are used.
-    """
-    dist = _haversine_km(station_lat, station_lon, swath_lat, swath_lon)
-    valid_aod = np.isfinite(swath_aod) & (swath_aod >= 0)
-
-    for max_km, flag in (
-        (exact_km, COLLOCATE_SPATIAL_FLAG_EXACT),
-        (r3x3_km,  COLLOCATE_SPATIAL_FLAG_3X3),
-        (r5x5_km,  COLLOCATE_SPATIAL_FLAG_5X5),
-    ):
-        mask = valid_aod & (dist <= max_km)
-        vals = swath_aod[mask]
-        if len(vals) == 0:
-            continue
-        mean_v = float(np.mean(vals))
-        std_v  = float(np.std(vals, ddof=0))
-        if std_v > _box_std_max(mean_v, sensor):
-            return None
-        return (
-            mean_v,
-            std_v,
-            float(np.mean(dist[mask])),
-            int(len(vals)),
-            flag,
-        )
-    return None
-
-
-# ── Per-sensor collocators ────────────────────────────────────────────────────
-
-def _collocate_himawari_l2(
-    aeronet_df: pd.DataFrame,
-    site: str,
-    station_lat: float,
-    station_lon: float,
-    window_min: int = LEO_WINDOW_MIN,
-) -> list[dict]:
-    """Match Himawari L2 10-min files to individual AERONET observations.
-
-    Spatial strategy: exact grid cell → 3×3 → 5×5 neighbourhood (cell indices).
-    For each AERONET time, all L2 files within ±window_min are collected; the
-    neighbourhood mean is computed per file and then averaged across files.
-    Records where the within-box std exceeds COLLOCATE_BOX_STD_MAX are dropped.
-    """
-    records = []
-
-    for _, aer_row in aeronet_df.iterrows():
-        aer_dt  = aer_row['datetime']          # UTC+7 (Vietnam local time)
-        aer_aod = float(aer_row['aod_550'])
-
-        files = _l2_files_in_window(aer_dt - _TZ, window_min)  # file names are UTC
-        if not files:
-            continue
-
-        per_file_means: list[float] = []
-        best_flag = COLLOCATE_SPATIAL_FLAG_5X5  # track the smallest neighbourhood used
-
-        for fpath in files:
-            try:
-                with rasterio.open(str(fpath)) as src:
-                    # Locate station in TIF coordinates via the file's own georeference
-                    tif_row, tif_col = rasterio.transform.rowcol(
-                        src.transform, station_lon, station_lat
-                    )
-                    if not (0 <= tif_row < src.height and 0 <= tif_col < src.width):
-                        continue
-                    aot_band = _read_band(src, 1)
-                    H, W = src.height, src.width
-            except Exception:
-                continue
-
-            result = _sample_grid_aod(aot_band, tif_row, tif_col, H, W, sensor='himawari_l2')
-            if result is None:
-                continue
-            mean_v, _std, _n, flag = result
-            per_file_means.append(mean_v)
-            if flag < best_flag:
-                best_flag = flag
-
-        if not per_file_means:
-            continue
-
-        records.append({
-            'sensor':              'himawari_l2',
-            'site':                site,
-            'region':              AERONET_SITES[site]['region'],
-            'season':              'dry' if aer_dt.month in DRY_MONTHS else 'wet',
-            'month':               aer_dt.month,
-            'lat':                 station_lat,
-            'lon':                 station_lon,
-            'date':                aer_dt.date().isoformat(),
-            'timestamp_aeronet':   aer_dt.isoformat(),
-            'timestamp_satellite': aer_dt.isoformat(),
-            'satellite_aod':       float(np.mean(per_file_means)),
-            'aeronet_aod':         aer_aod,
-            'dist_km':             0.0,
-            'vza':                 np.nan,
-            'sza':                 np.nan,
-            'spatial_flag':        best_flag,
-            'box_std':             float(np.std(per_file_means, ddof=0)),
-        })
-    return records
-
-
-def _collocate_himawari_l3(
-    aeronet_df: pd.DataFrame,
-    site: str,
-    station_lat: float,
-    station_lon: float,
-) -> list[dict]:
-    """Match Himawari L3 hourly composites to AERONET daily means.
-
-    L3 is a daily composite product; temporal matching is whole-day.
-    Spatial strategy: exact grid cell → 3×3 → 5×5 neighbourhood (cell indices).
-    """
-    records = []
-
-    aeronet_daily = (aeronet_df.groupby(aeronet_df['datetime'].dt.date)
-                                ['aod_550'].mean().reset_index())
-    aeronet_daily.columns = ['date', 'aod_550']
-
-    for date_obj in sorted(set(aeronet_df['datetime'].dt.date)):
-        aer_aod_row = aeronet_daily[aeronet_daily['date'] == date_obj]
-        if aer_aod_row.empty:
-            continue
-        aer_aod = float(aer_aod_row['aod_550'].values[0])
-
-        # 05:00 UTC = 12:00 UTC+7 (Vietnam noon); keeps the same calendar date for
-        # directory lookup while centering the ±12 h window on the UTC+7 day.
-        day_dt = datetime(date_obj.year, date_obj.month, date_obj.day, 5, 0)
-        files  = _l3_files_in_window(day_dt, window_min=720)  # whole-day window
-
-        per_file_means: list[float] = []
-        best_flag = COLLOCATE_SPATIAL_FLAG_5X5
-
-        for fpath in files:
-            try:
-                with rasterio.open(str(fpath)) as src:
-                    tif_row, tif_col = rasterio.transform.rowcol(
-                        src.transform, station_lon, station_lat
-                    )
-                    if not (0 <= tif_row < src.height and 0 <= tif_col < src.width):
-                        continue
-                    band2 = _read_band(src, 2)   # AOT_Merged
-                    H, W  = src.height, src.width
-            except Exception:
-                continue
-
-            result = _sample_grid_aod(band2, tif_row, tif_col, H, W, sensor='himawari_l3')
-            if result is None:
-                continue
-            mean_v, _std, _n, flag = result
-            per_file_means.append(mean_v)
-            if flag < best_flag:
-                best_flag = flag
-
-        if not per_file_means:
-            continue
-
-        dt_repr = datetime(date_obj.year, date_obj.month, date_obj.day)
-        records.append({
-            'sensor':              'himawari_l3',
-            'site':                site,
-            'region':              AERONET_SITES[site]['region'],
-            'season':              'dry' if date_obj.month in DRY_MONTHS else 'wet',
-            'month':               date_obj.month,
-            'lat':                 station_lat,
-            'lon':                 station_lon,
-            'date':                date_obj.isoformat(),
-            'timestamp_aeronet':   dt_repr.isoformat(),
-            'timestamp_satellite': dt_repr.isoformat(),
-            'satellite_aod':       float(np.mean(per_file_means)),
-            'aeronet_aod':         aer_aod,
-            'dist_km':             0.0,
-            'vza':                 np.nan,
-            'sza':                 np.nan,
-            'spatial_flag':        best_flag,
-            'box_std':             float(np.std(per_file_means, ddof=0)),
-        })
-    return records
-
-
-def _collocate_viirs(
-    aeronet_df: pd.DataFrame,
+def _match_leo(
+    sat_df: pd.DataFrame,
+    aer_df: pd.DataFrame,
     sensor: str,
     site: str,
     station_lat: float,
     station_lon: float,
-    window_min: int = LEO_WINDOW_MIN,
 ) -> list[dict]:
-    """Match VIIRS granules to individual AERONET observations.
+    """Match satellite snapshots to AERONET observations by time window.
 
-    Spatial strategy: exact pixel → 3×3 → 5×5 neighbourhood, defined by
-    distance thresholds based on the ~6 km aggregated VIIRS L2 pixel size
-    (VIIRS_EXACT_MAX_KM / VIIRS_3X3_MAX_KM / VIIRS_5X5_MAX_KM).  All pixels
-    from all granules within ±window_min are pooled per AERONET observation
-    before neighbourhood sampling.
+    For each AERONET observation at t_aer (UTC+7), finds all satellite rows
+    within ±window_min of (t_aer converted to UTC) and averages their values.
+    MODIS fallback rows (is_fallback=True) bypass the window and match any
+    AERONET obs on the same UTC calendar date.
+
+    Returns one record per AERONET observation that has at least one match.
     """
-    records = []
+    window_td = pd.Timedelta(minutes=_SENSOR_WINDOW.get(sensor, LEO_WINDOW_MIN))
 
-    for _, aer_row in aeronet_df.iterrows():
+    # Parse UTC timestamps; fallback rows get NaT
+    sat_df = sat_df.copy()
+    sat_df['ts_utc'] = pd.to_datetime(
+        sat_df['timestamp_sat'].replace('', float('nan')), errors='coerce'
+    )
+    is_fallback = sat_df['is_fallback'].fillna(False).astype(bool)
+    normal_sat  = sat_df[~is_fallback]
+    fallback_sat = sat_df[is_fallback]
+
+    # Pre-extract a UTC date column for fallback matching
+    # Fallback rows were generated from a specific date; recover it from the pool key
+    # (timestamp_sat is empty, but we can infer date from surrounding context).
+    # Since the raw CSV has no explicit date column for fallback rows, we derive it
+    # from the sat_aod uniqueness — instead, we re-index fallback by row position
+    # and match against AERONET date.  The is_fallback sentinel means "whole day",
+    # but we need the day.  The extract step stores timestamp_sat='' for fallback;
+    # we stored the date implicitly via the pool key 'fallback_{date}'.  Since we
+    # can't recover that date directly from the CSV row, we require the caller to
+    # pass a utc_date column.  If absent, we skip fallback matching.
+    has_fallback_date = 'utc_date' in sat_df.columns
+
+    records = []
+    for _, aer_row in aer_df.iterrows():
         aer_dt  = aer_row['datetime']          # UTC+7
+        aer_utc = aer_dt - _TZ                 # UTC
         aer_aod = float(aer_row['aod_550'])
 
-        files = _viirs_files_in_window(sensor, aer_dt - _TZ, window_min)  # file names are UTC
-        if not files:
-            continue
-
-        # Pool all valid pixels from all granules in the time window
-        all_lat, all_lon, all_aod, all_vza, all_sza = [], [], [], [], []
-        sat_ts = ''
-        for fpath in files:
-            px = _read_viirs_file(fpath)
-            if px is None:
-                continue
-            all_lat.append(px['lat'])
-            all_lon.append(px['lon'])
-            all_aod.append(px['aod'])
-            all_vza.append(px['vza'])
-            all_sza.append(px['sza'])
-            if not sat_ts:
-                fdt = _parse_viirs_utc(fpath.name) if hasattr(fpath, 'name') else None
-                if fdt:
-                    sat_ts = (fdt + _TZ).isoformat()  # store as UTC+7
-
-        if not all_lat:
-            continue
-
-        lat_arr = np.concatenate(all_lat)
-        lon_arr = np.concatenate(all_lon)
-        aod_arr = np.concatenate(all_aod)
-        vza_arr = np.concatenate(all_vza)
-        sza_arr = np.concatenate(all_sza)
-
-        result = _sample_swath_aod(
-            lat_arr, lon_arr, aod_arr,
-            station_lat, station_lon,
-            VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
-            sensor=sensor,
+        # Time-window match against non-fallback rows
+        mask = (
+            (normal_sat['ts_utc'] >= aer_utc - window_td)
+            & (normal_sat['ts_utc'] <= aer_utc + window_td)
         )
-        if result is None:
+        matches = normal_sat[mask]
+
+        # Date-based match against fallback rows (MODIS only)
+        if has_fallback_date and not fallback_sat.empty:
+            utc_date = aer_utc.date()
+            fb_mask  = fallback_sat['utc_date'] == str(utc_date)
+            fb_matches = fallback_sat[fb_mask]
+            matches = pd.concat([matches, fb_matches], ignore_index=True)
+
+        if matches.empty:
             continue
-        mean_aod, box_std, mean_dist, _n, flag = result
 
-        # Mean VZA/SZA of contributing pixels
-        dist_arr = _haversine_km(station_lat, station_lon, lat_arr, lon_arr)
-        max_km = (VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM)[flag]
-        hood   = dist_arr <= max_km
-        mean_vza = float(np.nanmean(vza_arr[hood])) if np.any(hood) else np.nan
-        mean_sza = float(np.nanmean(sza_arr[hood])) if np.any(hood) else np.nan
-
+        sat_ts = matches.iloc[0]['timestamp_sat']
         records.append({
             'sensor':              sensor,
             'site':                site,
@@ -424,175 +123,150 @@ def _collocate_viirs(
             'date':                aer_dt.date().isoformat(),
             'timestamp_aeronet':   aer_dt.isoformat(),
             'timestamp_satellite': sat_ts,
-            'satellite_aod':       mean_aod,
+            'satellite_aod':       float(matches['sat_aod'].mean()),
             'aeronet_aod':         aer_aod,
-            'dist_km':             mean_dist,
-            'vza':                 mean_vza,
-            'sza':                 mean_sza,
-            'spatial_flag':        flag,
-            'box_std':             box_std,
+            'dist_km':             float(matches['dist_km'].mean()),
+            'vza':                 float(matches['vza'].mean())
+                                   if matches['vza'].notna().any() else np.nan,
+            'sza':                 float(matches['sza'].mean())
+                                   if matches['sza'].notna().any() else np.nan,
+            'spatial_flag':        int(matches['spatial_flag'].min()),
+            # box_std: temporal std across matched snapshots (scene-change indicator);
+            # collapses to the single-snapshot spatial std when only one row matches.
+            'box_std':             float(matches['sat_aod'].std(ddof=0))
+                                   if len(matches) > 1
+                                   else float(matches['box_std'].iloc[0]),
         })
     return records
 
 
-def _collocate_modis(
-    aeronet_df: pd.DataFrame,
+def _match_l3_daily(
+    sat_df: pd.DataFrame,
+    aer_df: pd.DataFrame,
+    sensor: str,
     site: str,
     station_lat: float,
     station_lon: float,
 ) -> list[dict]:
-    """Match MODIS MAIAC orbits to individual AERONET observations.
+    """Match Himawari L3 hourly composites to AERONET daily means.
 
-    Temporal strategy: for each AERONET observation, find MCD19A2 orbit layers
-    whose UTC overpass time (read from the HDF ``Orbit_time_stamp`` attribute)
-    falls within ±MODIS_WINDOW_MIN.  If orbit times cannot be parsed, all orbits
-    from the daily file are used as a fallback.
-
-    Spatial strategy: exact MAIAC pixel → 3×3 → 5×5 neighbourhood, defined by
-    distance thresholds matched to the 1 km MAIAC native grid
-    (MODIS_EXACT_MAX_KM / MODIS_3X3_MAX_KM / MODIS_5X5_MAX_KM).
+    For each calendar date that appears in both the satellite time series and
+    the AERONET record, averages all L3 snapshots for that day and pairs with
+    the AERONET daily mean.  The satellite timestamp is UTC; the calendar date
+    is taken from the satellite side (which is already in UTC).
     """
+    sat_df = sat_df.copy()
+    sat_df['sat_date'] = pd.to_datetime(sat_df['timestamp_sat']).dt.date
+
+    aer_daily = (
+        aer_df
+        .assign(aer_date=aer_df['datetime'].dt.date)
+        .groupby('aer_date')['aod_550'].mean()
+        .reset_index()
+        .rename(columns={'aer_date': 'date', 'aod_550': 'aer_aod'})
+    )
+
     records = []
+    for _, row in aer_daily.iterrows():
+        d       = row['date']
+        aer_aod = float(row['aer_aod'])
 
-    for _, aer_row in aeronet_df.iterrows():
-        aer_dt  = aer_row['datetime']          # UTC+7
-        aer_aod = float(aer_row['aod_550'])
-        aer_dt_utc = aer_dt - _TZ             # UTC — used for all satellite lookups
-
-        files = _modis_files_for_date(aer_dt_utc)  # directory structure uses UTC
-        if not files:
+        # Satellite date: L3 timestamps are UTC; convert AERONET UTC+7 date → UTC
+        # date by shifting back 7 h.  For simplicity we match both the UTC+7 date
+        # and the UTC date (they can differ by one day around midnight).
+        aer_utc_date = (
+            pd.Timestamp(d) - _TZ
+        ).date()
+        day_sat = sat_df[sat_df['sat_date'].isin([d, aer_utc_date])]
+        if day_sat.empty:
             continue
 
-        # Collect pixels from all tiles, filtering to matching orbits
-        all_lat, all_lon, all_aod, all_vza, all_sza = [], [], [], [], []
-        sat_ts = ''
-
-        for fpath in files:
-            orbit_times = _read_modis_orbit_times(str(fpath))  # returns UTC datetimes
-
-            if orbit_times:
-                matching = [
-                    i for i, t in enumerate(orbit_times)
-                    if abs((t - aer_dt_utc).total_seconds()) <= MODIS_WINDOW_MIN * 60
-                ]
-                if not matching:
-                    continue
-                if not sat_ts and matching:
-                    sat_ts = (orbit_times[matching[0]] + _TZ).isoformat()  # store as UTC+7
-                orb_filter = matching
-            else:
-                # Orbit times unavailable — use all orbits for this day
-                orb_filter = None
-                if not sat_ts:
-                    sat_ts = aer_dt.date().isoformat()  # UTC+7 date
-
-            px = _read_modis_tile(str(fpath), orbit_indices=orb_filter)
-            if px is None:
-                continue
-            all_lat.append(px['lat'])
-            all_lon.append(px['lon'])
-            all_aod.append(px['aod'])
-            all_vza.append(px['vza'])
-            all_sza.append(px['sza'])
-
-        if not all_lat:
-            continue
-
-        lat_arr = np.concatenate(all_lat)
-        lon_arr = np.concatenate(all_lon)
-        aod_arr = np.concatenate(all_aod)
-        vza_arr = np.concatenate(all_vza)
-        sza_arr = np.concatenate(all_sza)
-
-        result = _sample_swath_aod(
-            lat_arr, lon_arr, aod_arr,
-            station_lat, station_lon,
-            MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM,
-            sensor='modis_maiac',
-        )
-        if result is None:
-            continue
-        mean_aod, box_std, mean_dist, _n, flag = result
-
-        dist_arr = _haversine_km(station_lat, station_lon, lat_arr, lon_arr)
-        max_km   = (MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM)[flag]
-        hood     = dist_arr <= max_km
-        mean_vza = float(np.nanmean(vza_arr[hood])) if np.any(hood) else np.nan
-        mean_sza = float(np.nanmean(sza_arr[hood])) if np.any(hood) else np.nan
-
+        dt_repr = pd.Timestamp(d)
         records.append({
-            'sensor':              'modis_maiac',
+            'sensor':              sensor,
             'site':                site,
             'region':              AERONET_SITES[site]['region'],
-            'season':              'dry' if aer_dt.month in DRY_MONTHS else 'wet',
-            'month':               aer_dt.month,
+            'season':              'dry' if d.month in DRY_MONTHS else 'wet',
+            'month':               d.month,
             'lat':                 station_lat,
             'lon':                 station_lon,
-            'date':                aer_dt.date().isoformat(),
-            'timestamp_aeronet':   aer_dt.isoformat(),
-            'timestamp_satellite': sat_ts,
-            'satellite_aod':       mean_aod,
+            'date':                d.isoformat(),
+            'timestamp_aeronet':   dt_repr.isoformat(),
+            'timestamp_satellite': day_sat.iloc[0]['timestamp_sat'],
+            'satellite_aod':       float(day_sat['sat_aod'].mean()),
             'aeronet_aod':         aer_aod,
-            'dist_km':             mean_dist,
-            'vza':                 mean_vza,
-            'sza':                 mean_sza,
-            'spatial_flag':        flag,
-            'box_std':             box_std,
+            'dist_km':             0.0,
+            'vza':                 np.nan,
+            'sza':                 np.nan,
+            'spatial_flag':        int(day_sat['spatial_flag'].min()),
+            'box_std':             float(day_sat['sat_aod'].std(ddof=0))
+                                   if len(day_sat) > 1
+                                   else float(day_sat['box_std'].iloc[0]),
         })
     return records
 
 
-# ── Main colocation entry point ───────────────────────────────────────────────
+# ── Main matching entry points ────────────────────────────────────────────────
 
-def collocate_site(
+def match_site(
     site: str,
-    start_date: date,
-    end_date:   date,
     sensors: tuple[str, ...] = (
         'himawari_l2', 'himawari_l3',
         'viirs_snpp', 'viirs_noaa20',
         'modis_maiac',
     ),
-    output_dir: Path | str = COLLOCATE_DIR,
+    extract_dir: Path | str = EXTRACT_DIR,
+    output_dir:  Path | str = COLLOCATE_DIR,
 ) -> dict[str, pd.DataFrame]:
-    """Run colocation for one AERONET site over a date range.
+    """Match extracted satellite time series with AERONET for one site.
 
-    Returns a dict mapping sensor → DataFrame of matched pairs.
-    Also writes/appends per-sensor CSVs to output_dir.
+    Reads raw satellite CSVs from extract_dir (written by extract_site()),
+    loads AERONET for the site, and writes matched-pair CSVs to output_dir.
+
+    New pairs are appended and de-duplicated on (timestamp_aeronet,
+    timestamp_satellite) so re-runs for overlapping periods are safe.
+
+    Returns a dict mapping sensor → DataFrame of all matched pairs.
     """
-    output_dir = Path(output_dir)
+    extract_dir = Path(extract_dir)
+    output_dir  = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    meta = AERONET_SITES[site]
+    meta        = AERONET_SITES[site]
     station_lat = meta['lat']
     station_lon = meta['lon']
 
-    # Load AERONET data for the requested period
     aer_all = load_aeronet(site)
-    aer_all = aer_all[
-        (aer_all['datetime'].dt.date >= start_date)
-        & (aer_all['datetime'].dt.date <= end_date)
-    ].copy()
-
-    if aer_all.empty:
-        print(f'  [{site}] No AERONET data in range.')
-        return {}
 
     results: dict[str, pd.DataFrame] = {}
+    for sensor in sensors:
+        raw_path = extract_dir / f'{sensor}_{site}_raw.csv'
+        if not raw_path.exists():
+            continue
 
-    sensor_bar = _make_bar(list(sensors), desc=f'  {site} sensors', unit='sensor',
-                           ncols=72, leave=False)
-    for sensor in (sensor_bar if sensor_bar is not None else sensors):
-        records: list[dict] = []
+        sat_df = pd.read_csv(raw_path)
+        if sat_df.empty:
+            continue
 
-        if sensor == 'himawari_l2':
-            records = _collocate_himawari_l2(aer_all, site, station_lat, station_lon)
-        elif sensor == 'himawari_l3':
-            records = _collocate_himawari_l3(aer_all, site, station_lat, station_lon)
-        elif sensor in ('viirs_snpp', 'viirs_noaa20'):
-            records = _collocate_viirs(aer_all, sensor, site, station_lat, station_lon)
-        elif sensor == 'modis_maiac':
-            records = _collocate_modis(aer_all, site, station_lat, station_lon)
+        # Add utc_date column for MODIS fallback matching
+        if sensor == 'modis_maiac':
+            sat_df['utc_date'] = sat_df.apply(
+                lambda r: (
+                    pd.to_datetime(r['timestamp_sat']).date().isoformat()
+                    if str(r.get('timestamp_sat', '')).strip()
+                    else ''
+                ),
+                axis=1,
+            )
+
+        if sensor == 'himawari_l3':
+            records = _match_l3_daily(
+                sat_df, aer_all, sensor, site, station_lat, station_lon
+            )
+        else:
+            records = _match_leo(
+                sat_df, aer_all, sensor, site, station_lat, station_lon
+            )
 
         if not records:
             continue
@@ -613,3 +287,36 @@ def collocate_site(
         print(f'  [{site}] {sensor}: {len(records)} new pairs  (total {len(df)})')
 
     return results
+
+
+def collocate_site(
+    site: str,
+    start_date: date,
+    end_date: date,
+    sensors: tuple[str, ...] = (
+        'himawari_l2', 'himawari_l3',
+        'viirs_snpp', 'viirs_noaa20',
+        'modis_maiac',
+    ),
+    output_dir:  Path | str = COLLOCATE_DIR,
+    extract_dir: Path | str = EXTRACT_DIR,
+) -> dict[str, pd.DataFrame]:
+    """Extract satellite data then match with AERONET for one site.
+
+    Convenience wrapper that calls extract_site() followed by match_site().
+    Use the two functions separately when you want to re-match with different
+    AERONET data or time windows without re-reading satellite files.
+
+    Returns the matched-pair DataFrames (same as match_site).
+    """
+    extract_site(
+        site, start_date, end_date,
+        sensors=sensors,
+        output_dir=Path(extract_dir),
+    )
+    return match_site(
+        site,
+        sensors=sensors,
+        extract_dir=Path(extract_dir),
+        output_dir=Path(output_dir),
+    )

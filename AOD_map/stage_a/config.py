@@ -152,7 +152,13 @@ AERONET_DIR      = DATA_ROOT / 'AERONET' / '10'
 ERA5_FILE        = DATA_ROOT / 'ERA5' / 'Vietnam_ERA5_bbox.nc'
 
 OUTPUT_DIR       = DATA_ROOT / 'Stage_A'
-COLLOCATE_DIR    = OUTPUT_DIR / 'collocated'    # satellite–AERONET matched CSVs
+EXTRACT_DIR      = OUTPUT_DIR / 'extracted'     # raw satellite AOD time series at stations
+COLLOCATE_DIR    = OUTPUT_DIR / 'collocated'    # satellite–AERONET matched pairs
 GRIDDED_DIR      = OUTPUT_DIR / 'gridded'       # per-sensor 30-min gridded arrays
 MERGED_DIR       = OUTPUT_DIR / 'merged'        # final ICW-merged 30-min NetCDFs
 BIASC_DIR        = OUTPUT_DIR / 'bias_corr'     # bias-correction coefficient files
+
+# ── VIIRS overpass grouping ───────────────────────────────────────────────────
+# Consecutive granules whose UTC timestamps differ by ≤ this threshold are
+# considered the same overpass and pooled before spatial extraction.
+VIIRS_OVERPASS_GAP_MIN = 5

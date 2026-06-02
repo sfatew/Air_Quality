@@ -50,6 +50,7 @@ from config import (
     COLLOCATE_DIR, EARTH_RADIUS_KM,
     LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
     LEO_WINDOW_MIN, MODIS_WINDOW_MIN,
+    TZ_OFFSET_HOURS,
     COLLOCATE_SPATIAL_FLAG_EXACT, COLLOCATE_SPATIAL_FLAG_3X3, COLLOCATE_SPATIAL_FLAG_5X5,
     COLLOCATE_BOX_STD_MAX,
     VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
@@ -62,6 +63,11 @@ from himawari  import (
 )
 from viirs     import _viirs_files_in_window, _read_viirs_file, _parse_viirs_utc
 from modis     import _modis_files_for_date, _read_modis_tile, _read_modis_orbit_times
+
+# AERONET timestamps are stored as UTC+7 (Vietnam local time) by crawl.py.
+# All satellite file names and orbit-time stamps use UTC.
+# _TZ converts between the two: subtract to get UTC, add to get UTC+7.
+_TZ = timedelta(hours=TZ_OFFSET_HOURS)
 
 
 # ── Haversine distance ────────────────────────────────────────────────────────
@@ -193,10 +199,10 @@ def _collocate_himawari_l2(
     records = []
 
     for _, aer_row in aeronet_df.iterrows():
-        aer_dt  = aer_row['datetime']
+        aer_dt  = aer_row['datetime']          # UTC+7 (Vietnam local time)
         aer_aod = float(aer_row['aod_550'])
 
-        files = _l2_files_in_window(aer_dt, window_min)
+        files = _l2_files_in_window(aer_dt - _TZ, window_min)  # file names are UTC
         if not files:
             continue
 
@@ -273,7 +279,9 @@ def _collocate_himawari_l3(
             continue
         aer_aod = float(aer_aod_row['aod_550'].values[0])
 
-        day_dt = datetime(date_obj.year, date_obj.month, date_obj.day, 6, 0)
+        # 05:00 UTC = 12:00 UTC+7 (Vietnam noon); keeps the same calendar date for
+        # directory lookup while centering the ±12 h window on the UTC+7 day.
+        day_dt = datetime(date_obj.year, date_obj.month, date_obj.day, 5, 0)
         files  = _l3_files_in_window(day_dt, window_min=720)  # whole-day window
 
         per_file_means: list[float] = []
@@ -345,10 +353,10 @@ def _collocate_viirs(
     records = []
 
     for _, aer_row in aeronet_df.iterrows():
-        aer_dt  = aer_row['datetime']
+        aer_dt  = aer_row['datetime']          # UTC+7
         aer_aod = float(aer_row['aod_550'])
 
-        files = _viirs_files_in_window(sensor, aer_dt, window_min)
+        files = _viirs_files_in_window(sensor, aer_dt - _TZ, window_min)  # file names are UTC
         if not files:
             continue
 
@@ -367,7 +375,7 @@ def _collocate_viirs(
             if not sat_ts:
                 fdt = _parse_viirs_utc(fpath.name) if hasattr(fpath, 'name') else None
                 if fdt:
-                    sat_ts = fdt.isoformat()
+                    sat_ts = (fdt + _TZ).isoformat()  # store as UTC+7
 
         if not all_lat:
             continue
@@ -436,10 +444,11 @@ def _collocate_modis(
     records = []
 
     for _, aer_row in aeronet_df.iterrows():
-        aer_dt  = aer_row['datetime']
+        aer_dt  = aer_row['datetime']          # UTC+7
         aer_aod = float(aer_row['aod_550'])
+        aer_dt_utc = aer_dt - _TZ             # UTC — used for all satellite lookups
 
-        files = _modis_files_for_date(aer_dt)
+        files = _modis_files_for_date(aer_dt_utc)  # directory structure uses UTC
         if not files:
             continue
 
@@ -448,23 +457,23 @@ def _collocate_modis(
         sat_ts = ''
 
         for fpath in files:
-            orbit_times = _read_modis_orbit_times(str(fpath))
+            orbit_times = _read_modis_orbit_times(str(fpath))  # returns UTC datetimes
 
             if orbit_times:
                 matching = [
                     i for i, t in enumerate(orbit_times)
-                    if abs((t - aer_dt).total_seconds()) <= MODIS_WINDOW_MIN * 60
+                    if abs((t - aer_dt_utc).total_seconds()) <= MODIS_WINDOW_MIN * 60
                 ]
                 if not matching:
                     continue
                 if not sat_ts and matching:
-                    sat_ts = orbit_times[matching[0]].isoformat()
+                    sat_ts = (orbit_times[matching[0]] + _TZ).isoformat()  # store as UTC+7
                 orb_filter = matching
             else:
                 # Orbit times unavailable — use all orbits for this day
                 orb_filter = None
                 if not sat_ts:
-                    sat_ts = aer_dt.date().isoformat()
+                    sat_ts = aer_dt.date().isoformat()  # UTC+7 date
 
             px = _read_modis_tile(str(fpath), orbit_indices=orb_filter)
             if px is None:

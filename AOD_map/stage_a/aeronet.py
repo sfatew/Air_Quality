@@ -36,7 +36,8 @@ def load_aeronet(site: str) -> pd.DataFrame:
     """Load AERONET V3 L2.0 CSV for one site.
 
     Returns a clean DataFrame with columns:
-        datetime        UTC (tz-naive pandas Timestamp)
+        datetime        UTC+7 / Vietnam local time (tz-naive pandas Timestamp;
+                        crawl.py adds +7 h to raw AERONET UTC timestamps)
         site            site name string
         lat, lon        site coordinates (degrees)
         aod_500         AOD at 500 nm

@@ -50,10 +50,12 @@ def _make_bar(iterable, **kwargs):
 from config import (
     AERONET_SITES, DRY_MONTHS,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
-    MERGED_DIR,
+    MERGED_DIR, TZ_OFFSET_HOURS,
     LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
 )
 from aeronet import load_all_aeronet
+
+_TZ = pd.Timedelta(hours=TZ_OFFSET_HOURS)  # UTC → UTC+7 (AERONET datetimes are UTC+7)
 
 # ── Study period splits ────────────────────────────────────────────────────────
 TRAIN_END   = date(2024, 12, 31)   # inclusive training period end
@@ -162,8 +164,9 @@ def extract_aeronet_pairs(
         fill_val   = -9999.0
         aod_merged = np.where(aod_merged == fill_val, np.nan, aod_merged)
 
-        slot_utc_ts = pd.Timestamp(slot)
-        delta       = pd.Timedelta(minutes=window_min)
+        slot_utc_ts   = pd.Timestamp(slot)
+        slot_local_ts = slot_utc_ts + _TZ   # AERONET datetimes are UTC+7
+        delta         = pd.Timedelta(minutes=window_min)
 
         for site, (row, col) in station_rc.items():
             if not (0 <= row < NLAT and 0 <= col < NLON):
@@ -176,14 +179,14 @@ def extract_aeronet_pairs(
             c_flag   = int(conf_flag[row, col])
             n_sens   = int(n_sensors[row, col])
 
-            # Find AERONET obs in window
+            # Find AERONET obs in window (compare UTC+7 to UTC+7)
             site_df = aer_by_site.get(site)
             if site_df is None or site_df.empty:
                 continue
 
             in_win = site_df[
-                (site_df['datetime'] >= slot_utc_ts - delta) &
-                (site_df['datetime'] <= slot_utc_ts + delta)
+                (site_df['datetime'] >= slot_local_ts - delta) &
+                (site_df['datetime'] <= slot_local_ts + delta)
             ]
             if in_win.empty:
                 continue

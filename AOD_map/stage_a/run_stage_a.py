@@ -21,6 +21,7 @@ python run_stage_a.py --start 2023-01-01 --end 2023-01-31 --no-physics
 from __future__ import annotations
 import argparse
 import sys
+import time
 import traceback
 from datetime import datetime, timedelta, date
 from pathlib import Path
@@ -28,6 +29,13 @@ from typing import Optional
 import concurrent.futures
 
 import numpy as np
+
+try:
+    from tqdm import tqdm as _tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _tqdm = None
+    _HAS_TQDM = False
 
 from config import (
     LATS, LONS, NLAT, NLON,
@@ -48,6 +56,68 @@ _SENSOR_KEYS = {
     'viirs':    ['viirs_snpp', 'viirs_noaa20'],
     'modis':    ['modis_maiac'],
 }
+
+SLOTS_PER_DAY = 48
+
+
+# ── Environment banner ────────────────────────────────────────────────────────
+
+def _print_env_banner() -> None:
+    """Print library versions and active compute backend to stdout."""
+    W = 64
+    print("=" * W)
+    print("Stage A Pipeline — Runtime Environment")
+    print("-" * W)
+
+    # Python
+    print(f"  {'Python':<12} {sys.version.split()[0]}")
+
+    # Key scientific libraries
+    _libs = [
+        ("numpy",    "NumPy"),
+        ("cupy",     "CuPy"),
+        ("scipy",    "SciPy"),
+        ("xarray",   "xarray"),
+        ("netCDF4",  "netCDF4"),
+        ("rasterio", "rasterio"),
+        ("tqdm",     "tqdm"),
+    ]
+    for mod_name, label in _libs:
+        try:
+            mod = __import__(mod_name)
+            ver = getattr(mod, "__version__", "?")
+            extra = ""
+            if mod_name == "cupy":
+                try:
+                    dev_id = mod.cuda.Device().id
+                    props  = mod.cuda.runtime.getDeviceProperties(dev_id)
+                    gpu_name = props["name"].decode() if isinstance(props["name"], bytes) else str(props["name"])
+                    extra = f"  ← GPU: {gpu_name}"
+                except Exception:
+                    extra = "  ← GPU: (unknown device)"
+            print(f"  {label:<12} {ver}{extra}")
+        except ImportError:
+            note = "  ← falling back to NumPy (CPU)" if mod_name == "cupy" else ""
+            print(f"  {label:<12} not installed{note}")
+
+    # Active compute backend (shared across gridder / physics / fusion)
+    try:
+        import gridder
+        backend = "CuPy  (GPU-accelerated)" if gridder._xp.__name__ == "cupy" else "NumPy (CPU only)"
+    except Exception:
+        backend = "unknown"
+    print(f"  {'Backend':<12} {backend}")
+
+    print("=" * W)
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format elapsed seconds as 'Xm Ys' or 'Xs'."""
+    if seconds >= 60:
+        m = int(seconds // 60)
+        s = seconds - m * 60
+        return f"{m}m {s:.1f}s"
+    return f"{seconds:.1f}s"
 
 
 # ── NetCDF writer ─────────────────────────────────────────────────────────────
@@ -123,135 +193,6 @@ def _write_netcdf(
 
 
 # ── Per-slot processing ───────────────────────────────────────────────────────
-
-def process_slot(
-    slot_utc:    datetime,
-    corrections: dict,
-    rmse_dict:   dict,
-    lat_2d:      np.ndarray,
-    sensor_groups: list[str],
-    dry_run:     bool = False,
-) -> Optional[Path]:
-    """Run Steps A1–A2–A4–A5 for one 30-min UTC slot.
-
-    Returns the output NetCDF path on success, None on skip/error.
-    """
-    month = slot_utc.month
-
-    # --- Step A2: build per-sensor gridded AOD arrays ---------------------
-    raw_grids: dict[str, Optional[np.ndarray]] = {}
-
-    if 'himawari' in sensor_groups:
-        hi_result = read_himawari_slot(slot_utc)
-        if hi_result is not None:
-            hi_grid = grid_from_himawari(hi_result)
-            # Treat blended result as a unified 'himawari' sensor; internally
-            # the blend already chose L2 vs L3 per region.
-            # We store both for diagnostic output and separate bias correction.
-            raw_grids['himawari_l2'] = hi_result.get('aot')
-            raw_grids['himawari_l3'] = hi_result.get('aot')  # same blended array
-        else:
-            raw_grids['himawari_l2'] = None
-            raw_grids['himawari_l3'] = None
-
-    if 'viirs' in sensor_groups:
-        for sensor in ('viirs_snpp', 'viirs_noaa20'):
-            px = read_viirs_slot(sensor, slot_utc)
-            if px is not None:
-                g = bin_to_grid(px['lat'], px['lon'], px['aod'],
-                                vza=px['vza'], sza=px['sza'])
-                raw_grids[sensor] = g['aod_mean']
-            else:
-                raw_grids[sensor] = None
-
-    if 'modis' in sensor_groups:
-        # MODIS: entire day's data; use if within ±6h of slot (midday overpass)
-        # For 30-min slots near 03:00–08:00 UTC (10:00–15:00 local), MODIS is present.
-        # We load the daily grid once and reuse across slots; here we load per-slot
-        # for simplicity (cache in run_day loop below).
-        px_mod = read_modis_date(slot_utc)
-        if px_mod is not None:
-            g = bin_to_grid(px_mod['lat'], px_mod['lon'], px_mod['aod'],
-                            ae=px_mod['ae'])
-            raw_grids['modis_maiac'] = g['aod_mean']
-        else:
-            raw_grids['modis_maiac'] = None
-
-    # Check if any data available
-    has_any = any(v is not None and np.any(np.isfinite(v))
-                  for v in raw_grids.values())
-    if not has_any:
-        return None
-
-    if dry_run:
-        return Path('dry_run')
-
-    # --- Step A4: apply bias correction ------------------------------------
-    corrected: dict[str, Optional[np.ndarray]] = {}
-    for sensor, aod in raw_grids.items():
-        if aod is None:
-            corrected[sensor] = None
-            continue
-        corrected[sensor] = apply_correction_grid(
-            aod, sensor, month, lat_2d, lon_2d, corrections
-        )
-
-    # --- Step A5: ICW fusion -----------------------------------------------
-    valid_corrected = {k: v for k, v in corrected.items() if v is not None}
-    merged = fuse(valid_corrected, month, lat_2d, rmse_dict)
-
-    # --- Write NetCDF -------------------------------------------------------
-    yyyymm = slot_utc.strftime('%Y%m')
-    dd     = slot_utc.strftime('%d')
-    hhmm   = slot_utc.strftime('%H%M')
-    out_path = MERGED_DIR / slot_utc.strftime('%Y') / slot_utc.strftime('%m') \
-               / slot_utc.strftime('%d') / f'merged_{slot_utc.strftime("%Y%m%d_%H%M")}.nc'
-
-    try:
-        _write_netcdf(out_path, merged, corrected, slot_utc)
-    except Exception as e:
-        print(f'  [!] Write error {out_path}: {e}')
-        return None
-
-    return out_path
-
-
-def _make_lat_lon_grids() -> tuple[np.ndarray, np.ndarray]:
-    from config import LATS, LONS
-    return np.meshgrid(LATS, LONS, indexing='ij')
-
-
-def run_day(
-    day: date,
-    sensor_groups: list[str],
-    corrections: dict,
-    rmse_dict: dict,
-    lat_2d: np.ndarray,
-    lon_2d: np.ndarray,
-    use_physics: bool = True,
-    dry_run: bool = False,
-) -> int:
-    """Process all 48 slots for one calendar day. Returns number of slots written."""
-    written = 0
-    # Load MODIS once per day (expensive HDF reads)
-    modis_cache: Optional[dict] = None
-    if 'modis' in sensor_groups:
-        modis_cache = read_modis_date(datetime(day.year, day.month, day.day))
-
-    for slot_idx in range(48):
-        slot_utc = datetime(day.year, day.month, day.day) + timedelta(minutes=slot_idx * SLOT_MINUTES)
-        try:
-            out = _process_slot_with_modis_cache(
-                slot_utc, corrections, rmse_dict, lat_2d, lon_2d,
-                sensor_groups, modis_cache, use_physics, dry_run,
-            )
-            if out is not None:
-                written += 1
-        except Exception:
-            pass
-
-    return written
-
 
 def _process_slot_with_modis_cache(
     slot_utc: datetime,
@@ -342,13 +283,83 @@ def _process_slot_with_modis_cache(
     return out_path
 
 
+def _make_lat_lon_grids() -> tuple[np.ndarray, np.ndarray]:
+    from config import LATS, LONS
+    return np.meshgrid(LATS, LONS, indexing='ij')
+
+
+# ── Per-day driver ────────────────────────────────────────────────────────────
+
+def run_day(
+    day: date,
+    sensor_groups: list[str],
+    corrections: dict,
+    rmse_dict: dict,
+    lat_2d: np.ndarray,
+    lon_2d: np.ndarray,
+    use_physics: bool = True,
+    dry_run: bool = False,
+    show_slot_bar: bool = False,
+) -> tuple[int, int]:
+    """Process all 48 slots for one calendar day.
+
+    Returns (n_written, n_errors).
+    """
+    written = 0
+    errors  = 0
+    skipped = 0
+
+    # Load MODIS once per day (expensive HDF reads)
+    modis_cache: Optional[dict] = None
+    if 'modis' in sensor_groups:
+        modis_cache = read_modis_date(datetime(day.year, day.month, day.day))
+
+    slot_range = range(SLOTS_PER_DAY)
+    if show_slot_bar and _HAS_TQDM:
+        slot_iter = _tqdm(
+            slot_range,
+            desc=f"  {day}",
+            leave=False,
+            unit="slot",
+            ncols=80,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}  [{elapsed}<{remaining}]  {postfix}",
+        )
+    else:
+        slot_iter = slot_range
+
+    for slot_idx in slot_iter:
+        slot_utc = (datetime(day.year, day.month, day.day)
+                    + timedelta(minutes=slot_idx * SLOT_MINUTES))
+        try:
+            out = _process_slot_with_modis_cache(
+                slot_utc, corrections, rmse_dict, lat_2d, lon_2d,
+                sensor_groups, modis_cache, use_physics, dry_run,
+            )
+            if out is not None:
+                written += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            errors += 1
+            msg = f"    [ERROR] {slot_utc.strftime('%H:%M')} UTC: {exc}"
+            if show_slot_bar and _HAS_TQDM:
+                slot_iter.write(msg)   # type: ignore[union-attr]
+            else:
+                print(msg)
+
+        if show_slot_bar and _HAS_TQDM:
+            slot_iter.set_postfix(ok=written, skip=skipped, err=errors)  # type: ignore[union-attr]
+
+    return written, errors
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(description='Run Stage A pipeline')
     p.add_argument('--start',      required=True, help='Start date YYYY-MM-DD')
     p.add_argument('--end',        required=True, help='End date YYYY-MM-DD')
-    p.add_argument('--sensors',    nargs='+',     default=_ALL_SENSOR_GROUPS,
+    p.add_argument('--sensors',    nargs='+',     default=list(_ALL_SENSOR_GROUPS),
                    choices=_ALL_SENSOR_GROUPS,
                    help='Sensor groups to include (default: all)')
     p.add_argument('--workers',    type=int,      default=1,
@@ -367,10 +378,15 @@ def main():
     sensors = args.sensors
 
     use_physics = not args.no_physics
-    print(f'Stage A pipeline: {start_d} → {end_d}')
-    print(f'Sensors:  {sensors}')
-    print(f'Physics:  {"enabled (ERA5 RH/PBLH)" if use_physics else "disabled (--no-physics)"}')
-    print(f'Output:   {MERGED_DIR}')
+
+    _print_env_banner()
+
+    print(f'Stage A pipeline : {start_d} → {end_d}')
+    print(f'Sensors          : {sensors}')
+    print(f'Physics (A3)     : {"enabled (ERA5 RH/PBLH)" if use_physics else "disabled (--no-physics)"}')
+    print(f'Workers          : {args.workers}')
+    print(f'Dry-run          : {args.dry_run}')
+    print(f'Output           : {MERGED_DIR}')
 
     # Load pre-trained bias corrections (or empty dict if none exist yet)
     all_sensor_keys = [k for grp in sensors for k in _SENSOR_KEYS.get(grp, [])]
@@ -378,45 +394,95 @@ def main():
     rmse_dict   = load_rmse()
     lat_2d, lon_2d = _make_lat_lon_grids()
 
-    print(f'Loaded {len(corrections)} bias-correction strata.')
-    if not corrections:
-        print('  (No CDF corrections found — using prior RMSE weights, no bias correction.)')
+    n_strata = len(corrections)
+    print(f'Bias strata      : {n_strata}'
+          + ('' if n_strata else '  (none found — using prior RMSE weights, no bias correction)'))
 
     # Enumerate calendar days
-    days = []
+    days: list[date] = []
     d = start_d
     while d <= end_d:
         days.append(d)
         d += timedelta(days=1)
 
+    n_days        = len(days)
+    total_slots   = n_days * SLOTS_PER_DAY
+    print(f'\nProcessing {n_days} day(s) × {SLOTS_PER_DAY} slots = {total_slots} slots total')
+    if args.dry_run:
+        print('[DRY RUN — no files will be written]')
+
     total_written = 0
+    total_errors  = 0
+    wall_t0 = time.perf_counter()
 
     try:
         if args.workers > 1:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as ex:
-                futures = {
-                    ex.submit(run_day, day, sensors, corrections, rmse_dict,
-                              lat_2d, lon_2d, use_physics, args.dry_run): day
-                    for day in days
-                }
-                for fut in concurrent.futures.as_completed(futures):
-                    day = futures[fut]
-                    try:
-                        n = fut.result()
-                        total_written += n
-                        print(f'  {day}: {n} slots')
-                    except Exception:
-                        print(f'  {day}: ERROR\n{traceback.format_exc()}')
+            # Multi-process: slot-level bars won't render cleanly in subprocesses;
+            # show a per-day summary line as each future completes.
+            _day_bar = (_tqdm(total=n_days, desc='Days', unit='day', ncols=80)
+                        if _HAS_TQDM else None)
+            try:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as ex:
+                    futures = {
+                        ex.submit(
+                            run_day, day, sensors, corrections, rmse_dict,
+                            lat_2d, lon_2d, use_physics, args.dry_run,
+                            False,   # show_slot_bar=False in subprocesses
+                        ): day
+                        for day in days
+                    }
+                    for fut in concurrent.futures.as_completed(futures):
+                        day = futures[fut]
+                        try:
+                            n_ok, n_err = fut.result()
+                            total_written += n_ok
+                            total_errors  += n_err
+                            msg = (f'  {day}: {n_ok}/{SLOTS_PER_DAY} slots written'
+                                   + (f', {n_err} error(s)' if n_err else ''))
+                        except Exception:
+                            msg = f'  {day}: FAILED\n{traceback.format_exc()}'
+                        if _day_bar is not None:
+                            _day_bar.write(msg)
+                            _day_bar.update(1)
+                        else:
+                            print(msg)
+            finally:
+                if _day_bar is not None:
+                    _day_bar.close()
+
         else:
-            for day in days:
-                n = run_day(day, sensors, corrections, rmse_dict,
-                            lat_2d, lon_2d, use_physics, args.dry_run)
-                total_written += n
-                print(f'  {day}: {n} slot(s) written')
+            # Single-process: nested tqdm bars (outer=days, inner=slots).
+            _day_bar = (_tqdm(days, desc='Days', unit='day', ncols=80)
+                        if _HAS_TQDM else None)
+            day_iter = _day_bar if _day_bar is not None else days
+
+            for day in day_iter:
+                t0 = time.perf_counter()
+                n_ok, n_err = run_day(
+                    day, sensors, corrections, rmse_dict,
+                    lat_2d, lon_2d, use_physics, args.dry_run,
+                    show_slot_bar=True,
+                )
+                elapsed = time.perf_counter() - t0
+                total_written += n_ok
+                total_errors  += n_err
+
+                summary = (f'  {day}: {n_ok}/{SLOTS_PER_DAY} slots written'
+                           + (f', {n_err} error(s)' if n_err else '')
+                           + f'  [{_fmt_duration(elapsed)}]')
+                if _day_bar is not None:
+                    _day_bar.write(summary)
+                else:
+                    print(summary)
+
     finally:
         close_era5()   # release ERA5 file handle
 
-    print(f'\nDone. Total slots written: {total_written}')
+    wall_elapsed = time.perf_counter() - wall_t0
+    print(f'\n{"─" * 64}')
+    print(f'Done.  {total_written}/{total_slots} slots written across {n_days} day(s)'
+          + (f', {total_errors} error(s)' if total_errors else '')
+          + f'  [total: {_fmt_duration(wall_elapsed)}]')
 
 
 if __name__ == '__main__':

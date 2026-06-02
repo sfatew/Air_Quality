@@ -52,7 +52,7 @@ from config import (
     LEO_WINDOW_MIN, MODIS_WINDOW_MIN,
     TZ_OFFSET_HOURS,
     COLLOCATE_SPATIAL_FLAG_EXACT, COLLOCATE_SPATIAL_FLAG_3X3, COLLOCATE_SPATIAL_FLAG_5X5,
-    COLLOCATE_BOX_STD_MAX,
+    BOX_STD_ABS_FLOOR, BOX_STD_SLOPE,
     VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
     MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM,
 )
@@ -95,6 +95,12 @@ def _station_pixel(station_lat: float, station_lon: float
 
 # ── Spatial-sampling helpers ─────────────────────────────────────────────────
 
+def _box_std_max(mean_aod: float, sensor: str) -> float:
+    """AOD-relative heterogeneity cap: max(floor, slope[sensor] × mean_aod)."""
+    slope = BOX_STD_SLOPE.get(sensor, 0.15)
+    return max(BOX_STD_ABS_FLOOR, slope * mean_aod)
+
+
 _GRID_TIERS = (
     (0, COLLOCATE_SPATIAL_FLAG_EXACT),
     (1, COLLOCATE_SPATIAL_FLAG_3X3),
@@ -108,14 +114,15 @@ def _sample_grid_aod(
     col: int,
     nrows: int,
     ncols: int,
-    std_max: float = COLLOCATE_BOX_STD_MAX,
+    sensor: str,
 ) -> 'tuple[float, float, int, int] | None':
     """Sample a 2-D AOD grid at (row, col) with tiered neighbourhood fallback.
 
     Tries exact cell → 3×3 → 5×5.  Returns ``(mean, std, n_valid, spatial_flag)``
     for the first tier that has at least one valid (finite, non-negative) value
-    and whose within-box std does not exceed *std_max*.  Returns ``None`` if the
-    scene is heterogeneous at the first populated tier, or if no data exist.
+    and whose within-box std does not exceed ``_box_std_max(mean_aod, sensor)``.
+    Returns ``None`` if the scene is heterogeneous at the first populated tier,
+    or if no data exist.
 
     Used for Himawari (0.05° grid) and MODIS MAIAC when a 2-D array is
     available (e.g. after loading an orbit layer).
@@ -129,10 +136,11 @@ def _sample_grid_aod(
         vals  = patch[np.isfinite(patch) & (patch >= 0)]
         if len(vals) == 0:
             continue
-        std_v = float(np.std(vals, ddof=0))
-        if std_v > std_max:
+        mean_v = float(np.mean(vals))
+        std_v  = float(np.std(vals, ddof=0))
+        if std_v > _box_std_max(mean_v, sensor):
             return None   # scene too heterogeneous at this scale
-        return float(np.mean(vals)), std_v, int(len(vals)), flag
+        return mean_v, std_v, int(len(vals)), flag
     return None
 
 
@@ -145,13 +153,14 @@ def _sample_swath_aod(
     exact_km: float,
     r3x3_km: float,
     r5x5_km: float,
-    std_max: float = COLLOCATE_BOX_STD_MAX,
+    sensor: str,
 ) -> 'tuple[float, float, float, int, int] | None':
     """Sample ungridded swath pixels near a station with tiered neighbourhood fallback.
 
     Tries exact pixel → 3×3-equivalent radius → 5×5-equivalent radius.
     Returns ``(mean_aod, std_aod, mean_dist_km, n_valid, spatial_flag)`` for the
-    first tier that has data and passes the heterogeneity filter, or ``None``.
+    first tier that has data and passes the AOD-relative heterogeneity filter
+    ``_box_std_max(mean_aod, sensor)``, or ``None``.
 
     Used for VIIRS (raw swath) and MODIS when flat pixel arrays are used.
     """
@@ -167,11 +176,12 @@ def _sample_swath_aod(
         vals = swath_aod[mask]
         if len(vals) == 0:
             continue
-        std_v = float(np.std(vals, ddof=0))
-        if std_v > std_max:
+        mean_v = float(np.mean(vals))
+        std_v  = float(np.std(vals, ddof=0))
+        if std_v > _box_std_max(mean_v, sensor):
             return None
         return (
-            float(np.mean(vals)),
+            mean_v,
             std_v,
             float(np.mean(dist[mask])),
             int(len(vals)),
@@ -223,7 +233,7 @@ def _collocate_himawari_l2(
             except Exception:
                 continue
 
-            result = _sample_grid_aod(aot_band, tif_row, tif_col, H, W)
+            result = _sample_grid_aod(aot_band, tif_row, tif_col, H, W, sensor='himawari_l2')
             if result is None:
                 continue
             mean_v, _std, _n, flag = result
@@ -300,7 +310,7 @@ def _collocate_himawari_l3(
             except Exception:
                 continue
 
-            result = _sample_grid_aod(band2, tif_row, tif_col, H, W)
+            result = _sample_grid_aod(band2, tif_row, tif_col, H, W, sensor='himawari_l3')
             if result is None:
                 continue
             mean_v, _std, _n, flag = result
@@ -390,6 +400,7 @@ def _collocate_viirs(
             lat_arr, lon_arr, aod_arr,
             station_lat, station_lon,
             VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
+            sensor=sensor,
         )
         if result is None:
             continue
@@ -497,6 +508,7 @@ def _collocate_modis(
             lat_arr, lon_arr, aod_arr,
             station_lat, station_lon,
             MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM,
+            sensor='modis_maiac',
         )
         if result is None:
             continue

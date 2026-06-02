@@ -109,9 +109,22 @@ COLLOCATE_SPATIAL_FLAG_EXACT = 0   # station falls in the exact pixel/grid cell
 COLLOCATE_SPATIAL_FLAG_3X3   = 1   # 3×3 native-cell neighbourhood mean (fallback)
 COLLOCATE_SPATIAL_FLAG_5X5   = 2   # 5×5 native-cell neighbourhood (low-N stratum fallback)
 
-# Reject matchup if within-neighbourhood AOD std-dev exceeds this threshold
-# (cloud edges, mixed surfaces, or residual aerosol gradients across the box)
-COLLOCATE_BOX_STD_MAX = 0.3
+# Reject matchup if within-neighbourhood AOD std exceeds the retrieval's own
+# expected-error (EE) envelope at the observed AOD level.
+# threshold = max(BOX_STD_ABS_FLOOR, BOX_STD_SLOPE[sensor] × mean_box_aod)
+BOX_STD_ABS_FLOOR = 0.05   # absolute floor shared across sensors
+
+# One-sigma EE slopes per product (used for box heterogeneity rejection)
+# MODIS MAIAC:   Lyapustin 2018 / Falah 2021 — tighter algorithm
+# VIIRS Deep Blue: Sayer 2019
+# Himawari AHI:  Zhang 2019 (AHI-specific validation)
+BOX_STD_SLOPE = {
+    'himawari_l2':  0.20,
+    'himawari_l3':  0.20,
+    'viirs_snpp':   0.20,
+    'viirs_noaa20': 0.20,
+    'modis_maiac':  0.10,
+}
 
 # Himawari and MODIS MAIAC are on fixed grids; neighbourhoods use cell-index half-widths
 # (half_width 0 = exact cell, 1 = 3×3 box, 2 = 5×5 box).

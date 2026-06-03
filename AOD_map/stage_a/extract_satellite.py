@@ -51,12 +51,11 @@ from config import (
     COLLOCATE_SPATIAL_FLAG_EXACT, COLLOCATE_SPATIAL_FLAG_3X3, COLLOCATE_SPATIAL_FLAG_5X5,
     BOX_STD_ABS_FLOOR, BOX_STD_SLOPE,
     VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
-    MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM,
     VIIRS_OVERPASS_GAP_MIN,
 )
 from himawari import _parse_l2_utc, _parse_l3_utc, _read_band
 from viirs    import _viirs_files_for_date, _parse_viirs_utc, _read_viirs_file
-from modis    import _modis_files_for_date, _read_modis_orbit_times, _read_modis_tile
+from modis    import _modis_files_for_date, _tile_station_rowcol, _read_modis_tile_aod2d
 
 
 # ── Haversine distance ────────────────────────────────────────────────────────
@@ -99,7 +98,7 @@ def _sample_grid_aod(
         r0 = max(0, row - hw);  r1 = min(nrows, row + hw + 1)
         c0 = max(0, col - hw);  c1 = min(ncols, col + hw + 1)
         vals = aod_2d[r0:r1, c0:c1].ravel()
-        vals = vals[np.isfinite(vals) & (vals >= 0)]
+        vals = vals[np.isfinite(vals) & (vals >= 0) & (vals <= 5.0)]
         if len(vals) == 0:
             continue
         mean_v = float(np.mean(vals))
@@ -226,12 +225,14 @@ def _extract_himawari_l3(
                     )
                     if not (0 <= tif_row < src.height and 0 <= tif_col < src.width):
                         continue
-                    band2 = _read_band(src, 2)   # AOT_Merged
-                    H, W  = src.height, src.width
+                    band2  = _read_band(src, 2)   # AOT_Merged
+                    band10 = _read_band(src, 10)  # AOT_L2_Mean fallback
+                    aot    = np.where(~np.isnan(band2), band2, band10)
+                    H, W   = src.height, src.width
             except Exception:
                 continue
 
-            result = _sample_grid_aod(band2, tif_row, tif_col, H, W, sensor='himawari_l3')
+            result = _sample_grid_aod(aot, tif_row, tif_col, H, W, sensor='himawari_l3')
             if result is None:
                 continue
             mean_v, std_v, _n, flag = result
@@ -369,15 +370,19 @@ def _extract_modis(
     start_date: date,
     end_date: date,
 ) -> list[dict]:
-    """One row per MODIS orbit at the station.
+    """One row per MODIS orbit at the station using grid-based neighbourhood sampling.
 
-    Orbit timestamps are read from each HDF's Orbit_time_stamp attribute.
-    Pixels from all tiles covering the same orbit are pooled before spatial
-    extraction — equivalent to the per-orbit tile-pooling in the old code.
+    MAIAC is a 1 km sinusoidal grid — the station's row/col is looked up via
+    the tile's rasterio transform and _sample_grid_aod is applied on the 2D
+    QA-filtered AOD array, exactly like Himawari.  When the station is near a
+    tile boundary the neighbourhood is clipped to the tile edge (acceptable:
+    Vietnam stations are never closer than 5 pixels to a tile boundary).
 
     When orbit timestamps are unavailable, all orbits for the day are pooled
-    into a single fallback row (is_fallback=True); the match step then uses
+    into a single fallback row (is_fallback=True); the match step uses
     date-based rather than time-window matching for those rows.
+
+    dist_km is 0.0 for all rows (station is inside its grid cell by definition).
     """
     records = []
     for d in _date_range(start_date, end_date):
@@ -386,73 +391,60 @@ def _extract_modis(
         if not files:
             continue
 
-        # orbit_key → {lat, lon, aod, vza, sza, ts (datetime|None), fallback (bool)}
+        # orbit_key → {aod_2d, row, col, H, W, vza, sza, ts, fallback}
         orbit_pools: dict[str, dict] = {}
 
         for fpath in files:
-            orbit_times = _read_modis_orbit_times(str(fpath))
-            # Read the file once for all orbits; splitting per orbit below avoids
-            # the O(n_orbits) repeat of HDF I/O + scipy.zoom + lat/lon transforms.
-            px_all = _read_modis_tile(str(fpath), orbit_indices=None)
-            if px_all is None:
-                continue
+            rc = _tile_station_rowcol(str(fpath), station_lat, station_lon)
+            if rc is None:
+                continue  # station not in this tile
+            row, col, H, W = rc
 
-            if orbit_times:
-                for i, t in enumerate(orbit_times):
-                    key = t.isoformat()
-                    mask = px_all['orbit_idx'] == i
-                    if not np.any(mask):
-                        continue
-                    if key not in orbit_pools:
-                        orbit_pools[key] = {
-                            'lat': [], 'lon': [], 'aod': [], 'vza': [], 'sza': [],
-                            'ts': t, 'fallback': False,
-                        }
-                    for k in ('lat', 'lon', 'aod', 'vza', 'sza'):
-                        orbit_pools[key][k].append(px_all[k][mask])
-            else:
-                key = f'fallback_{d.isoformat()}'
+            tile_data = _read_modis_tile_aod2d(str(fpath))
+            if tile_data is None:
+                continue
+            orbit_times, aod_2d_list, angle_list = tile_data
+
+            for orb_idx, (ts, aod_2d) in enumerate(zip(orbit_times, aod_2d_list)):
+                is_fb = (ts is None)
+                key   = ts.isoformat() if ts else f'fallback_{d.isoformat()}'
+                vza_2d, sza_2d = angle_list[orb_idx]
+                vza_val = float(vza_2d[row, col]) if np.isfinite(vza_2d[row, col]) else np.nan
+                sza_val = float(sza_2d[row, col]) if np.isfinite(sza_2d[row, col]) else np.nan
+
                 if key not in orbit_pools:
                     orbit_pools[key] = {
-                        'lat': [], 'lon': [], 'aod': [], 'vza': [], 'sza': [],
-                        'ts': None, 'fallback': True,
+                        'aod_2d':  aod_2d.copy(),
+                        'row': row, 'col': col, 'H': H, 'W': W,
+                        'vza': vza_val, 'sza': sza_val,
+                        'ts': ts, 'fallback': is_fb,
                     }
-                for k in ('lat', 'lon', 'aod', 'vza', 'sza'):
-                    orbit_pools[key][k].append(px_all[k])
+                else:
+                    # Merge overlapping tiles: first non-NaN value wins per pixel
+                    existing = orbit_pools[key]['aod_2d']
+                    orbit_pools[key]['aod_2d'] = np.where(np.isnan(existing), aod_2d, existing)
+                    if np.isnan(orbit_pools[key]['vza']):
+                        orbit_pools[key]['vza'] = vza_val
+                    if np.isnan(orbit_pools[key]['sza']):
+                        orbit_pools[key]['sza'] = sza_val
 
         for pool in orbit_pools.values():
-            if not pool['lat']:
-                continue
-            lat_arr = np.concatenate(pool['lat'])
-            lon_arr = np.concatenate(pool['lon'])
-            aod_arr = np.concatenate(pool['aod'])
-            vza_arr = np.concatenate(pool['vza'])
-            sza_arr = np.concatenate(pool['sza'])
-
-            result = _sample_swath_aod(
-                lat_arr, lon_arr, aod_arr,
-                station_lat, station_lon,
-                MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM,
-                sensor='modis_maiac',
+            result = _sample_grid_aod(
+                pool['aod_2d'], pool['row'], pool['col'],
+                pool['H'], pool['W'], sensor='modis_maiac',
             )
             if result is None:
                 continue
-            mean_aod, box_std, mean_dist, _n, flag = result
-
-            dist_arr = _haversine_km(station_lat, station_lon, lat_arr, lon_arr)
-            hood = dist_arr <= (MODIS_EXACT_MAX_KM, MODIS_3X3_MAX_KM, MODIS_5X5_MAX_KM)[flag]
-            mean_vza = float(np.nanmean(vza_arr[hood])) if np.any(hood) else np.nan
-            mean_sza = float(np.nanmean(sza_arr[hood])) if np.any(hood) else np.nan
-
-            ts_str = pool['ts'].isoformat() if pool['ts'] is not None else ''
+            mean_aod, box_std, _n, flag = result
+            ts_str = pool['ts'].isoformat() if pool['ts'] else ''
             records.append({
                 'timestamp_sat': ts_str,
                 'sat_aod':       mean_aod,
                 'box_std':       box_std,
                 'spatial_flag':  flag,
-                'dist_km':       mean_dist,
-                'vza':           mean_vza,
-                'sza':           mean_sza,
+                'dist_km':       0.0,
+                'vza':           pool['vza'],
+                'sza':           pool['sza'],
                 'is_fallback':   pool['fallback'],
             })
     return records

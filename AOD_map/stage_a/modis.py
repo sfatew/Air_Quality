@@ -284,6 +284,99 @@ def _read_modis_tile(
     return combined
 
 
+def _tile_station_rowcol(
+    hdf_path: str,
+    station_lat: float,
+    station_lon: float,
+) -> 'tuple[int, int, int, int] | None':
+    """Return (row, col, height, width) of station's grid cell in this tile, or None.
+
+    Converts WGS-84 station coordinates to MODIS sinusoidal projection and
+    looks up the 1 km pixel row/col via the tile's rasterio transform.
+    Returns None if the station falls outside the tile bounds.
+    """
+    ref_sds = f'HDF4_EOS:EOS_GRID:"{hdf_path}":grid1km:Optical_Depth_055'
+    try:
+        sinu_x, sinu_y = _WGS84_TO_SINU.transform(station_lon, station_lat)
+        with rasterio.open(ref_sds) as src:
+            rows, cols = rowcol(src.transform, [sinu_x], [sinu_y])
+            r, c = int(rows[0]), int(cols[0])
+            if 0 <= r < src.height and 0 <= c < src.width:
+                return r, c, src.height, src.width
+    except Exception:
+        pass
+    return None
+
+
+def _read_modis_tile_aod2d(
+    hdf_path: str,
+) -> 'tuple[list, list[np.ndarray], list[tuple[np.ndarray, np.ndarray]]] | None':
+    """Read per-orbit 2D QA-filtered AOD arrays from one MAIAC tile.
+
+    Returns (orbit_times, aod_2d_list, angle_list) or None on failure:
+        orbit_times[i]  : UTC datetime or None (no timestamp available)
+        aod_2d_list[i]  : (H, W) float32 — NaN where QA-rejected or out of range
+        angle_list[i]   : (vza_2d, sza_2d), both (H, W) float32; NaN if unavailable
+
+    Orbit timestamps come from _read_modis_orbit_times; when unavailable the list
+    is padded with None so callers can use a single fallback key for the day.
+    VZA/SZA are shared across orbits (5 km grid resampled to 1 km via nearest-neighbour).
+    """
+    orbit_times = _read_modis_orbit_times(hdf_path)
+    try:
+        aod_3d, _ = _load_sds(hdf_path, 'Optical_Depth_055')
+        qa_3d,  _ = _load_sds(hdf_path, 'AOD_QA')
+    except Exception:
+        return None
+
+    if aod_3d.ndim == 2:
+        aod_3d = aod_3d[np.newaxis]
+        qa_3d  = qa_3d[np.newaxis]
+
+    n_orbits, H, W = aod_3d.shape
+
+    # Resize 5 km VZA/SZA grids to 1 km (shared across orbits)
+    try:
+        cos_vza, _ = _load_sds(hdf_path, 'cosVZA')
+        cos_sza, _ = _load_sds(hdf_path, 'cosSZA')
+        from scipy.ndimage import zoom as _zoom
+        fh = H / cos_vza.shape[0]
+        fw = W / cos_vza.shape[1]
+        vza_2d = np.degrees(np.arccos(np.clip(
+            _zoom(cos_vza, (fh, fw), order=0)[:H, :W], -1.0, 1.0
+        ))).astype(np.float32)
+        sza_2d = np.degrees(np.arccos(np.clip(
+            _zoom(cos_sza, (fh, fw), order=0)[:H, :W], -1.0, 1.0
+        ))).astype(np.float32)
+    except Exception:
+        vza_2d = np.full((H, W), np.nan, dtype=np.float32)
+        sza_2d = np.full((H, W), np.nan, dtype=np.float32)
+
+    # Align orbit_times length to n_orbits
+    if len(orbit_times) < n_orbits:
+        orbit_times = orbit_times + [None] * (n_orbits - len(orbit_times))
+    else:
+        orbit_times = orbit_times[:n_orbits]
+
+    aod_2d_list: list[np.ndarray] = []
+    angle_list: list[tuple[np.ndarray, np.ndarray]] = []
+
+    for orb in range(n_orbits):
+        aod_2d = aod_3d[orb].copy().astype(np.float32)
+        qa_2d  = qa_3d[orb].astype(np.int32)
+        valid  = (
+            ((qa_2d & MODIS_QA_BIT_MASK) == 0)
+            & ~np.isnan(aod_2d)
+            & (aod_2d >= 0.0)
+            & (aod_2d <= 5.0)
+        )
+        aod_2d[~valid] = np.nan
+        aod_2d_list.append(aod_2d)
+        angle_list.append((vza_2d, sza_2d))
+
+    return orbit_times, aod_2d_list, angle_list
+
+
 def read_modis_date(date: datetime) -> Optional[dict[str, np.ndarray]]:
     """Return QA-filtered MODIS MAIAC pixel arrays for all Vietnam tiles on a date.
 

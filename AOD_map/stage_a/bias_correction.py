@@ -128,8 +128,8 @@ class CDFCorrection:
 
     def fit(self, sat_aod: np.ndarray, aer_aod: np.ndarray) -> 'CDFCorrection':
         """Fit the transfer function from matched (satellite, AERONET) pairs."""
-        sat = sat_aod[np.isfinite(sat_aod) & np.isfinite(aer_aod) & (sat_aod >= 0) & (aer_aod >= 0)]
-        aer = aer_aod[np.isfinite(sat_aod) & np.isfinite(aer_aod) & (sat_aod >= 0) & (aer_aod >= 0)]
+        mask = np.isfinite(sat_aod) & np.isfinite(aer_aod) & (sat_aod >= 0) & (aer_aod >= 0)
+        sat, aer = sat_aod[mask], aer_aod[mask]
 
         self.n_pairs = len(sat)
         if self.n_pairs < 5:
@@ -357,7 +357,8 @@ def train_all_corrections(
     for fpath in (csv_bar if csv_bar is not None else csv_files):
         try:
             all_frames.append(pd.read_csv(fpath))
-        except Exception:
+        except Exception as exc:
+            print(f'[bias_correction] warning: skipping {fpath.name}: {exc}')
             continue
     if csv_bar is not None:
         csv_bar.close()

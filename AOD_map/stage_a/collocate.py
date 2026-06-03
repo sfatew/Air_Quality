@@ -91,42 +91,57 @@ def _match_leo(
     records = []
 
     # ── Time-window matching (Ichoku et al. 2002) ─────────────────────────────
-    for _, sat_row in normal_sat.iterrows():
-        ts_utc = sat_row['ts_utc']
-        if pd.isna(ts_utc):
+    # Pre-extract numpy arrays to avoid per-row Pandas overhead; use
+    # searchsorted on int64 nanosecond timestamps for O(log N) window lookup.
+    aer_times_ns = aer_idx.index.values.astype(np.int64)
+    aer_aods_arr = aer_idx['aod_550'].values
+    window_ns    = window_td.value  # int64 nanoseconds
+
+    valid_sat    = normal_sat[normal_sat['ts_utc'].notna()].reset_index(drop=True)
+    sat_times_ns = valid_sat['ts_utc'].values.astype(np.int64)
+    sat_ts_col   = valid_sat['timestamp_sat'].values
+    sat_aod_col  = valid_sat['sat_aod'].values.astype(float)
+    dist_col     = valid_sat['dist_km'].values.astype(float)
+    vza_col      = valid_sat['vza'].values.astype(float)
+    sza_col      = valid_sat['sza'].values.astype(float)
+    sflag_col    = valid_sat['spatial_flag'].values.astype(int)
+    bstd_col     = valid_sat['box_std'].values.astype(float)
+    ts_local_dti = pd.DatetimeIndex(valid_sat['ts_utc'] + _TZ)
+    region_val   = AERONET_SITES[site]['region']
+
+    for i in range(len(valid_sat)):
+        t_ns = sat_times_ns[i]
+        lo   = np.searchsorted(aer_times_ns, t_ns - window_ns, side='left')
+        hi   = np.searchsorted(aer_times_ns, t_ns + window_ns, side='right')
+        vals = aer_aods_arr[lo:hi]
+        if len(vals) == 0:
             continue
 
-        window_aer = aer_idx.loc[ts_utc - window_td : ts_utc + window_td, 'aod_550']
-        if window_aer.empty:
-            continue
-
-        aer_aod  = float(window_aer.mean())
-        aer_n    = int(len(window_aer))
-        aer_std  = float(window_aer.std()) if aer_n > 1 else 0.0
-        ts_local = ts_utc + _TZ   # satellite UTC → local time for date labelling
+        aer_aod  = float(vals.mean())
+        aer_n    = int(len(vals))
+        aer_std  = float(vals.std()) if aer_n > 1 else 0.0
+        tsl      = ts_local_dti[i]
 
         records.append({
             'sensor':              sensor,
             'site':                site,
-            'region':              AERONET_SITES[site]['region'],
-            'season':              'dry' if ts_local.month in DRY_MONTHS else 'wet',
-            'month':               ts_local.month,
+            'region':              region_val,
+            'season':              'dry' if tsl.month in DRY_MONTHS else 'wet',
+            'month':               tsl.month,
             'lat':                 station_lat,
             'lon':                 station_lon,
-            'date':                ts_local.date().isoformat(),
-            'timestamp_aeronet':   ts_local.isoformat(),
-            'timestamp_satellite': sat_row['timestamp_sat'],
-            'satellite_aod':       float(sat_row['sat_aod']),
+            'date':                tsl.date().isoformat(),
+            'timestamp_aeronet':   tsl.isoformat(),
+            'timestamp_satellite': str(sat_ts_col[i]),
+            'satellite_aod':       sat_aod_col[i],
             'aeronet_aod':         aer_aod,
             'aer_n':               aer_n,
             'aer_std':             aer_std,
-            'dist_km':             float(sat_row['dist_km']),
-            'vza':                 float(sat_row['vza'])
-                                   if pd.notna(sat_row['vza']) else np.nan,
-            'sza':                 float(sat_row['sza'])
-                                   if pd.notna(sat_row['sza']) else np.nan,
-            'spatial_flag':        int(sat_row['spatial_flag']),
-            'box_std':             float(sat_row['box_std']),
+            'dist_km':             dist_col[i],
+            'vza':                 float(vza_col[i]) if np.isfinite(vza_col[i]) else np.nan,
+            'sza':                 float(sza_col[i]) if np.isfinite(sza_col[i]) else np.nan,
+            'spatial_flag':        sflag_col[i],
+            'box_std':             bstd_col[i],
         })
 
     # ── Date-based matching for MODIS fallback rows ───────────────────────────
@@ -288,10 +303,19 @@ def match_site(
         if sat_df.empty:
             continue
 
-        # Add utc_date column for MODIS fallback matching
+        # Add utc_date column for MODIS fallback matching.
+        # Non-fallback rows: compute from timestamp_sat.
+        # Fallback rows: timestamp_sat is '' so we preserve the utc_date written
+        # by _extract_modis(); overwriting it would always produce '' and break
+        # the date-based AERONET matching in _match_leo().
         if sensor == 'modis_maiac':
             _ts = pd.to_datetime(sat_df['timestamp_sat'], errors='coerce')
-            sat_df['utc_date'] = _ts.dt.date.astype(str).where(_ts.notna(), '')
+            from_ts = _ts.dt.date.astype(str).where(_ts.notna(), '')
+            is_fb = sat_df['is_fallback'].fillna(False).astype(bool)
+            if 'utc_date' in sat_df.columns:
+                sat_df['utc_date'] = sat_df['utc_date'].where(is_fb, from_ts)
+            else:
+                sat_df['utc_date'] = from_ts
 
         if sensor == 'himawari_l3':
             records = _match_l3_daily(

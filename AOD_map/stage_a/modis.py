@@ -1,14 +1,11 @@
-"""Read MODIS MCD19A2 MAIAC HDF files and apply Step A1 QA filters.
+"""Read MODIS MCD19A2 MAIAC HDF files.
 
 Primary SDS used:
     Optical_Depth_055  – MAIAC AOD at 550 nm (1 km, multi-orbit)
-    AOD_QA             – quality bitmask (16-bit)
     AngstromExp_470-780
     cosSZA / cosVZA    – 5 km grid (resampled to 1 km below)
-    Injection_Height   – (unused in A1 but loaded for future use)
 
-Step A1 filter:
-    • AOD_QA bits 3–4 = 0 (not cloud-adjacent, best algorithm quality)
+Pixel validity filter:
     • Valid AOD range: 0 ≤ AOD ≤ 5
 
 File naming:
@@ -36,7 +33,6 @@ from rasterio.transform import rowcol
 
 from config import (
     MODIS_DIR,
-    MODIS_QA_BIT_MASK,
     LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
 )
 
@@ -87,23 +83,27 @@ def _read_modis_orbit_times(hdf_path: str) -> list[datetime]:
     try:
         from pyhdf.SD import SD, SDC
         hdf = SD(hdf_path, SDC.READ)
-        stamp = str(hdf.attributes().get('Orbit_time_stamp', '')).strip()
+        _raw = hdf.attributes().get('Orbit_time_stamp', '')
+        stamp = (_raw.decode('utf-8') if isinstance(_raw, bytes) else str(_raw)).strip()
         hdf.end()
     except Exception:
         pass
 
-    # Fallback: GDAL metadata exposed through rasterio
+    # Fallback: GDAL metadata via rasterio on the raw HDF4 file.
+    # Must open the raw file path (not an EOS_GRID subdataset path) because
+    # Orbit_time_stamp is a file-level global attribute; subdataset handles
+    # only expose grid-scoped metadata.
     if not stamp:
         try:
-            ref_sds = (
-                f'HDF4_EOS:EOS_GRID:"{hdf_path}":grid1km:Optical_Depth_055'
-            )
-            with rasterio.open(ref_sds) as src:
-                for domain in (None, 'EOS_METADATA', 'HDF_GLOBAL'):
-                    tags = src.tags() if domain is None else src.tags(domain)
-                    if 'Orbit_time_stamp' in tags:
-                        stamp = tags['Orbit_time_stamp'].strip()
-                        break
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*no geotransform.*')
+                with rasterio.open(hdf_path) as src:
+                    for domain in (None, 'EOS_METADATA', 'HDF_GLOBAL'):
+                        tags = src.tags() if domain is None else src.tags(domain)
+                        if 'Orbit_time_stamp' in tags:
+                            _raw = tags['Orbit_time_stamp']
+                            stamp = (_raw.decode('utf-8') if isinstance(_raw, bytes) else str(_raw)).strip()
+                            break
         except Exception:
             pass
 
@@ -149,7 +149,7 @@ def _load_sds(hdf_path: str, sds_name: str) -> tuple[np.ndarray, dict]:
         try:
             lo, hi = float(vrange[0]), float(vrange[1])
             data[(data < lo) | (data > hi)] = np.nan
-        except (TypeError, IndexError):
+        except (TypeError, IndexError, ValueError):
             pass
 
     data = data * scale + offset
@@ -200,7 +200,6 @@ def _read_modis_tile(
     """
     try:
         aod_3d, _  = _load_sds(hdf_path, 'Optical_Depth_055')   # (n_orbits, H, W) or (H, W)
-        qa_3d, _   = _load_sds(hdf_path, 'AOD_QA')
         ae_3d, _   = _load_sds(hdf_path, 'AngstromExp_470-780')
         cos_sza, _ = _load_sds(hdf_path, 'cosSZA')  # 5 km → same shape after resize
         cos_vza, _ = _load_sds(hdf_path, 'cosVZA')
@@ -210,7 +209,6 @@ def _read_modis_tile(
     # Ensure 3-D (orbits, H, W) for multi-orbit SDS
     if aod_3d.ndim == 2:
         aod_3d = aod_3d[np.newaxis]
-        qa_3d  = qa_3d[np.newaxis]
         ae_3d  = ae_3d[np.newaxis]
 
     n_orbits, H, W = aod_3d.shape
@@ -248,16 +246,9 @@ def _read_modis_tile(
     _orb_iter = orbit_indices if orbit_indices is not None else range(n_orbits)
     for orb in _orb_iter:
         aod_2d = aod_3d[orb]
-        qa_2d  = qa_3d[orb].astype(np.int32)
         ae_2d  = ae_3d[orb]
 
-        # Step A1: bits 3–4 of AOD_QA must both be 0
-        qa_ok = (qa_2d & MODIS_QA_BIT_MASK) == 0
-
-        # Valid AOD range
-        aod_ok = ~np.isnan(aod_2d) & (aod_2d >= 0.0) & (aod_2d <= 5.0)
-
-        valid = domain & qa_ok & aod_ok
+        valid = domain & ~np.isnan(aod_2d) & (aod_2d >= 0.0) & (aod_2d <= 5.0)
 
         if not np.any(valid):
             continue
@@ -325,13 +316,11 @@ def _read_modis_tile_aod2d(
     orbit_times = _read_modis_orbit_times(hdf_path)
     try:
         aod_3d, _ = _load_sds(hdf_path, 'Optical_Depth_055')
-        qa_3d,  _ = _load_sds(hdf_path, 'AOD_QA')
     except Exception:
         return None
 
     if aod_3d.ndim == 2:
         aod_3d = aod_3d[np.newaxis]
-        qa_3d  = qa_3d[np.newaxis]
 
     n_orbits, H, W = aod_3d.shape
 
@@ -363,13 +352,7 @@ def _read_modis_tile_aod2d(
 
     for orb in range(n_orbits):
         aod_2d = aod_3d[orb].copy().astype(np.float32)
-        qa_2d  = qa_3d[orb].astype(np.int32)
-        valid  = (
-            ((qa_2d & MODIS_QA_BIT_MASK) == 0)
-            & ~np.isnan(aod_2d)
-            & (aod_2d >= 0.0)
-            & (aod_2d <= 5.0)
-        )
+        valid  = ~np.isnan(aod_2d) & (aod_2d >= 0.0) & (aod_2d <= 5.0)
         aod_2d[~valid] = np.nan
         aod_2d_list.append(aod_2d)
         angle_list.append((vza_2d, sza_2d))
@@ -378,7 +361,7 @@ def _read_modis_tile_aod2d(
 
 
 def read_modis_date(date: datetime) -> Optional[dict[str, np.ndarray]]:
-    """Return QA-filtered MODIS MAIAC pixel arrays for all Vietnam tiles on a date.
+    """Return valid MODIS MAIAC pixel arrays for all Vietnam tiles on a date.
 
     Returns a dict with flat 1-D arrays:
         lat, lon, aod, ae, sza, vza, orbit_idx

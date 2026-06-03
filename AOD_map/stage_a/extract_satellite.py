@@ -119,12 +119,15 @@ def _sample_swath_aod(
     r3x3_km: float,
     r5x5_km: float,
     sensor: str,
+    *,
+    dist: 'np.ndarray | None' = None,
 ) -> 'tuple[float, float, float, int, int] | None':
     """Sample ungridded swath pixels near a station with tiered neighbourhood fallback.
 
     Returns (mean_aod, std_aod, mean_dist_km, n_valid, spatial_flag) or None.
     """
-    dist = _haversine_km(station_lat, station_lon, swath_lat, swath_lon)
+    if dist is None:
+        dist = _haversine_km(station_lat, station_lon, swath_lat, swath_lon)
     valid_aod = np.isfinite(swath_aod) & (swath_aod >= 0)
 
     for max_km, flag in (
@@ -336,17 +339,18 @@ def _extract_viirs(
             vza_arr = np.concatenate(all_vza)
             sza_arr = np.concatenate(all_sza)
 
+            dist_arr = _haversine_km(station_lat, station_lon, lat_arr, lon_arr)
             result = _sample_swath_aod(
                 lat_arr, lon_arr, aod_arr,
                 station_lat, station_lon,
                 VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
                 sensor=sensor,
+                dist=dist_arr,
             )
             if result is None:
                 continue
             mean_aod, box_std, mean_dist, _n, flag = result
 
-            dist_arr = _haversine_km(station_lat, station_lon, lat_arr, lon_arr)
             hood = dist_arr <= (VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM)[flag]
             mean_vza = float(np.nanmean(vza_arr[hood])) if np.any(hood) else np.nan
             mean_sza = float(np.nanmean(sza_arr[hood])) if np.any(hood) else np.nan
@@ -437,8 +441,10 @@ def _extract_modis(
                 continue
             mean_aod, box_std, _n, flag = result
             ts_str = pool['ts'].isoformat() if pool['ts'] else ''
+
             records.append({
                 'timestamp_sat': ts_str,
+                'utc_date':      d.isoformat() if pool['fallback'] else '',
                 'sat_aod':       mean_aod,
                 'box_std':       box_std,
                 'spatial_flag':  flag,
@@ -505,10 +511,11 @@ def extract_site(
         if csv_path.exists():
             existing = pd.read_csv(csv_path)
             df = pd.concat([existing, df], ignore_index=True)
-            # De-duplicate: for fallback rows (empty timestamp_sat) key on is_fallback
             non_fallback = df[~df['is_fallback'].fillna(False)]
             fallback     = df[df['is_fallback'].fillna(False)]
             non_fallback = non_fallback.drop_duplicates(subset=['timestamp_sat'], keep='last')
+            if not fallback.empty and 'utc_date' in fallback.columns:
+                fallback = fallback.drop_duplicates(subset=['utc_date'], keep='last')
             df = pd.concat([non_fallback, fallback], ignore_index=True)
 
         df.to_csv(csv_path, index=False)

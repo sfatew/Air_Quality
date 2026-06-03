@@ -47,6 +47,7 @@ from config import (
     HIMAWARI_L2_DIR, HIMAWARI_L3_DIR,
     EXTRACT_DIR,
     EARTH_RADIUS_KM,
+    LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
     COLLOCATE_SPATIAL_FLAG_EXACT, COLLOCATE_SPATIAL_FLAG_3X3, COLLOCATE_SPATIAL_FLAG_5X5,
     BOX_STD_ABS_FLOOR, BOX_STD_SLOPE,
     VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
@@ -311,6 +312,15 @@ def _extract_viirs(
                 px = _read_viirs_file(fpath)
                 if px is None:
                     continue
+                # Pre-clip to Vietnam domain before haversine to avoid
+                # computing distances for the entire global swath (~2M pixels).
+                bbox_mask = (
+                    (px['lat'] >= LAT_MIN) & (px['lat'] <= LAT_MAX)
+                    & (px['lon'] >= LON_MIN) & (px['lon'] <= LON_MAX)
+                )
+                if not np.any(bbox_mask):
+                    continue
+                px = {k: v[bbox_mask] for k, v in px.items()}
                 all_lat.append(px['lat'])
                 all_lon.append(px['lon'])
                 all_aod.append(px['aod'])
@@ -381,12 +391,17 @@ def _extract_modis(
 
         for fpath in files:
             orbit_times = _read_modis_orbit_times(str(fpath))
+            # Read the file once for all orbits; splitting per orbit below avoids
+            # the O(n_orbits) repeat of HDF I/O + scipy.zoom + lat/lon transforms.
+            px_all = _read_modis_tile(str(fpath), orbit_indices=None)
+            if px_all is None:
+                continue
 
             if orbit_times:
                 for i, t in enumerate(orbit_times):
                     key = t.isoformat()
-                    px = _read_modis_tile(str(fpath), orbit_indices=[i])
-                    if px is None:
+                    mask = px_all['orbit_idx'] == i
+                    if not np.any(mask):
                         continue
                     if key not in orbit_pools:
                         orbit_pools[key] = {
@@ -394,19 +409,16 @@ def _extract_modis(
                             'ts': t, 'fallback': False,
                         }
                     for k in ('lat', 'lon', 'aod', 'vza', 'sza'):
-                        orbit_pools[key][k].append(px[k])
+                        orbit_pools[key][k].append(px_all[k][mask])
             else:
                 key = f'fallback_{d.isoformat()}'
-                px = _read_modis_tile(str(fpath), orbit_indices=None)
-                if px is None:
-                    continue
                 if key not in orbit_pools:
                     orbit_pools[key] = {
                         'lat': [], 'lon': [], 'aod': [], 'vza': [], 'sza': [],
                         'ts': None, 'fallback': True,
                     }
                 for k in ('lat', 'lon', 'aod', 'vza', 'sza'):
-                    orbit_pools[key][k].append(px[k])
+                    orbit_pools[key][k].append(px_all[k])
 
         for pool in orbit_pools.values():
             if not pool['lat']:

@@ -26,6 +26,8 @@ import glob
 import warnings
 from typing import Optional
 
+import re
+
 import numpy as np
 import pyproj
 import rasterio
@@ -42,6 +44,11 @@ from config import (
 _SINU_CRS = '+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +R=6371007.181 +units=m +no_defs'
 _WGS84_TO_SINU = pyproj.Transformer.from_crs('EPSG:4326', _SINU_CRS, always_xy=True)
 _SINU_TO_WGS84 = pyproj.Transformer.from_crs(_SINU_CRS, 'EPSG:4326', always_xy=True)
+
+# Cache lat/lon grids per tile ID (e.g. h27v06). MODIS tiles sit on a fixed
+# sinusoidal grid, so the per-pixel lat/lon never changes across dates.
+# Without this cache, _tile_pixel_latlon transforms ~1.44M pixels per call.
+_TILE_LATLON_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
 # Vietnam tile list
 _VN_TILES = ('h27v06', 'h27v07', 'h27v08', 'h28v06', 'h28v07', 'h28v08')
@@ -150,7 +157,17 @@ def _load_sds(hdf_path: str, sds_name: str) -> tuple[np.ndarray, dict]:
 
 
 def _tile_pixel_latlon(hdf_path: str) -> tuple[np.ndarray, np.ndarray]:
-    """Build per-pixel WGS-84 lat/lon arrays for the 1 km grid of a tile."""
+    """Build per-pixel WGS-84 lat/lon arrays for the 1 km grid of a tile.
+
+    Results are cached by tile ID (e.g. h27v06): the sinusoidal grid position
+    of a tile is fixed across all acquisition dates, so this expensive
+    ~1.44M-pixel transform only runs once per unique tile per process.
+    """
+    m = re.search(r'\.(h\d{2}v\d{2})\.', Path(hdf_path).name)
+    cache_key = m.group(1) if m else hdf_path
+    if cache_key in _TILE_LATLON_CACHE:
+        return _TILE_LATLON_CACHE[cache_key]
+
     ref_sds = f'HDF4_EOS:EOS_GRID:"{hdf_path}":grid1km:Optical_Depth_055'
     with rasterio.open(ref_sds) as src:
         rows, cols = np.indices((src.height, src.width))
@@ -160,6 +177,8 @@ def _tile_pixel_latlon(hdf_path: str) -> tuple[np.ndarray, np.ndarray]:
     lon_flat, lat_flat = _SINU_TO_WGS84.transform(np.array(sinu_x), np.array(sinu_y))
     lat = lat_flat.reshape(rows.shape).astype(np.float32)
     lon = lon_flat.reshape(cols.shape).astype(np.float32)
+
+    _TILE_LATLON_CACHE[cache_key] = (lat, lon)
     return lat, lon
 
 

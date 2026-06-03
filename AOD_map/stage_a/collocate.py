@@ -88,18 +88,20 @@ def _match_leo(
     # pass a utc_date column.  If absent, we skip fallback matching.
     has_fallback_date = 'utc_date' in sat_df.columns
 
+    # Pre-sort once for O(log N) binary search instead of O(N) boolean scan per row.
+    normal_sat_sorted = normal_sat.sort_values('ts_utc').reset_index(drop=True)
+    sat_times = normal_sat_sorted['ts_utc']  # sorted datetime64 Series
+
     records = []
     for _, aer_row in aer_df.iterrows():
         aer_dt  = aer_row['datetime']          # UTC+7
         aer_utc = aer_dt - _TZ                 # UTC
         aer_aod = float(aer_row['aod_550'])
 
-        # Time-window match against non-fallback rows
-        mask = (
-            (normal_sat['ts_utc'] >= aer_utc - window_td)
-            & (normal_sat['ts_utc'] <= aer_utc + window_td)
-        )
-        matches = normal_sat[mask]
+        # Time-window match against non-fallback rows (searchsorted = O(log N))
+        lo = int(sat_times.searchsorted(aer_utc - window_td))
+        hi = int(sat_times.searchsorted(aer_utc + window_td, side='right'))
+        matches = normal_sat_sorted.iloc[lo:hi] if lo < hi else pd.DataFrame()
 
         # Date-based match against fallback rows (MODIS only)
         if has_fallback_date and not fallback_sat.empty:
@@ -250,14 +252,8 @@ def match_site(
 
         # Add utc_date column for MODIS fallback matching
         if sensor == 'modis_maiac':
-            sat_df['utc_date'] = sat_df.apply(
-                lambda r: (
-                    pd.to_datetime(r['timestamp_sat']).date().isoformat()
-                    if str(r.get('timestamp_sat', '')).strip()
-                    else ''
-                ),
-                axis=1,
-            )
+            _ts = pd.to_datetime(sat_df['timestamp_sat'], errors='coerce')
+            sat_df['utc_date'] = _ts.dt.date.astype(str).where(_ts.notna(), '')
 
         if sensor == 'himawari_l3':
             records = _match_l3_daily(

@@ -36,8 +36,9 @@ from scipy.interpolate import PchipInterpolator
 
 try:
     import cupy as cp
+    cp.array([0])  # triggers CUDA init — raises if no GPU device
     _xp = cp
-except ImportError:
+except Exception:
     cp = None
     _xp = np
 

@@ -221,6 +221,10 @@ def _read_modis_tile(
 
     # Resize 5 km SZA/VZA to 1 km (repeat nearest, integer factor ~5×)
     from scipy.ndimage import zoom
+    if cos_sza.ndim == 3:
+        cos_sza = np.nanmean(cos_sza, axis=0)
+    if cos_vza.ndim == 3:
+        cos_vza = np.nanmean(cos_vza, axis=0)
     factor_h = H / cos_sza.shape[0]
     factor_w = W / cos_sza.shape[1]
     cos_sza = zoom(cos_sza, (factor_h, factor_w), order=0)

@@ -52,6 +52,7 @@ from config import (
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
     MERGED_DIR, TZ_OFFSET_HOURS,
     LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
+    DATA_ROOT,
 )
 from aeronet import load_all_aeronet
 
@@ -79,8 +80,8 @@ NGUYEN2025_R2_BASELINES = {
 def _station_rc(site: str) -> tuple[int, int]:
     """Return (row, col) in the 0.05° config grid for a named AERONET site."""
     meta = AERONET_SITES[site]
-    row  = int((LAT_MAX - GRID_RES / 2 - meta['lat']) / GRID_RES)
-    col  = int((meta['lon'] - LON_MIN - GRID_RES / 2) / GRID_RES)
+    row  = int(round((LAT_MAX - GRID_RES / 2 - meta['lat']) / GRID_RES))
+    col  = int(round((meta['lon'] - LON_MIN - GRID_RES / 2) / GRID_RES))
     return row, col
 
 
@@ -152,17 +153,11 @@ def extract_aeronet_pairs(
 
         try:
             with nc.Dataset(fpath) as ds:
-                aod_merged  = ds.variables['AOD_merged'][:]
-                conf_flag   = ds.variables['confidence_flag'][:]
-                n_sensors   = ds.variables['n_sensors'][:]
+                aod_merged = np.ma.filled(ds.variables['AOD_merged'][:].astype(np.float32), np.nan)
+                conf_flag  = np.ma.filled(ds.variables['confidence_flag'][:].astype(np.int8), 0)
+                n_sensors  = np.ma.filled(ds.variables['n_sensors'][:].astype(np.int8), 0)
         except Exception:
             continue
-
-        aod_merged = np.array(aod_merged, dtype=np.float32)
-        conf_flag  = np.array(conf_flag,  dtype=np.int8)
-        n_sensors  = np.array(n_sensors,  dtype=np.int8)
-        fill_val   = -9999.0
-        aod_merged = np.where(aod_merged == fill_val, np.nan, aod_merged)
 
         slot_utc_ts   = pd.Timestamp(slot)
         slot_local_ts = slot_utc_ts + _TZ   # AERONET datetimes are UTC+7
@@ -173,7 +168,7 @@ def extract_aeronet_pairs(
                 continue
 
             sat_aod  = float(aod_merged[row, col])
-            if not np.isfinite(sat_aod):
+            if not np.isfinite(sat_aod) or sat_aod < 0:
                 continue
 
             c_flag   = int(conf_flag[row, col])
@@ -232,7 +227,7 @@ def compute_metrics(
     sat  = sat[mask]
     aer  = aer[mask]
     N    = len(sat)
-    if N < 3:
+    if N < 10:
         return {'N': N, 'R': np.nan, 'R2': np.nan, 'RMSE': np.nan,
                 'MAE': np.nan, 'Bias': np.nan, 'pct_EE': np.nan, 'label': label}
 
@@ -343,9 +338,9 @@ def inter_sensor_consistency(
                 for sen_a, sen_b in sensor_pairs:
                     for s in (sen_a, sen_b):
                         if s in available and s not in slot_data:
-                            arr = np.array(ds.variables[s][:], dtype=np.float32)
-                            arr[arr == -9999.0] = np.nan
-                            slot_data[s] = arr
+                            slot_data[s] = np.ma.filled(
+                                ds.variables[s][:].astype(np.float32), np.nan
+                            )
         except Exception:
             continue
 
@@ -617,9 +612,8 @@ def spatial_coverage_stats(start: date, end: date) -> pd.DataFrame:
         for fpath in day_files:
             try:
                 with nc.Dataset(fpath) as ds:
-                    aod = np.array(ds.variables['AOD_merged'][:])
-                    aod[aod == -9999.0] = np.nan
-                    valid_mask = np.isfinite(aod)
+                    aod = np.ma.filled(ds.variables['AOD_merged'][:].astype(np.float32), np.nan)
+                    valid_mask = np.isfinite(aod) & (aod >= 0)
                     rows_v, cols_v = np.where(valid_mask)
                     daily_valid.update(zip(rows_v.tolist(), cols_v.tolist()))
             except Exception:

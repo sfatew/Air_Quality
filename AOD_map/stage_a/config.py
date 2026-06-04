@@ -33,29 +33,43 @@ AERONET_SITES = {
     'Bac_Lieu':  {'lat': 9.280,  'lon': 105.730, 'region': 'south'},
 }
 
-# ── Pre-correction sensor RMSE from Nguyen et al. 2025 (Table 2 & 3) ─────────
-# Used as initial ICW weights; updated after CDF correction training.
+# ── Pre-correction sensor RMSE (actual training collocation, Sep 2022–Dec 2024) ─
+# Used as initial ICW weight priors; replaced by post_correction_rmse.json once
+# `run_collocate.py train` has been executed.
+# Values are dry-season pre-correction RMSE from collocated pairs — more reliable
+# than the original Nguyen 2025 figures which do not match our data distribution.
 # Key: (sensor_key, region)
 SENSOR_RMSE_PRIOR = {
-    ('himawari_l2', 'north'):   0.481,
-    ('himawari_l2', 'central'): 0.315,  # interpolated
-    ('himawari_l2', 'south'):   0.150,
-    ('himawari_l3', 'north'):   0.444,
-    ('himawari_l3', 'central'): 0.280,  # interpolated
-    ('himawari_l3', 'south'):   0.120,
-    ('modis_maiac', 'north'):   0.295,
-    ('modis_maiac', 'central'): 0.225,  # interpolated
-    ('modis_maiac', 'south'):   0.155,  # note: low R=0.41, downweighted separately
-    ('viirs_snpp',  'north'):   0.271,  # proxy: use NOAA-20 stats
-    ('viirs_snpp',  'central'): 0.200,
-    ('viirs_snpp',  'south'):   0.143,
-    ('viirs_noaa20','north'):   0.271,
-    ('viirs_noaa20','central'): 0.200,
-    ('viirs_noaa20','south'):   0.143,
+    ('himawari_l2', 'north'):   0.525,
+    ('himawari_l2', 'central'): 0.420,
+    ('himawari_l2', 'south'):   0.317,
+    ('himawari_l3', 'north'):   0.477,
+    ('himawari_l3', 'central'): 0.399,
+    ('himawari_l3', 'south'):   0.321,
+    ('modis_maiac', 'north'):   0.385,
+    ('modis_maiac', 'central'): 0.254,
+    ('modis_maiac', 'south'):   0.122,
+    ('viirs_snpp',  'north'):   0.301,
+    ('viirs_snpp',  'central'): 0.244,
+    ('viirs_snpp',  'south'):   0.187,
+    ('viirs_noaa20','north'):   0.243,
+    ('viirs_noaa20','central'): 0.206,
+    ('viirs_noaa20','south'):   0.169,
 }
 
 # MODIS MAIAC gets an extra down-weighting factor in the south (R=0.41 → unreliable)
 MODIS_SOUTH_WEIGHT_FACTOR = 0.1  # effectively removes MAIAC from south fusion
+
+# Himawari wet-season (May–Sep) weight factor.
+# Test-period validation shows R≈0 for both AERONET stations in wet months,
+# caused by cloud-edge contamination that passes the RF/Unc QA filters.
+# Applied analogously to MODIS_SOUTH_WEIGHT_FACTOR.
+HIMAWARI_WET_WEIGHT_FACTOR = 0.1
+
+# Minimum RMSE used when computing ICW weights (1/RMSE²).
+# Wet-season CDF corrections trained on N<20 pairs can reach RMSE≈0.04
+# (overfitting), which gives near-infinite weights and unstable fusion.
+SENSOR_RMSE_FLOOR = 0.05
 
 # ── Sensor fusion inclusion rules ────────────────────────────────────────────
 # Confidence flag assigned to each merged cell based on contributing sensors.

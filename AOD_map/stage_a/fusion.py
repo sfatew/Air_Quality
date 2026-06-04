@@ -41,6 +41,8 @@ except Exception:
 from config import (
     SENSOR_RMSE_PRIOR,
     MODIS_SOUTH_WEIGHT_FACTOR,
+    HIMAWARI_WET_WEIGHT_FACTOR,
+    SENSOR_RMSE_FLOOR,
     CONFIDENCE_FLAG,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
     NLAT, NLON, BIASC_DIR, DRY_MONTHS,
@@ -63,11 +65,12 @@ _RMSE_CACHE_FILE = BIASC_DIR / 'post_correction_rmse.json'
 
 def load_rmse(
     use_post_correction: bool = True,
-) -> dict[tuple[str, str], float]:
-    """Return RMSE dict keyed by (sensor, region).
+) -> dict[tuple, float]:
+    """Return RMSE dict keyed by (sensor, region) or (sensor, region, season).
 
     Tries to load post-correction RMSE from the JSON cache first; falls back
     to the prior values from config.py if the cache is missing.
+    The JSON may contain season-stratified keys written by run_collocate.py.
     """
     if use_post_correction and _RMSE_CACHE_FILE.exists():
         try:
@@ -78,8 +81,11 @@ def load_rmse(
     return dict(SENSOR_RMSE_PRIOR)
 
 
-def save_rmse(rmse_dict: dict[tuple[str, str], float]) -> None:
-    """Persist updated post-correction RMSE values to JSON."""
+def save_rmse(rmse_dict: dict[tuple, float]) -> None:
+    """Persist post-correction RMSE values to JSON.
+
+    Accepts tuples of length 2 (sensor, region) or 3 (sensor, region, season).
+    """
     _RMSE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     raw = {'|'.join(k): v for k, v in rmse_dict.items()}
     _RMSE_CACHE_FILE.write_text(json.dumps(raw, indent=2))
@@ -171,18 +177,26 @@ def fuse(
         if not np.any(has):
             continue
 
-        # Build per-cell RMSE on GPU using integer region codes
+        # Build per-cell RMSE on GPU using integer region codes.
+        # Look up season-specific key first, fall back to region-only, then 'north'.
         rmse_arr_d = xp.full(shape, np.nan, dtype=np.float64)
         for code, reg in _reg_codes:
-            key = (sensor, reg)
-            rmse_val = rmse_dict.get(key, rmse_dict.get((sensor, 'north'), np.nan))
+            rmse_val = rmse_dict.get(
+                (sensor, reg, season),
+                rmse_dict.get((sensor, reg),
+                              rmse_dict.get((sensor, 'north'), np.nan)),
+            )
+            if not np.isnan(rmse_val):
+                rmse_val = max(float(rmse_val), SENSOR_RMSE_FLOOR)
             rmse_arr_d[region_code_d == code] = rmse_val
 
-        # ICW weight = 1 / RMSE²; apply MODIS south downweight inline
+        # ICW weight = 1 / RMSE²; apply per-sensor down-weight factors
         w_d = xp.where(xp.isfinite(rmse_arr_d) & (rmse_arr_d > 0),
                        1.0 / rmse_arr_d ** 2, 0.0)
         if sensor == 'modis_maiac':
             w_d = xp.where(region_code_d == 0, w_d * MODIS_SOUTH_WEIGHT_FACTOR, w_d)
+        if sensor in ('himawari_l2', 'himawari_l3') and season == 'wet':
+            w_d = w_d * HIMAWARI_WET_WEIGHT_FACTOR
 
         aod_d     = xp.asarray(aod)
         has_d     = xp.asarray(has)

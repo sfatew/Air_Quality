@@ -41,10 +41,13 @@ def _make_bar(iterable, **kwargs):
     return None
 
 
+import numpy as np
+
 from config import AERONET_SITES, EXTRACT_DIR, COLLOCATE_DIR, BIASC_DIR
 from extract_satellite import extract_site
 from collocate import match_site, collocate_site
 from bias_correction import train_all_corrections
+from fusion import save_rmse
 
 _ALL_SENSORS = ('himawari_l2', 'himawari_l3', 'viirs_snpp', 'viirs_noaa20', 'modis_maiac')
 _ALL_SITES   = list(AERONET_SITES.keys())
@@ -172,6 +175,18 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
     print(f'\nTrained {len(corrections)} correction(s) saved to {BIASC_DIR}'
           f'  [{_fmt_duration(time.perf_counter() - t0)}]')
+
+    # Persist season-stratified post-correction RMSE so fusion.py uses real
+    # weights instead of the SENSOR_RMSE_PRIOR fallback.
+    rmse_post = {
+        (s, reg, sea): float(c.rmse_after)
+        for (s, reg, sea), c in corrections.items()
+        if not np.isnan(getattr(c, 'rmse_after', float('nan')))
+    }
+    if rmse_post:
+        save_rmse(rmse_post)
+        print(f'  Post-correction RMSE saved ({len(rmse_post)} strata) '
+              f'→ {BIASC_DIR / "post_correction_rmse.json"}')
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

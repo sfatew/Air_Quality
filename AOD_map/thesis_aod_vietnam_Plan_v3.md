@@ -171,13 +171,15 @@ Choice of ancillary predictors mirrors Chen et al. 2023 and Youn et al. 2024 (wh
        ▼                                     │
 [Step A2: Regrid to 0.05°, 30-min slots]     │
        ▼                                     │
-[Step A3: Physics correction (RH, PBLH)] ◄───┤
-       ▼                                     │
-[Step A4: Region/Season bias correction] ◄───┤  (AERONET + LEO–Himawari pairs)
+[Step A4: Region/Season bias correction] ◄───┤  (AERONET + IDW spatial extension)
        ▼                                     │
 [Step A5: Inverse-RMSE sensor fusion]        │
        ▼                                     │
-═══════ Stage A complete: 30-min merged ═════│
+[Step A3: Physics normalization] ◄───────────┘  (applied to AOD_merged; stored as
+       │                                         separate output field only — not
+       │                                         fed back into A4/A5)
+       ▼
+═══════ Stage A complete: 30-min merged ═════
        ▼                                     │
 [Step B1: Daily aggregation]                 │
        ▼                                     │
@@ -198,36 +200,40 @@ Stage A produces the 30-min merged product (analogue of Ahn 2021's hourly compos
 
 ### 7.0 Satellite–AERONET colocation protocol
 
+The colocation workflow is separated into three stages that can be run independently: (1) extract satellite AOD time series at the two AERONET station locations, (2) temporally match the extracted satellite values to the corresponding AERONET observations, and (3) fit the bias-correction transfer functions from the matched pairs. This separation allows new satellite data or updated AERONET records to be incorporated by re-running only the relevant stage.
+
 #### 7.0.1 Spatial matching
 
 Each satellite product uses a tiered neighbourhood approach adapted to its native grid geometry (Ichoku et al. 2002; Levy et al. 2010):
 
-1. **Exact pixel (primary):** The pixel or grid cell whose centre contains the AERONET station coordinates is extracted. For grid-based sensors (Himawari 0.05°, MODIS MAIAC 1 km) this is a direct cell-index lookup; no distance metric is needed.
-2. **3×3 neighbourhood (Fallback 1):** If the exact pixel has no valid retrieval, the mean of all valid pixels within one native-cell radius in each direction is used (a 3×3 box of native cells centred on the station cell). This is consistent with the 5×5 MODIS-pixel neighbourhood of Ichoku et al. (2002) scaled to each sensor's native resolution.
-3. **5×5 neighbourhood (Fallback 2):** Applied only when a particular (sensor × region × season) stratum would otherwise fall below the minimum sample size for CDF fitting (N < CDF_MIN_PAIRS). These matchups carry `spatial_flag = 2` and are held separate during bias-correction training.
+1. **Exact pixel (primary):** The pixel or grid cell whose centre contains the AERONET station coordinates is extracted.
+2. **3×3 neighbourhood (Fallback 1):** If the exact pixel has no valid retrieval, the mean of all valid pixels within one native-cell radius is used (a 3×3 box of native cells centred on the station). This is consistent with the 5×5 MODIS-pixel neighbourhood of Ichoku et al. (2002) scaled to each sensor's native resolution.
+3. **5×5 neighbourhood (Fallback 2):** Applied only when a stratum would otherwise fall below the minimum sample size for CDF fitting (N < 100).
 
-Each matchup record stores `spatial_flag` (0 = exact, 1 = 3×3, 2 = 5×5) and `box_std` (within-neighbourhood AOD standard deviation).
+Each matchup records which spatial tier was used and the within-neighbourhood AOD standard deviation.
 
-**Scene homogeneity filter:** A matchup is rejected if `box_std > 0.3` at the first tier that yields any valid data (Levy et al. 2010, §3.2). This discards retrievals contaminated by cloud edges, mixed land/water, or sub-pixel aerosol gradients. No wider neighbourhood is tried after a heterogeneity rejection.
+**Scene homogeneity filter:** A matchup is rejected if the within-neighbourhood AOD spread exceeds a threshold that scales with the mean AOD at the box (Levy et al. 2010, §3.2). This discards retrievals contaminated by cloud edges, mixed land/water, or sub-pixel aerosol gradients. No wider neighbourhood is tried after a heterogeneity rejection.
 
 **Sensor-specific spatial details:**
 
 | Sensor | Grid type | Exact pixel | 3×3 radius | 5×5 radius |
 |--------|-----------|-------------|------------|------------|
-| Himawari L2/L3 | Fixed 0.05° raster | Cell-index lookup via rasterio | ±1 cell (~5.5 km) | ±2 cells (~11 km) |
-| MODIS MAIAC | Fixed 1 km sinusoidal | Cell-index lookup ≡ distance < 0.5 km | distance < 1.5 km (±1 cell) | distance < 2.5 km (±2 cells) |
-| VIIRS SNPP/NOAA-20 | Raw swath ~6 km aggregated | distance < 3.0 km | distance < 9.0 km | distance < 15.0 km |
+| Himawari L2/L3 | Fixed 0.05° raster | Station's grid cell | ±1 cell (~5.5 km) | ±2 cells (~11 km) |
+| MODIS MAIAC | Fixed 1 km sinusoidal | Station's 1 km cell | ±1 cell (~1.5 km) | ±2 cells (~2.5 km) |
+| VIIRS SNPP/NOAA-20 | Raw swath ~6 km pixels | < 3 km from station | < 9 km | < 15 km |
 
 #### 7.0.2 Temporal matching
 
+**Strategy: satellite-centric.** One record is emitted per satellite snapshot (not per AERONET observation). For each satellite observation, all AERONET measurements within the time window are averaged. This avoids over-representing a single satellite snapshot against multiple AERONET points.
+
 | Sensor | Matched to | Time window | Rationale |
 |--------|-----------|------------|-----------|
-| Himawari L2 | Each AERONET observation | ±30 min | Ichoku et al. (2002) ±30 min criterion; multiple 10-min slots averaged |
-| VIIRS SNPP / NOAA-20 | Each AERONET observation | ±30 min | Overpass UTC parsed from filename field `.A{YYYY}{DOY}.{HHMM}.` |
-| MODIS MAIAC | Each AERONET observation | ±30 min **per orbit** | Per-orbit UTC read from HDF `Orbit_time_stamp` global attribute (`YYYYDDDHHMM{T\|A}` tokens); only the matching orbit layer(s) are extracted from the multi-orbit 3-D SDS array. Falls back to all orbits if the attribute is absent. |
-| Himawari L3 | Daily mean AERONET AOD | Whole day (all hourly composites) | L3 is itself a daily composite product; per-observation matching would introduce sub-daily sampling noise inconsistent with the L3 aggregation. |
+| Himawari L2 | Each 10-min L2 snapshot | ±30 min | Multiple 10-min files within the slot are averaged into one record |
+| VIIRS SNPP / NOAA-20 | Each overpass | ±30 min | Consecutive granules from the same overpass are pooled before extraction |
+| MODIS MAIAC | Each orbit layer separately | ±30 min **per orbit** | Terra (~10:30 LT) and Aqua (~13:30 LT) matched independently using per-orbit timestamps; daily-mean fallback when timestamps are unavailable |
+| Himawari L3 | Daily mean AERONET AOD | Whole day | L3 is itself a daily composite; per-observation matching would introduce noise inconsistent with the L3 aggregation |
 
-The per-orbit MODIS approach avoids confounding diurnal aerosol variation with retrieval bias: Terra (~10:30 LT) and Aqua (~13:30 LT) overpasses are matched independently against only the AERONET observations measured within ±30 min of each orbit, rather than against a daily mean that mixes morning and afternoon aerosol loading.
+The per-orbit MODIS approach avoids confounding diurnal aerosol variation with retrieval bias: Terra and Aqua overpasses are matched independently rather than against a daily mean that mixes morning and afternoon aerosol loading.
 
 ### 7.1 Step A1 — Quality filtering
 
@@ -240,38 +246,40 @@ The per-orbit MODIS approach avoids confounding diurnal aerosol variation with r
 
 **MODIS MAIAC (MCD19A2):**
 
-- QA (bits 3-4) = 0 over land only; exclude snow/ice, cloud-adjacent, high-surface-reflectance pixels.
-- No fine-mode / uncertainty filters (already implicit in MAIAC; further filtering gives nothing).
-- Terra and Aqua separated by overpass time, not pre-merged.
+- Valid AOD range: 0 ≤ AOD ≤ 5. The MAIAC algorithm's internal multi-angle retrieval implicitly restricts to high-quality land retrievals; no additional fine-mode or uncertainty filters are applied (they give no measurable improvement over MAIAC's own pre-filtering).
+- Terra and Aqua orbits separated by per-file timestamp, with a daily-mean fallback when timestamps are unavailable.
 
 **VIIRS Deep Blue (SNPP + NOAA-20):**
 
-- QA ≥ 2 (good + best).
-- SNPP and NOAA-20 treated as separate sensors.
-- Grid cells with fewer than 5 retrievals/month flagged unreliable for bias-correction training.
+- Land pixels: QA ≥ 2 (moderate–good). Ocean and coastal pixels: QA ≥ 1, allowing mixed-surface pixels to contribute when the ocean retrieval meets a lower threshold.
+- Valid AOD range: 0 ≤ AOD ≤ 5.
+- SNPP and NOAA-20 treated as separate sensors throughout.
 
 ### 7.2 Step A2 — Regridding to 0.05° × 30-min
 
-Box-averaging per Gupta et al. 2020:
+Box-averaging per Gupta et al. 2020: only pixels whose centre falls inside a 0.05° cell contribute (no nearest-neighbour fill or ring search).
 
-1. Per 30-min window, collect L2 pixels whose center coordinates fall in each 0.05° cell.
-2. MAIAC (1 km): mean + std (std stored as within-cell heterogeneity flag).
-3. VIIRS DB (6 km): pixel-size-aware spatial fill (Gupta et al. 2020) to mitigate bow-tie gaps.
-4. Himawari (0.05° native): direct mapping.
+1. Per 30-min window, collect L2 pixels whose centre coordinates fall in each 0.05° cell.
+2. MAIAC (1 km) and VIIRS DB (6 km): box-average to per-cell mean, std, count, mean VZA, mean SZA.
+3. Himawari (0.05° native): already on the target grid. Multiple 10-min L2 files within the slot window are averaged into one slot value.
 
 **Output per sensor per 30-min slot:** mean AOD, std AOD, pixel count, mean VZA, mean SZA.
 
-### 7.3 Step A3 — Physics normalization (applied to all sensors uniformly)
+### 7.3 Step A3 — Physics normalization (stored as a separate output, applied after fusion)
 
 ```
-AOD_phys = AOD × (1 − RH/100)^γ / PBLH
+AOD_phys = AOD_merged × (1 − RH/100)^γ / PBLH
 ```
 
-with γ = 0.6 (mixed-type empirical; Kotchenruther & Hobbs 1998), PBLH constrained ≥ 50 m, RH preferentially from Envisoft, ERA5 fallback. Stored as a _separate variable_ alongside the raw AOD, so downstream users can choose. This step is validated by Nguyen 2025 to improve hourly Himawari–PM2.5 from r 0.110 → 0.162. It is _not_ a bias correction; it is a state normalization that makes the column → surface inference cleaner.
+with γ = 0.6 (mixed-type empirical; Kotchenruther & Hobbs 1998), PBLH constrained ≥ 50 m, RH and PBLH from ERA5 bilinearly interpolated from 0.25° to 0.05°.
+
+**Ordering note:** In the production pipeline, Step A3 runs _after_ Steps A4 and A5. The physics correction is applied to the fused `AOD_merged` and stored as a separate output field alongside the ERA5 RH and PBLH fields. It is **not** fed back into the bias-correction or fusion steps. This is deliberate: AERONET measures raw column AOD, so bias-correction training and ICW fusion must operate on raw AOD; physics normalization is a downstream PM₂.₅-modelling convenience that does not belong in the calibration loop.
+
+This step is validated by Nguyen 2025 to improve hourly Himawari–PM₂.₅ from r = 0.110 → 0.162. If ERA5 data are unavailable for a slot, the physics fields are omitted but the raw merged AOD is always written.
 
 ### 7.4 Step A4 — Region/Season-aware bias correction (the Ahn-2021 step, refined)
 
-**Strategy.** Use AERONET to train a transfer function per _(sensor, region, season, product-level)_ stratum, then extend spatially using LEO–Himawari co-locations (an extra training source Ahn 2021 did not exploit).
+**Strategy.** Use AERONET to train a transfer function per _(sensor, region, season)_ stratum, then extend spatially via IDW from the two anchor sites.
 
 #### 7.4.1 Per-site quantile mapping (CDF correction)
 
@@ -281,7 +289,7 @@ For each stratum:
 2. Build the corresponding AERONET CDF.
 3. The transfer function maps each sensor AOD value to its AERONET-equivalent value by matching quantile ranks. This corrects both mean bias _and_ distribution shape, which simple linear regression cannot do at high AOD.
 
-This is the Ahn 2021 CDF approach (their Eq. 1, fitted as piecewise cubic over AOD bins of 0.1 from 0–4). Where AERONET sample size is too small for a stratum (N < 100), fall back to linear regression bias correction.
+**Implementation:** Empirical CDFs are built from 200 quantile points across the matched pair distribution. A monotone piecewise cubic interpolant is fitted from satellite quantiles to AERONET quantiles — equivalent in spirit to Ahn 2021's piecewise cubic, with stable extrapolation beyond the training range. Where N_pairs < 100, linear regression is used as a fallback. The fitted transfer functions are saved after training and reloaded at run time, so training and production runs are fully decoupled.
 
 Strata used:
 
@@ -289,23 +297,30 @@ Strata used:
 - **Season:** Dry (Oct–Apr) / Wet (May–Sep).
 - **Himawari level:** L2 for the north / L3 daily for the south (per finding 3 in §5.2).
 
-#### 7.4.2 Spatial extension: IDW from anchors + LEO–Himawari co-location
+#### 7.4.2 Spatial extension: IDW from AERONET anchors
 
 AERONET anchors only the two endpoints (north and south). To extend bias correction across Vietnam (especially Central Vietnam where no AERONET exists):
 
-- Apply Ahn 2021's **IDW from the two AERONET anchors** as a first pass. Distance weight ∝ d⁻². This gives a spatially-varying coefficient field that smoothly interpolates the north/south corrections across the central region.
-- **LEO–Himawari co-location correction** (a second pass, novel relative to Ahn 2021): for every cell-time where MODIS or VIIRS observes within ±15 min of a Himawari slot, record the (AOD_LEO, AOD_Himawari) pair. Over 4 years this builds a large spatially distributed training set far beyond the two AERONET sites. Use it to fit a spatially varying offset map for Himawari, particularly across the VZA gradient (the central VZA strip is where this matters most).
-- The central Vietnam coefficients are therefore _constrained_ (by LEO co-locations) but _not validated_ (no central AERONET). This is flagged as a limitation in §10.
+- Apply Ahn 2021's **IDW from the two AERONET anchors**. Distance weight ∝ d⁻². For any grid cell, the corrected AOD is the IDW-blend of the north-stratum (Nghia Do) and south-stratum (Bac Lieu) corrections applied at the cell's AOD value:
+
+  ```
+  w_N = 1 / d(cell, NghiaDo)²
+  w_S = 1 / d(cell, BacLieu)²
+  AOD_corr(cell) = (w_N · f_N(AOD) + w_S · f_S(AOD)) / (w_N + w_S)
+  ```
+
+- The central Vietnam coefficients are therefore _interpolated_ but _not validated_ (no central AERONET). This is flagged as a limitation in §10.
+
+**Future work — LEO–Himawari co-location correction (not yet implemented):** A planned second pass would use (AOD_LEO, AOD_Himawari) co-located pairs across all Vietnam grid cells over 4 years to build a spatially varying offset map for Himawari, anchoring the central region independently of the two AERONET sites. This will provide a denser spatial constraint, particularly across the high-VZA gradient in the north-central zone.
 
 #### 7.4.3 Per-sensor correction summary
 
-| Sensor               | Correction                                        | Rationale                                      |
-| -------------------- | ------------------------------------------------- | ---------------------------------------------- |
-| Himawari L2 (north)  | Quantile mapping + LEO-anchored spatial extension | Large bias (−0.117); event preservation needed |
-| Himawari L3 (south)  | Quantile mapping; small correction                | Near-zero raw bias; only fine-tuning           |
-| MAIAC (north)        | Linear regression                                 | Large negative bias (−0.146); reasonable skill |
-| MAIAC (south)        | Down-weight only; minimal correction              | R = 0.41, cannot be corrected reliably         |
-| VIIRS SNPP & NOAA-20 | Small linear correction (per region)              | Already accurate; small positive bias          |
+| Sensor               | Correction                                               | Rationale                                      |
+| -------------------- | -------------------------------------------------------- | ---------------------------------------------- |
+| Himawari (blended)   | Quantile mapping (north) + IDW blend to south correction | Both L2 and L3 keys receive the same spatially blended grid; region-appropriate correction applied via IDW |
+| MAIAC (north/central)| Quantile mapping or linear regression                    | Large negative bias (−0.146 at Nghia Do); reasonable skill in north |
+| MAIAC (south)        | Down-weight factor 0.1 + minimal correction              | R = 0.41 at Bac Lieu; cannot be corrected reliably |
+| VIIRS SNPP & NOAA-20 | Quantile mapping or linear regression (per region)       | High skill; small positive bias corrected      |
 
 ### 7.5 Step A5 — Inverse-RMSE fusion (Ahn 2021 ICW, region/season-stratified)
 
@@ -316,26 +331,35 @@ w_i = 1 / RMSE_i(region, season, sensor, product-level)²
 AOD_merged = Σ(w_i · AOD_i_corrected) / Σ(w_i)
 ```
 
-RMSE_i comes from the post-correction validation in §5.1, stratified per (region × season × sensor). Identical in form to Ahn 2021's ICW (their Eq. 3), but with strata they did not use.
+RMSE_i is taken from post-correction validation statistics stratified per (sensor, region, season). Initial prior RMSE values are self-derived from the training collocations (Sep 2022–Dec 2024); once bias-correction training is complete, the post-correction RMSE values replace these priors for all subsequent fusion runs. This is identical in form to Ahn 2021's ICW (their Eq. 3), but with strata they did not use.
 
-**Sensor inclusion rules** (weights effectively enforce this, but explicit logic handles edge cases):
+**RMSE floor:** A minimum RMSE of 0.05 is enforced when computing ICW weights (1/RMSE²). Wet-season corrections trained on very few pairs can overfit to near-zero RMSE, which would produce near-infinite weights and unstable fusion.
+
+**Himawari wet-season down-weighting:** In May–Sep, Himawari is down-weighted by a factor of 0.1, analogous to the MAIAC south down-weighting. Validation shows near-zero R for both AERONET stations during wet months, caused by cloud-edge contamination that passes the QA filters.
+
+**Himawari L2/L3 blending:** Both L2 and L3 are read for every slot, then blended per grid cell before entering the fusion: north cells (lat ≥ 16°N) use pure L2, south cells (lat < 11.5°N) use pure L3, and the central zone receives a linear latitudinal blend. Both the blended-L2 and blended-L3 representations enter the ICW fusion with their respective RMSE weights, so the combined Himawari contribution is naturally region-weighted (L2-dominant in the north, L3-dominant in the south).
+
+**Sensor inclusion rules** (ICW weights enforce this; explicit logic handles edge cases):
 
 ```
-if VIIRS available in slot:        include (highest weight)
-if MAIAC available and not Bac Lieu region:  include with regional weight
-if Himawari available and SZA < 70°:     include
-if only one sensor:           use that sensor, flag uncertainty
-if no sensor:             leave as gap → Stage B
+if VIIRS available in slot:              include (highest accuracy anchor)
+if MAIAC available and not south region: include with regional weight
+if MAIAC in south region:               strongly down-weighted (factor 0.1; R = 0.41)
+if Himawari available and SZA < 70°:    include
+if Himawari in wet season (May–Sep):    strongly down-weighted (factor 0.1; R ≈ 0)
+if only one sensor:                     use that sensor, flag low confidence
+if no sensor:                           leave as gap → Stage B
 ```
 
-**Stage A output** — 48 × 30-min files per day, each containing per cell:
+**Stage A output** — 48 × 30-min NetCDF files per day, each containing per cell:
 
-- `AOD_merged` (550 nm, weighted mean)
-- `AOD_phys_corrected` (physics-normalized variant)
-- `AOD_std` (across-sensor spread)
-- `n_sensors`, `dominant_sensor`
+- `AOD_merged` (550 nm, ICW-weighted mean of bias-corrected sensors)
+- `AOD_std` (cross-sensor spread)
+- `n_sensors`, `dominant_sensor` (sensor with highest ICW weight)
 - `confidence_flag` (0 = no data, 1 = Himawari only, 2 = LEO only, 3 = Himawari + LEO, 4 = multi-LEO + Himawari)
-- VZA, SZA mean across contributing sensors
+- Per-sensor bias-corrected grids (diagnostic; written only when data are available)
+- `AOD_phys_corrected` (Step A3 output; physics-normalized surface-concentration proxy)
+- ERA5 RH and PBLH fields (written when ERA5 data are available for the slot)
 
 ### 7.6 Step B1 — Daily aggregation
 
@@ -471,6 +495,10 @@ Per Nguyen 2025, RANSAC lifts daily Himawari–PM2.5 R² from 0.065 to 0.293. Us
 8. **Gap-filled values are model estimates**, not observations. They must be flagged in every output and should not be used for trend analysis or extreme-value statistics without an explicit "observed-only" filter.
 9. **ML gap-filling generalizes only as far as the training data.** If a regime (e.g., a once-per-decade biomass burning event of unusual intensity) is absent from training, predictions there are extrapolations.
 10. **Spectral harmonization is dropped.** Justified empirically (Nguyen 2025), but means the product is technically a mix of 500 nm Himawari and 550 nm LEO. The error this introduces is bounded at ~ΔR² of 0.003 and ΔRMSE of 0.001.
+11. **MODIS MAIAC quality filtering relies on the algorithm's internal encoding.** Explicit bitmask application (bits 3–4) is not active in the current pipeline; filtering relies on MAIAC's own fill-value and valid-range metadata, which implicitly restricts to the algorithm's high-quality retrievals. Explicit bitmask filtering is a planned hardening step.
+12. **LEO–Himawari co-location correction not yet implemented.** Central Vietnam bias correction remains a pure IDW interpolation between the two AERONET anchors. The calibration gap is largest in the 11.5°N–16°N zone where neither anchor is nearby.
+13. **Himawari wet-season down-weight is empirically set.** The factor of 0.1 was chosen based on observed near-zero correlation during wet months but has not been tuned against held-out data; a different optimal value may emerge from validation.
+14. **Physics correction uses ERA5 RH/PBLH only.** In-situ RH from surface stations (mentioned in §4.4) is not yet incorporated into the production pipeline.
 
 ---
 
@@ -506,7 +534,7 @@ If the timeline shrinks, Step B3 is the first thing to drop. The product is stil
 | 1. Data preparation                | Download & organize L2 products; AERONET re-processing        | 4 weeks  |
 | 2. Baseline validation extension   | Reproduce/extend per-sensor validation; add SNPP VIIRS        | 3 weeks  |
 | 3. Gridding pipeline               | 0.05° box-averaging code for all sensors                      | 3 weeks  |
-| 4. Bias correction                 | QM (CDF) + IDW + LEO–Himawari spatial extension               | 5 weeks  |
+| 4. Bias correction                 | QM (CDF) + IDW spatial extension from AERONET anchors         | 5 weeks  |
 | 5. Fusion (Stage A)                | Inverse-RMSE merge; produce 30-min files for full period      | 3 weeks  |
 | 6a. Spatial gap-fill (Step B2)     | Kriging + climatological fill                                 | 2 weeks  |
 | 6b. ML gap-fill (Step B3, stretch) | RF + reanalysis covariates                                    | 4 weeks  |
@@ -557,4 +585,4 @@ The merged product is expected to lie between the Himawari-only (0.293) and MODI
 
 ---
 
-_Draft v3.0 — restructured around explicit research questions (§1.2), positioned vs Ahn 2021 / Gupta 2024 / Chen 2023 / Youn 2024 / Lee 2025 (§2), staged into clear A/B sequence (§6–7), with ML-aided gap-filling promoted from "future work" to a primary methodological track (§7.8), and scope-graded so that the minimum publishable thesis is well-defined (§11)._
+_Draft v3.1 — Stage A sections updated to reflect the current implementation. Key changes vs v3.0: (1) Step ordering corrected — physics normalization (A3) runs after fusion (A5) and is stored as a separate output, not in the calibration pipeline; (2) LEO–Himawari co-location correction reclassified as future work; (3) Himawari L2/L3 blending clarified — both are blended spatially before fusion and enter the ICW with separate region-stratified RMSE weights; (4) RMSE floor and wet-season Himawari down-weighting added to §7.5; (5) VIIRS QA corrected to a two-tier land/ocean policy; (6) MODIS MAIAC QA limitation noted; (7) four new limitations added (§10 #11–14)._

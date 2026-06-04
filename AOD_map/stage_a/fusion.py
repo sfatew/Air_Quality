@@ -68,17 +68,20 @@ def load_rmse(
 ) -> dict[tuple, float]:
     """Return RMSE dict keyed by (sensor, region) or (sensor, region, season).
 
-    Tries to load post-correction RMSE from the JSON cache first; falls back
-    to the prior values from config.py if the cache is missing.
-    The JSON may contain season-stratified keys written by run_collocate.py.
+    Always seeds from SENSOR_RMSE_PRIOR (2-tuple keys, covers all regions
+    including central), then overlays post-correction 3-tuple entries from the
+    JSON cache.  Without this merge, central-region cells would fall through
+    every branch of the fuse() lookup and receive NaN RMSE → zero weight →
+    no merged output for the entire central latitude band.
     """
+    result = dict(SENSOR_RMSE_PRIOR)
     if use_post_correction and _RMSE_CACHE_FILE.exists():
         try:
             raw = json.loads(_RMSE_CACHE_FILE.read_text())
-            return {tuple(k.split('|')): v for k, v in raw.items()}
+            result.update({tuple(k.split('|')): v for k, v in raw.items()})
         except Exception:
             pass
-    return dict(SENSOR_RMSE_PRIOR)
+    return result
 
 
 def save_rmse(rmse_dict: dict[tuple, float]) -> None:

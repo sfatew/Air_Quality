@@ -1,53 +1,31 @@
-"""
-ERA5 Per-Station Extractor
-==========================
+#!/usr/bin/env python3
+"""Extract ERA5 per-station time series from the monthly NetCDF files
+produced by fetch_era5_bbox.py.
 
-Sample the Vietnam-wide ERA5 NetCDF produced by `fetch_era5_bbox.py` at the
-nearest 0.25° grid cell of each station listed in a station-map CSV, then
-write one hourly time-series CSV per station.
+Input layout (created by the fetch script):
+    ERA5_ROOT/
+    ├── 202401/
+    │   ├── era5_vietnam_t2m_202401.nc
+    │   ├── era5_vietnam_d2m_202401.nc
+    │   └── ... (16 files)
+    ├── 202402/
+    └── ...
 
-Pattern mirrors VIIRS/crawl.py:
-  - `load_stations` from a CSV with columns
-      stationId, stationName, latitude, longitude
-  - `EXTRA_STATIONS` dict for ad-hoc points (NGHIA_DO, Bac_Lieu, …)
-  - `group_stations_by_city` for the job report
-  - filename-safe station naming
-  - `write_job_report` style log
-
-If the merged ERA5 file does not yet exist OR does not span the requested
-date range, this script invokes `fetch_era5_bbox.fetch_bbox()` to fill in
-the missing months (the per-month checkpoint cache in MONTHLY_DIR makes
-this idempotent).
-
-Usage (CLI):
-    python extract_stations.py \\
-        --station-map /home/work1/projects/Air_Quality/Masterdata/envisoft_station_map.csv \\
-        --start 2024-01-01 \\
-        --end   2024-12-31
-
-Usage (Python):
-    from ERA5.extract_stations import extract_stations
-    df_by_station = extract_stations(start="2024-01-01", end="2024-12-31")
+Output: one CSV per station at OUTPUT_DIR/<station_name>.csv with columns
+    timestamp, station_name, T2m, Td2m, RH, Psfc, MSL, U10, V10,
+    WS10m, WD10m, U100, V100, WS100m, WD100m, PBLH, CloudCover,
+    CBH, TCWV, SolarRad, Precip, Albedo, CAPE
 """
 
 import argparse
 import logging
-import sys
-from datetime import datetime
 from pathlib import Path
 
-# Make the project root importable so `from ERA5.fetch_era5_bbox import …`
-# works whether this file is run as a script or imported as a module.
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
+import numpy as np
 import pandas as pd
 import xarray as xr
+from tqdm import tqdm
 
-from ERA5.fetch_era5_bbox import fetch_bbox, BBOX, OUTPUT_FILE, MONTHLY_DIR
-
-# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -60,16 +38,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_STATION_CSV = Path(
     "/home/work1/projects/Air_Quality/Masterdata/envisoft_station_map.csv"
 )
-DEFAULT_OUTPUT_DIR  = Path("/home/slow_data/Air_Quality/ERA5/stations")
-DEFAULT_ERA5_NC     = Path(OUTPUT_FILE)
+DEFAULT_OUTPUT_DIR = Path("/home/slow_data/Air_Quality/ERA5/stations")
+DEFAULT_ERA5_ROOT  = Path("/home/slow_data/Air_Quality/ERA5/raw")
 
-# Ad-hoc stations not in the envisoft CSV but used downstream
 EXTRA_STATIONS = {
     "NGHIA_DO": {"lat": 21.048, "lon": 105.800, "city": "Hà Nội"},
     "Bac_Lieu": {"lat": 9.30,   "lon": 105.70,  "city": "Bạc Liêu"},
 }
 
-# Order of feature columns written to each per-station CSV
 FEATURE_COLUMNS = [
     "T2m", "Td2m", "RH", "Psfc", "MSL",
     "U10", "V10", "WS10m", "WD10m",
@@ -78,12 +54,32 @@ FEATURE_COLUMNS = [
     "SolarRad", "Precip", "Albedo", "CAPE",
 ]
 
+# Map ERA5 short-name (in NC files) → our feature name
+ERA5_TO_FEATURE = {
+    "t2m":  "T2m",        # K   → °C
+    "d2m":  "Td2m",       # K   → °C
+    "sp":   "Psfc",       # Pa  → hPa
+    "msl":  "MSL",        # Pa  → hPa
+    "u10":  "U10",
+    "v10":  "V10",
+    "u100": "U100",
+    "v100": "V100",
+    "blh":  "PBLH",
+    "tcc":  "CloudCover",
+    "cbh":  "CBH",
+    "tcwv": "TCWV",
+    "ssrd": "SolarRad",   # J/m² accum/hour → W/m²
+    "tp":   "Precip",     # m   → mm
+    "fal":  "Albedo",
+    "cape": "CAPE",
+}
 
-# ── Station loading (mirrors VIIRS/crawl.py) ───────────────────────────────────
+
+# ── Station loading ───────────────────────────────────────────────────────────
 def load_stations(csv_path: Path = DEFAULT_STATION_CSV,
                   include_extra: bool = True) -> dict:
     df = pd.read_csv(csv_path)
-    stations: dict = {}
+    stations = {}
     for _, row in df.iterrows():
         city = row["stationName"].split(":")[0].strip()
         stations[row["stationName"]] = {
@@ -96,284 +92,165 @@ def load_stations(csv_path: Path = DEFAULT_STATION_CSV,
     return stations
 
 
-def group_stations_by_city(stations: dict) -> dict[str, dict]:
-    groups: dict[str, dict] = {}
-    for name, info in stations.items():
-        groups.setdefault(info["city"], {})[name] = info
-    return groups
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def safe_filename(name: str) -> str:
+    """Filename-safe slug; preserves diacritics-free station names."""
+    keep = []
+    for ch in name:
+        if ch.isalnum() or ch in ("-", "_"):
+            keep.append(ch)
+        elif ch in (" ", ":", "/"):
+            keep.append("_")
+    return "".join(keep).strip("_")
 
 
-def safe_filename(station_name: str) -> str:
-    return (
-        station_name.replace(":", "")
-        .replace("/", "_")
-        .replace("\\", "_")
-        .replace(" ", "_")
-        .strip("_")
-    )
+def open_month(month_dir: Path) -> xr.Dataset:
+    """Open all 16 single-variable NCs of a month into one Dataset."""
+    ds = xr.open_mfdataset(str(month_dir / "*.nc"), combine="by_coords",
+                           engine="netcdf4", compat="override")
+    # CDS-Beta quirks
+    if "valid_time" in ds.dims:
+        ds = ds.rename({"valid_time": "time"})
+    for extra in ("number", "expver"):
+        if extra in ds.dims:
+            ds = ds.isel({extra: 0}, drop=True) if ds.sizes[extra] == 1 \
+                else ds.mean(extra)
+    return ds
 
 
-# ── ERA5 file management ───────────────────────────────────────────────────────
-def _months_in_range(start_dt: datetime, end_dt: datetime) -> list[tuple[int, int]]:
-    months = []
-    y, m = start_dt.year, start_dt.month
-    while (y, m) <= (end_dt.year, end_dt.month):
-        months.append((y, m))
-        m += 1
-        if m > 12:
-            m, y = 1, y + 1
-    return months
+def extract_points(ds: xr.Dataset, stations: dict) -> pd.DataFrame:
+    """Vectorized nearest-pixel extraction for ALL stations at once."""
+    names = list(stations.keys())
+    lats = np.array([stations[n]["lat"] for n in names])
+    lons = np.array([stations[n]["lon"] for n in names])
+
+    lat_da = xr.DataArray(lats, dims="station", coords={"station": names})
+    lon_da = xr.DataArray(lons, dims="station", coords={"station": names})
+
+    pt = ds.sel(latitude=lat_da, longitude=lon_da, method="nearest")
+    df = pt.to_dataframe().reset_index()
+
+    # df now has columns: time, station, latitude, longitude, t2m, d2m, ...
+    # Rename short-names → feature names where they exist
+    df = df.rename(columns={k: v for k, v in ERA5_TO_FEATURE.items()
+                            if k in df.columns})
+    return df
 
 
-def ensure_era5_file(start_dt: datetime, end_dt: datetime,
-                     era5_nc: Path, bbox: list[float],
-                     monthly_dir: str) -> Path:
-    """
-    Ensure `era5_nc` covers [start_dt, end_dt]. If the file is missing or its
-    time axis does not span the requested range, call fetch_bbox() to download
-    the missing months and rebuild the merged file.
+def convert_units_and_derive(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert units & compute RH, WS, WD."""
+    # Temperature K → °C
+    for col in ("T2m", "Td2m"):
+        if col in df.columns:
+            df[col] = df[col] - 273.15
 
-    Returns the (possibly newly-built) path.
-    """
-    needs_fetch = False
-    if not era5_nc.exists():
-        logger.info("ERA5 file %s not found — will fetch.", era5_nc)
-        needs_fetch = True
-    else:
-        with xr.open_dataset(era5_nc) as ds:
-            t_min = pd.Timestamp(ds.time.values.min())
-            t_max = pd.Timestamp(ds.time.values.max())
-        if t_min > pd.Timestamp(start_dt) or t_max < pd.Timestamp(end_dt):
-            logger.info(
-                "ERA5 file covers %s → %s, requested %s → %s — will fetch.",
-                t_min, t_max, start_dt, end_dt,
-            )
-            needs_fetch = True
-        else:
-            logger.info("ERA5 file %s already covers requested range.", era5_nc)
+    # Pressure Pa → hPa
+    for col in ("Psfc", "MSL"):
+        if col in df.columns:
+            df[col] = df[col] / 100.0
 
-    if needs_fetch:
-        # Fetch the entire merge range; cached months are skipped by fetch_bbox.
-        # Use the union of the requested range and any existing coverage so
-        # the rebuilt merged file does not lose previously-downloaded data.
-        first, last = (start_dt.year, start_dt.month), (end_dt.year, end_dt.month)
-        if era5_nc.exists():
-            with xr.open_dataset(era5_nc) as ds:
-                existing_min = pd.Timestamp(ds.time.values.min()).to_pydatetime()
-                existing_max = pd.Timestamp(ds.time.values.max()).to_pydatetime()
-            first = min(first, (existing_min.year, existing_min.month))
-            last  = max(last,  (existing_max.year, existing_max.month))
-        fetch_bbox(
-            start=first, end=last, bbox=bbox,
-            output_file=str(era5_nc), monthly_dir=monthly_dir,
-        )
+    # Precip m → mm
+    if "Precip" in df.columns:
+        df["Precip"] = df["Precip"] * 1000.0
 
-    return era5_nc
+    # SolarRad J/m² (1-hour accumulation) → W/m²
+    if "SolarRad" in df.columns:
+        df["SolarRad"] = df["SolarRad"] / 3600.0
+
+    # RH (Magnus) — needs both T2m and Td2m in °C (done above)
+    if {"T2m", "Td2m"}.issubset(df.columns):
+        a, b = 17.625, 243.04
+        es = np.exp((a * df["T2m"])  / (b + df["T2m"]))
+        e  = np.exp((a * df["Td2m"]) / (b + df["Td2m"]))
+        df["RH"] = (100.0 * e / es).clip(0, 100)
+
+    # Wind speed & direction (meteorological: degrees FROM which wind blows)
+    for h in ("10", "100"):
+        u, v = f"U{h}", f"V{h}"
+        if {u, v}.issubset(df.columns):
+            df[f"WS{h}m"] = np.sqrt(df[u] ** 2 + df[v] ** 2)
+            df[f"WD{h}m"] = (270.0 - np.degrees(np.arctan2(df[v], df[u]))) % 360.0
+
+    return df
 
 
-# ── Per-station sampling ──────────────────────────────────────────────────────
-def _sample_station(ds: xr.Dataset, lat: float, lon: float) -> xr.Dataset:
-    """Nearest-neighbour sample. ERA5 is 0.25° — no interpolation, by design."""
-    lat_name = "latitude" if "latitude" in ds.dims else "lat"
-    lon_name = "longitude" if "longitude" in ds.dims else "lon"
-    return ds.sel({lat_name: lat, lon_name: lon}, method="nearest")
+def process_month(month_dir: Path, stations: dict) -> pd.DataFrame:
+    ds = open_month(month_dir)
+    try:
+        df = extract_points(ds, stations)
+    finally:
+        ds.close()
+
+    df = convert_units_and_derive(df)
+    df = df.rename(columns={"time": "timestamp", "station": "station_name"})
+
+    cols = ["timestamp", "station_name"] + [c for c in FEATURE_COLUMNS
+                                            if c in df.columns]
+    return df[cols].sort_values(["station_name", "timestamp"])
 
 
-def extract_stations(
-    station_map_csv: Path = DEFAULT_STATION_CSV,
-    start: str = None,
-    end: str = None,
-    era5_nc: Path = DEFAULT_ERA5_NC,
-    output_dir: Path = DEFAULT_OUTPUT_DIR,
-    bbox: list[float] = None,
-    monthly_dir: str = MONTHLY_DIR,
-    include_extra: bool = True,
-) -> dict[str, dict]:
-    """
-    Extract per-station hourly ERA5 time series.
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+def run(era5_root: Path, output_dir: Path, station_csv: Path,
+        include_extra: bool = True):
+    stations = load_stations(station_csv, include_extra=include_extra)
+    logger.info(f"Loaded {len(stations)} stations")
 
-    Parameters
-    ----------
-    station_map_csv : path to envisoft-style station CSV
-    start, end      : 'YYYY-MM-DD' (end defaults to today). Times are
-                      interpreted as the UTC+7 timestamps stored in the ERA5
-                      NetCDF — matching what `fetch_era5_bbox.py` writes.
-
-    Returns
-    -------
-    dict { station_name : {records, date_min, date_max, csv_path} }
-    """
-    if start is None:
-        raise ValueError("`start` is required (YYYY-MM-DD)")
-    start_dt = datetime.strptime(start, "%Y-%m-%d")
-    end_dt   = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now()
-    if bbox is None:
-        bbox = BBOX
-
-    station_map_csv = Path(station_map_csv)
-    era5_nc         = Path(era5_nc)
-    output_dir      = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stations = load_stations(station_map_csv, include_extra=include_extra)
-    city_groups = group_stations_by_city(stations)
-    logger.info("Loaded %d stations across %d cities.",
-                len(stations), len(city_groups))
+    month_dirs = sorted(p for p in era5_root.iterdir()
+                        if p.is_dir() and p.name.isdigit() and len(p.name) == 6)
+    if not month_dirs:
+        raise SystemExit(f"No YYYYMM subfolders found in {era5_root}")
+    logger.info(f"Found {len(month_dirs)} month folders: "
+                f"{month_dirs[0].name} → {month_dirs[-1].name}")
 
-    # Make sure the Vietnam-wide ERA5 file covers the requested window
-    ensure_era5_file(start_dt, end_dt, era5_nc, bbox, monthly_dir)
+    # Per-station buffer of monthly chunks
+    buffers: dict[str, list[pd.DataFrame]] = {name: [] for name in stations}
 
-    # Lazy open — only the per-station slice is materialised
-    ds = xr.open_dataset(era5_nc, chunks={"time": 24})
+    for mdir in tqdm(month_dirs, desc="months"):
+        try:
+            df_month = process_month(mdir, stations)
+        except Exception as e:
+            logger.error(f"Failed to process {mdir.name}: {e}")
+            continue
 
-    # Restrict to requested window (timestamps in the file are UTC+7, tz-naive)
-    t_end_inclusive = pd.Timestamp(f"{end_dt:%Y-%m-%d} 23:00")
-    ds = ds.sel(time=slice(pd.Timestamp(start_dt), t_end_inclusive))
+        for name, sub in df_month.groupby("station_name", sort=False):
+            buffers[name].append(sub)
 
-    lat_name = "latitude" if "latitude" in ds.dims else "lat"
-    lon_name = "longitude" if "longitude" in ds.dims else "lon"
+    # Write one CSV per station
+    n_ok, n_empty = 0, 0
+    for name, parts in buffers.items():
+        if not parts:
+            logger.warning(f"No data for station {name}")
+            n_empty += 1
+            continue
+        df = (pd.concat(parts, ignore_index=True)
+                .drop_duplicates(subset=["timestamp", "station_name"])
+                .sort_values("timestamp")
+                .reset_index(drop=True))
 
-    summary: dict[str, dict] = {}
-    feature_cols_present = [c for c in FEATURE_COLUMNS if c in ds.data_vars]
-    missing_cols = [c for c in FEATURE_COLUMNS if c not in ds.data_vars]
-    if missing_cols:
-        logger.warning(
-            "ERA5 file is missing expected variables (will be omitted from CSV): %s",
-            missing_cols,
-        )
+        out_path = output_dir / f"{safe_filename(name)}.csv"
+        df.to_csv(out_path, index=False, float_format="%.4f")
+        n_ok += 1
+        logger.info(f"[{n_ok:>3}/{len(stations)}] {out_path.name} "
+                    f"({len(df):,} rows, {df.timestamp.min()} → "
+                    f"{df.timestamp.max()})")
 
-    for name, coords in stations.items():
-        slat, slon = coords["lat"], coords["lon"]
-        sub = _sample_station(ds, slat, slon)[feature_cols_present].load()
-
-        grid_lat = float(sub[lat_name].values)
-        grid_lon = float(sub[lon_name].values)
-
-        df = sub.to_dataframe().reset_index()
-        # to_dataframe yields lat/lon columns too — drop them to avoid duplicates
-        df = df.drop(columns=[c for c in (lat_name, lon_name) if c in df.columns])
-        df.insert(0, "station_lon", slon)
-        df.insert(0, "station_lat", slat)
-        df.insert(0, "station",     name)
-        df.insert(0, "datetime",    df.pop("time"))
-        df["grid_lat"] = grid_lat
-        df["grid_lon"] = grid_lon
-
-        ordered = (
-            ["datetime", "station", "station_lat", "station_lon",
-             "grid_lat", "grid_lon"]
-            + feature_cols_present
-        )
-        df = df[ordered].sort_values("datetime").reset_index(drop=True)
-
-        out_csv = output_dir / f"{safe_filename(name)}.csv"
-        df.to_csv(out_csv, index=False)
-
-        summary[name] = {
-            "records":  len(df),
-            "date_min": df["datetime"].min().strftime("%Y-%m-%d"),
-            "date_max": df["datetime"].max().strftime("%Y-%m-%d"),
-            "csv_path": str(out_csv),
-        }
-        logger.info("  %s → %d rows (%s → %s)",
-                    name, len(df), summary[name]["date_min"], summary[name]["date_max"])
-
-    ds.close()
-    return summary
+    logger.info(f"Done. Wrote {n_ok} CSV, {n_empty} empty/missing")
 
 
-# ── Job report (mirrors VIIRS/crawl.py::write_job_report) ─────────────────────
-def write_job_report(
-    summary: dict[str, dict],
-    stations: dict,
-    start: str, end: str,
-    log_path: Path,
-) -> str:
-    city_groups = group_stations_by_city(stations)
-    lines: list[str] = []
-    w = lines.append
-
-    w("=" * 70)
-    w(f"ERA5 station extraction — {datetime.now():%Y-%m-%d %H:%M:%S}")
-    w("=" * 70)
-    w(f"Period: {start} → {end}")
-    w(f"Stations: {len(stations)} in {len(city_groups)} cities")
-    w("-" * 70)
-
-    for city, members in sorted(city_groups.items()):
-        w(f"  {city} ({len(members)} station(s)):")
-        for name, info in members.items():
-            w(f"    - [{info['lat']:.4f}, {info['lon']:.4f}] {name}")
-    w("")
-
-    w("EXTRACTION:")
-    if summary:
-        by_city: dict[str, list] = {}
-        for sname, info in summary.items():
-            city = stations.get(sname, {}).get("city", "Unknown")
-            by_city.setdefault(city, []).append((sname, info))
-        for city in sorted(by_city):
-            members = by_city[city]
-            total   = sum(s["records"] for _, s in members)
-            dmin    = min(s["date_min"] for _, s in members)
-            dmax    = max(s["date_max"] for _, s in members)
-            w(f"  {city}: {total} records ({dmin} → {dmax})")
-            for sname, sinfo in members:
-                short = sname.split(":")[-1].strip()[:40]
-                w(f"    - {short}: {sinfo['records']} rows "
-                  f"({sinfo['date_min']} → {sinfo['date_max']})")
-
-        missing = set(stations) - set(summary)
-        if missing:
-            w("")
-            w(f"NO DATA ({len(missing)}):")
-            for sname in sorted(missing):
-                w(f"  - {sname}")
-    else:
-        w("  no records extracted")
-
-    w("")
-    w("=" * 70)
-    report = "\n".join(lines)
-    log_path.write_text(report, encoding="utf-8")
-    logger.info("Job report written to %s", log_path)
-    return report
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Extract per-station ERA5 time series.")
-    p.add_argument("--station-map", type=Path, default=DEFAULT_STATION_CSV,
-                   help="Path to envisoft-style station CSV.")
-    p.add_argument("--start", type=str, required=True, help="YYYY-MM-DD")
-    p.add_argument("--end",   type=str, default=None,
-                   help="YYYY-MM-DD (default: today)")
-    p.add_argument("--era5-nc", type=Path, default=DEFAULT_ERA5_NC,
-                   help="Path to merged Vietnam ERA5 NetCDF.")
-    p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
-                   help="Where to write per-station CSVs.")
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--era5-root", type=Path, default=DEFAULT_ERA5_ROOT,
+                   help="Folder containing YYYYMM/ subfolders of NC files.")
+    p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    p.add_argument("--station-csv", type=Path, default=DEFAULT_STATION_CSV)
     p.add_argument("--no-extra", action="store_true",
-                   help="Skip the built-in EXTRA_STATIONS dict.")
+                   help="Skip EXTRA_STATIONS (NGHIA_DO, Bac_Lieu).")
     return p.parse_args()
 
 
-def main() -> None:
-    args = _parse_args()
-
-    end_str = args.end or datetime.now().strftime("%Y-%m-%d")
-    summary = extract_stations(
-        station_map_csv=args.station_map,
-        start=args.start,
-        end=end_str,
-        era5_nc=args.era5_nc,
-        output_dir=args.output_dir,
-        include_extra=not args.no_extra,
-    )
-
-    stations = load_stations(args.station_map, include_extra=not args.no_extra)
-    log_path = Path(__file__).parent / f"{datetime.now():%Y%m%d}_era5_extract.log"
-    write_job_report(summary, stations, args.start, end_str, log_path)
-
-
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    run(args.era5_root, args.output_dir, args.station_csv,
+        include_extra=not args.no_extra)

@@ -53,7 +53,7 @@ from config import (
     VIIRS_EXACT_MAX_KM, VIIRS_3X3_MAX_KM, VIIRS_5X5_MAX_KM,
     VIIRS_OVERPASS_GAP_MIN,
 )
-from himawari import _parse_l2_utc, _parse_l3_utc, _read_band
+from himawari import _parse_l2_utc, _parse_l3_utc, _read_band, _wavelength_correct
 from viirs    import _viirs_files_for_date, _parse_viirs_utc, _read_viirs_file
 from modis    import _modis_files_for_date, _tile_station_rowcol, _read_modis_tile_aod2d
 
@@ -182,10 +182,14 @@ def _extract_himawari_l2(
                     )
                     if not (0 <= tif_row < src.height and 0 <= tif_col < src.width):
                         continue
-                    aot = _read_band(src, 1)
+                    aot = _read_band(src, 1)   # 500 nm
+                    ae  = _read_band(src, 3)   # Ångström exponent
                     H, W = src.height, src.width
             except Exception:
                 continue
+
+            # 500 → 550 nm Ångström interpolation; drops AE-missing pixels
+            aot = _wavelength_correct(aot, ae)
 
             result = _sample_grid_aod(aot, tif_row, tif_col, H, W, sensor='himawari_l2')
             if result is None:
@@ -228,12 +232,18 @@ def _extract_himawari_l3(
                     )
                     if not (0 <= tif_row < src.height and 0 <= tif_col < src.width):
                         continue
-                    band2  = _read_band(src, 2)   # AOT_Merged
-                    band10 = _read_band(src, 10)  # AOT_L2_Mean fallback
-                    aot    = np.where(~np.isnan(band2), band2, band10)
-                    H, W   = src.height, src.width
+                    band2   = _read_band(src, 2)   # AOT_Merged   (500 nm)
+                    band10  = _read_band(src, 10)  # AOT_L2_Mean  (500 nm fallback)
+                    band6   = _read_band(src, 6)   # AE_Merged
+                    band13  = _read_band(src, 13)  # AE_L2_Mean   (AE fallback)
+                    aot     = np.where(~np.isnan(band2), band2, band10)
+                    ae      = np.where(~np.isnan(band6), band6, band13)
+                    H, W    = src.height, src.width
             except Exception:
                 continue
+
+            # 500 → 550 nm Ångström interpolation; drops AE-missing pixels
+            aot = _wavelength_correct(aot, ae)
 
             result = _sample_grid_aod(aot, tif_row, tif_col, H, W, sensor='himawari_l3')
             if result is None:

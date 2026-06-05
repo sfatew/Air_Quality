@@ -42,7 +42,8 @@ def load_aeronet(site: str) -> pd.DataFrame:
         lat, lon        site coordinates (degrees)
         aod_500         AOD at 500 nm
         aod_550         AOD at 550 nm (Ångström interpolated)
-        alpha_440_870   Ångström exponent 440–870 nm
+        alpha_550       Ångström exponent used for the 500→550 interpolation
+                        (440-675 preferred, 500-870 fallback, 440-870 last)
         aod_675, aod_440
         region          'north' | 'central' | 'south'
         season          'dry' | 'wet'
@@ -54,17 +55,28 @@ def load_aeronet(site: str) -> pd.DataFrame:
     df['aod_500']       = pd.to_numeric(df['AOD_500nm'],             errors='coerce')
     df['aod_675']       = pd.to_numeric(df['AOD_675nm'],             errors='coerce')
     df['aod_440']       = pd.to_numeric(df['AOD_440nm'],             errors='coerce')
-    df['alpha_440_870'] = pd.to_numeric(df['440-870_Angstrom_Exponent'], errors='coerce')
+
+    # Ångström exponent for 500→550 nm interpolation.
+    # Preference order (closest spectral match wins):
+    #   1. 440-675  — brackets both 500 and 550 nm (most accurate)
+    #   2. 500-870  — anchored at 500 nm
+    #   3. 440-870  — broader, used only when (1)/(2) are NaN
+    # Polarimetric variants are skipped: they are sparsely populated in
+    # standard AERONET CSVs and would add NaNs at the coalesce step.
+    ae_preferred = pd.to_numeric(df['440-675_Angstrom_Exponent'], errors='coerce')
+    ae_500_870   = pd.to_numeric(df['500-870_Angstrom_Exponent'], errors='coerce')
+    ae_440_870   = pd.to_numeric(df['440-870_Angstrom_Exponent'], errors='coerce')
+    df['alpha_550'] = ae_preferred.fillna(ae_500_870).fillna(ae_440_870)
 
     # Remove obviously bad values (instrument noise, fill sentinels -999)
     for col in ['aod_500', 'aod_675', 'aod_440']:
         df[col] = df[col].where(df[col] >= 0, other=np.nan)
 
     # Ångström interpolation 500 → 550 nm
-    valid = df['aod_500'].notna() & df['alpha_440_870'].notna()
+    valid = df['aod_500'].notna() & df['alpha_550'].notna()
     df['aod_550'] = np.where(
         valid,
-        aod_at_550(df['aod_500'].values, df['alpha_440_870'].values),
+        aod_at_550(df['aod_500'].values, df['alpha_550'].values),
         np.nan,
     )
     df['aod_550'] = df['aod_550'].where(df['aod_550'] >= 0, other=np.nan)
@@ -79,7 +91,7 @@ def load_aeronet(site: str) -> pd.DataFrame:
     )
 
     keep = ['datetime', 'site', 'lat', 'lon',
-            'aod_500', 'aod_550', 'alpha_440_870', 'aod_675', 'aod_440',
+            'aod_500', 'aod_550', 'alpha_550', 'aod_675', 'aod_440',
             'region', 'season']
     df = df[keep].dropna(subset=['aod_550']).reset_index(drop=True)
     return df

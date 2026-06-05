@@ -67,11 +67,13 @@ TEST_END    = date(2026, 4, 30)    # held-out test period end
 EE_OFFSET   = 0.05
 EE_SLOPE    = 0.15
 
-# Nguyen 2025 inter-sensor R² baselines (MODIS–Himawari, per region)
+# Nguyen 2025 inter-sensor R² baselines (MODIS–Himawari, per region).
+# v3.2: a single 'AOD_himawari' grid replaces the separate L2/L3 grids,
+# so the baseline key is keyed by 'himawari'.
 NGUYEN2025_R2_BASELINES = {
-    ('modis_maiac', 'himawari_l2', 'north'):   0.621,
-    ('modis_maiac', 'himawari_l2', 'central'): 0.474,
-    ('modis_maiac', 'himawari_l2', 'south'):   0.756,
+    ('modis_maiac', 'himawari', 'north'):   0.621,
+    ('modis_maiac', 'himawari', 'central'): 0.474,
+    ('modis_maiac', 'himawari', 'south'):   0.756,
 }
 
 
@@ -300,110 +302,122 @@ def inter_sensor_consistency(
     start: date,
     end:   date,
     sensor_pairs: list[tuple[str, str]] = (
-        ('AOD_modis_maiac', 'AOD_himawari_l2'),
-        ('AOD_viirs_noaa20', 'AOD_himawari_l2'),
+        ('AOD_modis_maiac', 'AOD_himawari'),
+        ('AOD_viirs_noaa20', 'AOD_himawari'),
         ('AOD_viirs_noaa20', 'AOD_modis_maiac'),
     ),
+    stations_csv: Path = None,
 ) -> pd.DataFrame:
-    """§8.2: Compute inter-sensor R² by region using per-sensor grids in merged NetCDFs.
+    """§8.2: Inter-sensor R² by region using daily means at Envisoft station pixels.
 
-    Only slots where BOTH sensors have valid data for a given cell are used.
+    Methodology (v3.2 — aligned with EDA Regional Comparison and Nguyen 2025):
+      1. Extract each sensor's AOD at every Envisoft station pixel, every slot.
+      2. Aggregate to daily means per (station, date, sensor).
+      3. For each (sensor_a, sensor_b, region), regress all (station, date)
+         daily-mean pairs within that region.
 
-    Uses running sums (N, Σa, Σb, Σa², Σb², Σab, Σ(a−b)²) instead of storing
-    every paired observation — the all-pairs accumulator previously held 8M+
-    tuples per region in memory and was the dominant memory cost of
-    `--mode all` for multi-year ranges.
+    The v3.1 all-cell-all-slot scan produced 10⁶-tick scatter dominated by
+    QA-edge and IDW-blend artefacts; Nguyen 2025 reports station-level daily
+    R², so the previous "vs baseline" deltas were apples-to-oranges.
 
     Returns DataFrame: sensor_a, sensor_b, region, N, R2, RMSE, Bias
     """
-    # Running sums per (pair, region) — region codes match fusion.py:
-    # 0=south, 1=central, 2=north
-    region_names = {0: 'south', 1: 'central', 2: 'north'}
-    keys = ['N', 'sa', 'sb', 'saa', 'sbb', 'sab', 'sd2']
-    stats_acc: dict[tuple, dict[str, float]] = {
-        (pair, rn): {k: 0.0 for k in keys}
-        for pair in sensor_pairs
-        for rn in region_names.values()
-    }
+    if stations_csv is None:
+        stations_csv = STATIONS_META
+    meta = load_pm25_meta(stations_csv)
 
-    # Build per-cell region mask (constant)
-    lat_2d = np.meshgrid(LATS, LONS, indexing='ij')[0]
-    region_grid = np.where(
-        lat_2d >= NORTH_CENTRAL_LAT, 2,
-        np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1)
-    )
+    # Station pixel → (row, col, region)
+    station_rc: dict[str, tuple[int, int, str]] = {}
+    for _, row in meta.iterrows():
+        r, c = _latlon_rc(float(row['latitude']), float(row['longitude']))
+        if 0 <= r < NLAT and 0 <= c < NLON:
+            station_rc[row['stationName']] = (r, c, str(row['region']))
+    if not station_rc:
+        return pd.DataFrame()
+
+    # Per (station, date, sensor) daily accumulators
+    # daily[(station, date, sensor)] = [values from each valid slot]
+    from collections import defaultdict
+    daily: dict[tuple[str, date, str], list[float]] = defaultdict(list)
+
+    sensor_vars = sorted({s for pair in sensor_pairs for s in pair})
 
     files = _merged_files_for_range(start, end)
     bar   = _make_bar(files, desc='Sensor overlap scan', unit='file', ncols=80)
 
     for fpath in (bar if bar is not None else files):
+        slot = _parse_slot_utc(fpath)
+        if slot is None:
+            continue
+        slot_date = slot.date()
         try:
             with nc.Dataset(fpath) as ds:
-                available = list(ds.variables.keys())
-                slot_data = {}
-                for sen_a, sen_b in sensor_pairs:
-                    for s in (sen_a, sen_b):
-                        if s in available and s not in slot_data:
-                            slot_data[s] = np.ma.filled(
-                                ds.variables[s][:].astype(np.float32), np.nan
-                            )
+                available = set(ds.variables.keys())
+                slot_data: dict[str, np.ndarray] = {}
+                for s in sensor_vars:
+                    if s in available:
+                        slot_data[s] = np.ma.filled(
+                            ds.variables[s][:].astype(np.float32), np.nan
+                        )
         except Exception:
             continue
 
-        for pair in sensor_pairs:
-            sen_a, sen_b = pair
-            if sen_a not in slot_data or sen_b not in slot_data:
-                continue
-            a = slot_data[sen_a]
-            b = slot_data[sen_b]
-            valid = np.isfinite(a) & np.isfinite(b)
-            if not np.any(valid):
-                continue
+        for stn, (r, c, region) in station_rc.items():
+            for s, grid in slot_data.items():
+                v = float(grid[r, c])
+                if np.isfinite(v) and v >= 0:
+                    daily[(stn, slot_date, s)].append(v)
 
-            for reg_idx, reg_name in region_names.items():
-                mask = valid & (region_grid == reg_idx)
-                if not np.any(mask):
-                    continue
-                av = a[mask].astype(np.float64)
-                bv = b[mask].astype(np.float64)
-                d  = stats_acc[(pair, reg_name)]
-                d['N']   += float(av.size)
-                d['sa']  += float(av.sum())
-                d['sb']  += float(bv.sum())
-                d['saa'] += float((av * av).sum())
-                d['sbb'] += float((bv * bv).sum())
-                d['sab'] += float((av * bv).sum())
-                d['sd2'] += float(((av - bv) ** 2).sum())
+    if not daily:
+        return pd.DataFrame()
 
-    rows = []
-    for (pair, region), d in stats_acc.items():
-        n = d['N']
-        if n < 10:
+    # Build a wide daily-mean DataFrame: rows = (station, date), cols = sensors
+    records: list[dict] = []
+    keys_by_sd: dict[tuple[str, date], dict[str, float]] = defaultdict(dict)
+    for (stn, d_, s), vals in daily.items():
+        keys_by_sd[(stn, d_)][s] = float(np.mean(vals))
+    for (stn, d_), sd in keys_by_sd.items():
+        region = station_rc[stn][2]
+        rec = {'station_name': stn, 'date': d_, 'region': region}
+        rec.update(sd)
+        records.append(rec)
+    daily_df = pd.DataFrame(records)
+
+    rows: list[dict] = []
+    for sen_a, sen_b in sensor_pairs:
+        if sen_a not in daily_df.columns or sen_b not in daily_df.columns:
             continue
-        mean_a = d['sa'] / n
-        mean_b = d['sb'] / n
-        var_a  = max(d['saa'] / n - mean_a * mean_a, 0.0)
-        var_b  = max(d['sbb'] / n - mean_b * mean_b, 0.0)
-        cov_ab = d['sab'] / n - mean_a * mean_b
-        denom  = np.sqrt(var_a * var_b)
-        r      = cov_ab / denom if denom > 0 else np.nan
-        rmse   = float(np.sqrt(d['sd2'] / n))
-        bias   = float(mean_a - mean_b)
-        sen_a, sen_b = pair
-        baseline_key = (sen_a.replace('AOD_', ''), sen_b.replace('AOD_', ''), region)
-        baseline_r2  = NGUYEN2025_R2_BASELINES.get(baseline_key, np.nan)
-        r2_val       = float(r ** 2) if np.isfinite(r) else np.nan
-        rows.append({
-            'sensor_a':    sen_a,
-            'sensor_b':    sen_b,
-            'region':      region,
-            'N':           int(n),
-            'R2':          r2_val,
-            'R2_baseline': baseline_r2,
-            'R2_delta':    (r2_val - baseline_r2) if (np.isfinite(r2_val) and not np.isnan(baseline_r2)) else np.nan,
-            'RMSE':        rmse,
-            'Bias':        bias,
-        })
+        for region in ('south', 'central', 'north'):
+            sub = daily_df[(daily_df['region'] == region)
+                           & daily_df[sen_a].notna()
+                           & daily_df[sen_b].notna()]
+            n = len(sub)
+            if n < 10:
+                continue
+            a = sub[sen_a].to_numpy(dtype=np.float64)
+            b = sub[sen_b].to_numpy(dtype=np.float64)
+            r, _ = stats.pearsonr(a, b)
+            r2   = float(r ** 2)
+            rmse = float(np.sqrt(np.mean((a - b) ** 2)))
+            bias = float(np.mean(a - b))
+            baseline_key = (
+                sen_a.replace('AOD_', ''),
+                sen_b.replace('AOD_', ''),
+                region,
+            )
+            baseline_r2 = NGUYEN2025_R2_BASELINES.get(baseline_key, np.nan)
+            rows.append({
+                'sensor_a':    sen_a,
+                'sensor_b':    sen_b,
+                'region':      region,
+                'N':           int(n),
+                'R2':          r2,
+                'R2_baseline': baseline_r2,
+                'R2_delta':    (r2 - baseline_r2)
+                               if not np.isnan(baseline_r2) else np.nan,
+                'RMSE':        rmse,
+                'Bias':        bias,
+            })
 
     return pd.DataFrame(rows)
 
@@ -877,20 +891,26 @@ def extract_aod_pm25_pairs(
 def pm25_coupling_metrics(pairs: pd.DataFrame) -> pd.DataFrame:
     """§8.4: AOD–PM2.5 coupling metrics stratified by region, season, and station.
 
-    Fits OLS + RANSAC for both aod_merged_daily and aod_phys_daily vs pm25_daily
-    across four stratum levels: overall, per-region, per-region×season, per-station.
+    Methodology (v3.2 — aligned with EDA_MODIS_AQI.ipynb):
+      • Per-station strata: one row per (station, aod_type) with that station's
+        own Pearson/Spearman/OLS/RANSAC fit.
+      • Aggregate strata (ALL, region, region×season): compute the per-station
+        fit *within* the stratum, then report the **mean and std across
+        stations**.  The v3.1 pooled regression collapsed because
+        between-station differences in mean PM2.5 (5–10 µg/m³) dominate the
+        within-station AOD-PM2.5 signal.
+      • 'ransac_r2_delta' = aggregate RANSAC R² minus the Nguyen 2025
+        Himawari-only baseline (0.293).
 
-    'ransac_r2_delta' = RANSAC R² minus the Nguyen 2025 Himawari-only baseline
-    (0.293) — positive values indicate the merged product beats the baseline.
-
-    Returns a tidy DataFrame with one row per (stratum, aod_type).
+    Returns a tidy DataFrame; aggregate rows carry extra `*_std` and
+    `n_stations` columns.
     """
 
-    def _fit_stratum(
+    def _fit_one(
         aod_col: str,
         sub: pd.DataFrame,
-        label: str,
     ) -> Optional[dict]:
+        """Per-station-or-stratum OLS+RANSAC+Pearson+Spearman fit, raw metrics."""
         df = sub[[aod_col, 'pm25_daily']].dropna()
         if len(df) < 10:
             return None
@@ -915,49 +935,93 @@ def pm25_coupling_metrics(pairs: pd.DataFrame) -> pd.DataFrame:
         sr, _ = stats.spearmanr(df[aod_col].values, y)
 
         return {
-            'label':            label,
-            'aod_type':         aod_col,
             'N':                len(df),
             'pearson_r':        float(pr),
             'spearman_r':       float(sr),
             'ols_r2':           ols_r2,
             'ransac_r2':        ransac_r2,
-            'ransac_r2_delta':  (ransac_r2 - NGUYEN2025_PM25_RANSAC_R2)
-                                if not np.isnan(ransac_r2) else np.nan,
             'inlier_frac':      inlier_frac,
             'ransac_slope':     ransac_slope,
             'ransac_intercept': ransac_intercept,
         }
 
-    rows     = []
+    def _aggregate_per_station(
+        sub_df: pd.DataFrame,
+        aod_col: str,
+        label: str,
+        **extra,
+    ) -> Optional[dict]:
+        """Run _fit_one per station within sub_df; return mean & std across stations."""
+        per_station: list[dict] = []
+        for _, grp in sub_df.groupby('station_name'):
+            f = _fit_one(aod_col, grp)
+            if f is not None:
+                per_station.append(f)
+        if not per_station:
+            return None
+        ps = pd.DataFrame(per_station)
+        out = {
+            'label':            label,
+            'aod_type':         aod_col,
+            'n_stations':       int(len(ps)),
+            'N':                int(ps['N'].sum()),
+            'pearson_r':        float(ps['pearson_r'].mean()),
+            'pearson_r_std':    float(ps['pearson_r'].std()),
+            'spearman_r':       float(ps['spearman_r'].mean()),
+            'spearman_r_std':   float(ps['spearman_r'].std()),
+            'ols_r2':           float(ps['ols_r2'].mean()),
+            'ols_r2_std':       float(ps['ols_r2'].std()),
+            'ransac_r2':        float(ps['ransac_r2'].mean()),
+            'ransac_r2_std':    float(ps['ransac_r2'].std()),
+            'ransac_r2_delta':  float(ps['ransac_r2'].mean() - NGUYEN2025_PM25_RANSAC_R2),
+            'inlier_frac':      float(ps['inlier_frac'].mean()),
+        }
+        out.update(extra)
+        return out
+
+    rows: list[dict] = []
     aod_cols = ['aod_merged_daily', 'aod_phys_daily']
 
+    # ALL — across every station
     for aod_col in aod_cols:
-        r = _fit_stratum(aod_col, pairs, 'ALL')
+        r = _aggregate_per_station(pairs, aod_col, 'ALL')
         if r:
             rows.append(r)
 
+    # Per region — across stations within region
     for region, grp in pairs.groupby('region'):
         for aod_col in aod_cols:
-            r = _fit_stratum(aod_col, grp, f'region={region}')
+            r = _aggregate_per_station(grp, aod_col, f'region={region}',
+                                       region=region)
             if r:
-                r['region'] = region
                 rows.append(r)
 
+    # Per region × season — across stations within stratum
     for (region, season), grp in pairs.groupby(['region', 'season']):
         for aod_col in aod_cols:
-            r = _fit_stratum(aod_col, grp, f'region={region} season={season}')
+            r = _aggregate_per_station(
+                grp, aod_col,
+                f'region={region} season={season}',
+                region=region, season=season,
+            )
             if r:
-                r['region'] = region
-                r['season'] = season
                 rows.append(r)
 
+    # Per station — single fit, no across-station aggregation
     for sn, grp in pairs.groupby('station_name'):
         for aod_col in aod_cols:
-            r = _fit_stratum(aod_col, grp, f'station={sn}')
-            if r:
-                r['station_name'] = sn
-                rows.append(r)
+            f = _fit_one(aod_col, grp)
+            if f is None:
+                continue
+            f.update({
+                'label':           f'station={sn}',
+                'aod_type':        aod_col,
+                'station_name':    sn,
+                'n_stations':      1,
+                'ransac_r2_delta': (f['ransac_r2'] - NGUYEN2025_PM25_RANSAC_R2)
+                                   if not np.isnan(f['ransac_r2']) else np.nan,
+            })
+            rows.append(f)
 
     return pd.DataFrame(rows)
 

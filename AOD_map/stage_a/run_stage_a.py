@@ -54,6 +54,9 @@ from bias_correction import (
 from fusion          import fuse, load_rmse
 
 _ALL_SENSOR_GROUPS = ('himawari', 'viirs', 'modis')
+# Training keys (bias-correction CDFs).  Himawari L2 and L3 each train their
+# own CDF from their own AERONET collocation CSVs.  Fusion sees only the
+# merged 'himawari' grid (L3-preferred, L2-fallback).
 _SENSOR_KEYS = {
     'himawari': ['himawari_l2', 'himawari_l3'],
     'viirs':    ['viirs_snpp', 'viirs_noaa20'],
@@ -212,13 +215,18 @@ def _process_slot_with_modis_cache(
     """Run Steps A1–A2–A3–A4–A5 for one slot using a pre-loaded MODIS pixel cache."""
     month = slot_utc.month
     raw_grids: dict[str, Optional[np.ndarray]] = {}
+    # Per-level raw Himawari grids are kept separately through bias correction
+    # so each level uses its own CDF.  They are merged into a single 'himawari'
+    # grid (L3 wins per pixel, L2 fills L3 gaps) immediately before fusion.
+    himawari_l2_raw: Optional[np.ndarray] = None
+    himawari_l3_raw: Optional[np.ndarray] = None
 
     # ── Step A1 + A2: read and grid each sensor ────────────────────────────
     if 'himawari' in sensor_groups:
         l2 = read_l2_slot(slot_utc)
         l3 = read_l3_slot(slot_utc)
-        raw_grids['himawari_l2'] = grid_from_himawari(l2)['aod_mean'] if l2 is not None else None
-        raw_grids['himawari_l3'] = grid_from_himawari(l3)['aod_mean'] if l3 is not None else None
+        himawari_l2_raw = grid_from_himawari(l2)['aod_mean'] if l2 is not None else None
+        himawari_l3_raw = grid_from_himawari(l3)['aod_mean'] if l3 is not None else None
 
     if 'viirs' in sensor_groups:
         for sensor in ('viirs_snpp', 'viirs_noaa20'):
@@ -238,26 +246,66 @@ def _process_slot_with_modis_cache(
         else:
             raw_grids['modis_maiac'] = None
 
-    has_any = any(v is not None and np.any(np.isfinite(v)) for v in raw_grids.values())
+    has_any_himawari = any(
+        v is not None and np.any(np.isfinite(v))
+        for v in (himawari_l2_raw, himawari_l3_raw)
+    )
+    has_any = has_any_himawari or any(
+        v is not None and np.any(np.isfinite(v)) for v in raw_grids.values()
+    )
     if not has_any:
         return None
     if dry_run:
         return Path('dry_run')
 
-    # ── Step A4: bias correction (on raw AOD — AERONET also measures raw AOD)
+    # ── Step A4: bias correction ───────────────────────────────────────────
+    # Each Himawari level uses its own CDF (different retrieval quality);
+    # the corrected per-level grids are then merged into one 'himawari' grid
+    # with L3 winning per pixel, L2 filling L3 gaps.
     corrected: dict[str, Optional[np.ndarray]] = {}
+
+    if himawari_l3_raw is not None:
+        himawari_l3_corrected = apply_correction_grid(
+            himawari_l3_raw, 'himawari_l3', month, lat_2d, lon_2d, corrections
+        )
+    else:
+        himawari_l3_corrected = None
+    if himawari_l2_raw is not None:
+        himawari_l2_corrected = apply_correction_grid(
+            himawari_l2_raw, 'himawari_l2', month, lat_2d, lon_2d, corrections
+        )
+    else:
+        himawari_l2_corrected = None
+
+    if himawari_l3_corrected is not None and himawari_l2_corrected is not None:
+        himawari_corrected = np.where(
+            np.isfinite(himawari_l3_corrected),
+            himawari_l3_corrected,
+            himawari_l2_corrected,
+        ).astype(np.float32)
+    elif himawari_l3_corrected is not None:
+        himawari_corrected = himawari_l3_corrected
+    elif himawari_l2_corrected is not None:
+        himawari_corrected = himawari_l2_corrected
+    else:
+        himawari_corrected = None
+
+    # Step A4b: LEO–Himawari spatial offset (thesis §7.4.2) applied to the
+    # merged Himawari grid (was per-level pre-v3.2 — one offset for the
+    # downstream sensor.)
+    if himawari_corrected is not None and leo_himawari_offset is not None:
+        himawari_corrected = apply_leo_himawari_offset(
+            himawari_corrected, 'himawari', month, leo_himawari_offset
+        )
+    corrected['himawari'] = himawari_corrected
+
     for sensor, aod in raw_grids.items():
         if aod is None:
             corrected[sensor] = None
             continue
-        g = apply_correction_grid(aod, sensor, month, lat_2d, lon_2d, corrections)
-        # Step A4b: LEO–Himawari spatial offset (thesis §7.4.2) — applied only to
-        # Himawari grids, after the AERONET-anchored CDF correction.  Pixels far
-        # from either AERONET anchor receive a LEO-derived additive offset that
-        # is otherwise unconstrained.
-        if leo_himawari_offset is not None and sensor in ('himawari_l2', 'himawari_l3'):
-            g = apply_leo_himawari_offset(g, sensor, month, leo_himawari_offset)
-        corrected[sensor] = g
+        corrected[sensor] = apply_correction_grid(
+            aod, sensor, month, lat_2d, lon_2d, corrections
+        )
 
     # ── Step A5: ICW fusion ────────────────────────────────────────────────
     valid_corrected = {k: v for k, v in corrected.items() if v is not None}

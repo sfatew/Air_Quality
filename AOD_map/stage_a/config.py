@@ -40,12 +40,12 @@ AERONET_SITES = {
 # than the original Nguyen 2025 figures which do not match our data distribution.
 # Key: (sensor_key, region)
 SENSOR_RMSE_PRIOR = {
-    ('himawari_l2', 'north'):   0.525,
-    ('himawari_l2', 'central'): 0.420,
-    ('himawari_l2', 'south'):   0.317,
-    ('himawari_l3', 'north'):   0.477,
-    ('himawari_l3', 'central'): 0.399,
-    ('himawari_l3', 'south'):   0.321,
+    # Single Himawari entry (v3.2): L3 wins per pixel, L2 fills L3 gaps.
+    # Values seeded from the previous himawari_l3 priors since L3 dominates
+    # most pixels.  Updated by post_correction_rmse.json after training.
+    ('himawari',    'north'):   0.477,
+    ('himawari',    'central'): 0.399,
+    ('himawari',    'south'):   0.321,
     ('modis_maiac', 'north'):   0.385,
     ('modis_maiac', 'central'): 0.254,
     ('modis_maiac', 'south'):   0.122,
@@ -59,6 +59,13 @@ SENSOR_RMSE_PRIOR = {
 
 # MODIS MAIAC gets an extra down-weighting factor in the south (R=0.41 → unreliable)
 MODIS_SOUTH_WEIGHT_FACTOR = 0.1  # effectively removes MAIAC from south fusion
+
+# Himawari gets an extra ICW down-weighting factor in wet months (May–Sep) to
+# suppress cloud-edge contamination during monsoon season.  Replaces the
+# previous wet-season QA tightening (HIMAWARI_WET_RF_MIN/UNC_MAX), which
+# stripped 70%+ of wet-season retrievals and biased the remainder toward
+# high-AOD events.  v3.0-era band-aid restored.
+HIMAWARI_WET_WEIGHT_FACTOR = 0.5
 
 # Minimum RMSE used when computing ICW weights (1/RMSE²).
 # Wet-season CDF corrections trained on N<20 pairs can reach RMSE≈0.04
@@ -96,11 +103,10 @@ HIMAWARI_SZA_MAX = 70.0   # solar zenith angle maximum (degrees)
 HIMAWARI_VZA_MAX = 60.0   # viewing zenith angle hard cut (degrees)
 HIMAWARI_VZA_SOFT = 55.0  # VZA > 55° flagged lower confidence (not discarded)
 
-# Wet-season (May–Sep) Himawari QA tightening: cloud-edge contamination is
-# the dominant error source in monsoon months.  Replaces the v3.0
-# HIMAWARI_WET_WEIGHT_FACTOR band-aid with stricter retrieval-quality gates.
-HIMAWARI_WET_RF_MIN  = 0.7
-HIMAWARI_WET_UNC_MAX = 0.3
+# Wet-season Himawari QA tightening removed (v3.2) — the strict thresholds
+# stripped ~70% of monsoon retrievals and biased the survivors toward extreme
+# events.  Wet-season cloud-edge contamination is now handled in fusion.py via
+# HIMAWARI_WET_WEIGHT_FACTOR (ICW down-weight), which preserves coverage.
 
 # VIIRS Deep Blue L2
 VIIRS_QA_MIN_LAND  = 2   # 0=no retrieval, 1=poor, 2=moderate, 3=good

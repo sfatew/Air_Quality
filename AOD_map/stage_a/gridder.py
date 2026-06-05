@@ -32,11 +32,6 @@ from config import (
     LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
 )
 
-# Bin edges for latitude (north → south) and longitude (west → east)
-# histogram2d uses [min, max) bins, so we define edges from extremes
-_LAT_EDGES = np.linspace(LAT_MAX, LAT_MIN, NLAT + 1)   # descending (north first)
-_LON_EDGES = np.linspace(LON_MIN, LON_MAX, NLON + 1)    # ascending
-
 
 def _lat_to_row(lat: np.ndarray) -> np.ndarray:
     """Map latitude → 0-based row index (0 = northernmost row)."""

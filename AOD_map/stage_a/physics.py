@@ -15,7 +15,7 @@ ERA5 source
 -----------
   File  : ERA5_FILE (Vietnam_ERA5_bbox.nc)
   Grid  : 0.25° × 0.25°, 63 × 33 points, N=23.5 W=102.0 S=8.0 E=110.0
-  Time  : UTC+7, hourly, Sep 2022 – Apr 2026
+  Time  : UTC, hourly, Sep 2022 – Apr 2026
   Vars  : RH (%), PBLH (m)
 
 The ERA5 dataset is opened once as a lazy xarray Dataset and kept in a
@@ -25,7 +25,7 @@ scipy.interpolate.RegularGridInterpolator.
 """
 
 from __future__ import annotations
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 import numpy as np
@@ -43,7 +43,6 @@ except Exception:
 from config import (
     ERA5_FILE, GAMMA, PBLH_MIN,
     LATS, LONS, NLAT, NLON,
-    TZ_OFFSET_HOURS,
 )
 
 # ── Module-level ERA5 cache ───────────────────────────────────────────────────
@@ -65,11 +64,10 @@ def _load_era5() -> xr.Dataset:
 # ── ERA5 nearest-hourly retrieval ─────────────────────────────────────────────
 
 def _nearest_era5_slice(slot_utc: datetime) -> Optional[xr.Dataset]:
-    """Return the ERA5 time slice nearest to slot_utc (UTC+7 local time)."""
+    """Return the ERA5 time slice nearest to slot_utc (UTC)."""
     ds = _load_era5()
-    # Convert slot to local time for ERA5 look-up (ERA5 timestamps are UTC+7)
-    slot_local = slot_utc.replace(tzinfo=None) + timedelta(hours=TZ_OFFSET_HOURS)
-    ts = np.datetime64(slot_local.replace(minute=0, second=0, microsecond=0))
+    slot_hour = slot_utc.replace(tzinfo=None, minute=0, second=0, microsecond=0)
+    ts = np.datetime64(slot_hour)
 
     # Find the nearest available ERA5 hour
     era5_times = ds['time'].values

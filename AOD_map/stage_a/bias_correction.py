@@ -56,10 +56,10 @@ def _make_bar(iterable, **kwargs):
     return None
 
 from config import (
-    AERONET_SITES, DRY_MONTHS, WET_MONTHS,
+    DRY_MONTHS, WET_MONTHS,
     CDF_N_QUANTILES, CDF_MIN_PAIRS,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
-    EARTH_RADIUS_KM, BIASC_DIR,
+    BIASC_DIR,
     LATS, LONS, NLAT, NLON,
     LEO_HIMAWARI_OFFSET_FILE, LEO_HIMAWARI_MIN_PAIRS, LEO_HIMAWARI_SMOOTH_SIGMA,
     MERGED_DIR,
@@ -72,22 +72,6 @@ _FIT_MIN_PEARSON   = 0.30   # minimum Pearson R for any correction to be trusted
 _FIT_MIN_SLOPE     = 0.30   # linear slope sanity range
 _FIT_MAX_SLOPE     = 3.00
 _CV_FOLDS          = 5      # cross-validated RMSE evaluation folds
-
-
-# ── Haversine distance ────────────────────────────────────────────────────────
-
-def _haversine_km(lat1: float, lon1: float, lat2: np.ndarray,
-                  lon2: np.ndarray) -> np.ndarray:
-    """Vectorised great-circle distance (km)."""
-    xp   = _xp
-    lat2 = xp.asarray(lat2)
-    lon2 = xp.asarray(lon2)
-    cos_lat1 = float(np.cos(np.radians(lat1)))
-    R    = EARTH_RADIUS_KM
-    dlat = xp.radians(lat2 - lat1)
-    dlon = xp.radians(lon2 - lon1)
-    a = xp.sin(dlat / 2) ** 2 + cos_lat1 * xp.cos(xp.radians(lat2)) * xp.sin(dlon / 2) ** 2
-    return R * 2 * xp.arctan2(xp.sqrt(a), xp.sqrt(1 - a))
 
 
 # ── Stratum helpers ───────────────────────────────────────────────────────────
@@ -178,14 +162,16 @@ class CDFCorrection:
                 {'slope': slope, 'intercept': intercept, 'pearson_r': float(r)},
             )
 
-        # Quantile-mapping (Ahn 2021)
+        # Quantile-mapping (Ahn 2021).  No upper identity anchor: the v3.1
+        # `[max(sat.max(), aer.max()) * 1.1]` anchor on both axes forced the
+        # correction to identity at the high-AOD limit, inverting any monotone
+        # bias in the extrapolation tail.  Let PCHIP extrapolate from the top
+        # empirical quantile instead.
         q     = np.linspace(0.005, 0.995, CDF_N_QUANTILES)
         sat_q = np.quantile(sat, q)
         aer_q = np.quantile(aer, q)
-        sat_all = np.concatenate([[0.0], sat_q, [max(sat.max(), aer.max()) * 1.1]])
-        aer_all = np.concatenate(
-            [[min(0.0, float(aer_q[0]))], aer_q, [max(sat.max(), aer.max()) * 1.1]]
-        )
+        sat_all = np.concatenate([[0.0], sat_q])
+        aer_all = np.concatenate([[min(0.0, float(aer_q[0]))], aer_q])
         order   = np.argsort(sat_all)
         sat_all = sat_all[order]
         aer_all = aer_all[order]
@@ -319,17 +305,12 @@ class CDFCorrection:
                 f'RMSE {self.rmse_before:.3f} → {self.rmse_after:.3f}')
 
 
-# ── IDW-blended spatial application ──────────────────────────────────────────
-
-def _idw_weights(lat_2d: np.ndarray, lon_2d: np.ndarray,
-                 anchor_lat: float, anchor_lon: float,
-                 power: float = 2.0) -> np.ndarray:
-    """Return IDW weight array (1 / d^power) for a single anchor site."""
-    xp   = _xp
-    dist = _haversine_km(anchor_lat, anchor_lon, lat_2d, lon_2d)
-    dist = xp.maximum(dist, 0.001)
-    return 1.0 / dist ** power
-
+# ── Per-region spatial application ───────────────────────────────────────────
+# v3.2: dropped the IDW blend between NGHIA_DO and Bac_Lieu.  The two-anchor
+# transect averaged corrections trained on incompatible aerosol regimes for
+# central cells, with no third anchor to constrain the blend.  Central cells
+# now pass through; central Himawari bias is handled by the §7.4.2 LEO
+# spatial-offset map instead.
 
 def apply_correction_grid(
     aod_grid: np.ndarray,
@@ -339,73 +320,67 @@ def apply_correction_grid(
     lon_2d: np.ndarray,
     corrections: dict[tuple[str, str, str], CDFCorrection],
 ) -> np.ndarray:
-    """Apply IDW-blended bias correction to a 2-D AOD grid.
+    """Apply per-region bias correction to a 2-D AOD grid.
 
-    Strategy:
-      • Look up the north-stratum correction (anchored at Nghia Do)
-        and the south-stratum correction (anchored at Bac Lieu).
-      • For each grid cell compute IDW weights from both anchors.
-      • The corrected AOD is the weight-normalised blend of the two
-        site corrections evaluated at the cell's AOD value.
-      • If only one anchor has a trained correction, that correction
-        is applied uniformly across the grid.
-      • If neither anchor has a correction, return aod_grid unchanged.
+    Strategy (v3.2 — no IDW blend):
+      • North cells (lat ≥ NORTH_CENTRAL_LAT) → apply the NGHIA_DO-trained
+        correction for this stratum.
+      • South cells (lat <  CENTRAL_SOUTH_LAT) → apply the Bac_Lieu-trained
+        correction for this stratum.
+      • Central cells → pass through unchanged.  No AERONET anchor exists in
+        central Vietnam, so the IDW blend used in v3.1 averaged two corrections
+        trained on different aerosol regimes (continental smoke vs delta
+        maritime) with no physical justification.  Central Himawari bias is
+        instead handled by the §7.4.2 LEO–Himawari spatial offset map.
+      • A correction whose quality gates rejected the fit has
+        correction_type='none' and is treated the same as missing.
 
     Parameters
     ----------
     aod_grid : (NLAT, NLON) float32 array, NaN = no data
-    sensor   : sensor key (e.g. 'himawari_l2')
+    sensor   : sensor key (e.g. 'himawari_l3')
     month    : calendar month (1–12) used to select dry/wet season
-    lat_2d, lon_2d : (NLAT, NLON) coordinate arrays
+    lat_2d   : (NLAT, NLON) latitude array
+    lon_2d   : kept for signature compatibility; no longer used
     corrections    : dict mapping (sensor, region, season) → CDFCorrection
 
     Returns (NLAT, NLON) float32 corrected AOD array.
     """
+    del lon_2d  # unused after dropping IDW
+
     season = 'dry' if month in DRY_MONTHS else 'wet'
 
     corr_N = corrections.get((sensor, 'north', season))
     corr_S = corrections.get((sensor, 'south', season))
 
-    # A correction whose quality gates rejected the fit has correction_type='none'
-    # and would pass through unchanged in apply().  Treat it the same as a missing
-    # anchor so the IDW blend never mixes raw AOD with bias-corrected AOD.
     if corr_N is not None and corr_N.correction_type == 'none':
         corr_N = None
     if corr_S is not None and corr_S.correction_type == 'none':
         corr_S = None
 
-    # No corrections available: pass through
+    out = aod_grid.astype(np.float32, copy=True)
     if corr_N is None and corr_S is None:
-        return aod_grid.copy()
+        return out
 
-    shape = aod_grid.shape
-    out   = np.full(shape, np.nan, dtype=np.float32)
+    # Region mask (0=south, 1=central, 2=north) — same convention as fusion.py
+    region_code = np.where(
+        lat_2d >= NORTH_CENTRAL_LAT, 2,
+        np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1)
+    )
     valid = np.isfinite(aod_grid)
 
-    if corr_N is None:
-        # Only south anchor available
-        out[valid] = corr_S.apply(aod_grid[valid])
-        return out
+    if corr_N is not None:
+        mask_n = valid & (region_code == 2)
+        if np.any(mask_n):
+            out[mask_n] = corr_N.apply(aod_grid[mask_n]).astype(np.float32)
 
-    if corr_S is None:
-        # Only north anchor available
-        out[valid] = corr_N.apply(aod_grid[valid])
-        return out
+    if corr_S is not None:
+        mask_s = valid & (region_code == 0)
+        if np.any(mask_s):
+            out[mask_s] = corr_S.apply(aod_grid[mask_s]).astype(np.float32)
 
-    # Both anchors available: IDW blend (weights on GPU, corrections stay CPU)
-    xp     = _xp
-    nghia  = AERONET_SITES['NGHIA_DO']
-    bac    = AERONET_SITES['Bac_Lieu']
-    w_N    = _idw_weights(lat_2d, lon_2d, nghia['lat'], nghia['lon'])  # GPU array
-    w_S    = _idw_weights(lat_2d, lon_2d, bac['lat'],  bac['lon'])     # GPU array
-    w_total = w_N + w_S
-
-    corr_n_vals = xp.asarray(corr_N.apply(aod_grid))   # PchipInterpolator on CPU → GPU
-    corr_s_vals = xp.asarray(corr_S.apply(aod_grid))
-
-    blended = (w_N * corr_n_vals + w_S * corr_s_vals) / w_total
-    out = xp.where(xp.asarray(valid), blended, np.nan).astype(np.float32)
-    return np.asarray(out)
+    # Central cells (region_code == 1): pass through unchanged.
+    return out
 
 
 # ── Convenience: load all corrections for a sensor set ───────────────────────
@@ -562,17 +537,19 @@ def build_leo_himawari_offset(
 
     For each grid cell, accumulates the mean residual:
 
-        offset[lat, lon, level, season] = mean( Himawari_corrected
-                                                − mean(LEO_sensors_corrected) )
+        offset[lat, lon, season] = mean( Himawari_corrected
+                                         − mean(LEO_sensors_corrected) )
 
     over the training period.  The map is then Gaussian-smoothed (mask-weighted
     so no-data cells do not pollute their neighbours) and written as a NetCDF
-    with one offset grid per (level, season) combination.
+    with one offset grid per season.
 
-    Prerequisite: a Stage A run already exists for [start_d, end_d] so that
-    MERGED_DIR contains `AOD_himawari_l2`, `AOD_himawari_l3`, and at least one
-    of `AOD_modis_maiac` / `AOD_viirs_*` per slot.  Run **after** Bug 1 has
-    been fixed so the L2 and L3 diagnostic grids carry distinct data.
+    Prerequisite (v3.2): a Stage A run already exists for [start_d, end_d] so
+    that MERGED_DIR contains `AOD_himawari` (the merged L3-preferred /
+    L2-fallback grid produced after the bug-1/2 fixes) and at least one of
+    `AOD_modis_maiac` / `AOD_viirs_*` per slot.  Rebuild after bugs 1-4 land
+    so the offset reflects the new corrections rather than the v3.1 IDW blend
+    and 500 nm wavelength artefacts.
 
     Parameters
     ----------
@@ -590,7 +567,8 @@ def build_leo_himawari_offset(
     from config import SENSOR_RMSE_FLOOR, MODIS_SOUTH_WEIGHT_FACTOR
     from fusion import load_rmse
 
-    levels   = ('l2', 'l3')
+    # v3.2: a single Himawari level (L3-preferred, L2-fallback merged grid).
+    levels   = ('himawari',)
     seasons  = ('dry', 'wet')
     leo_vars = ('AOD_modis_maiac', 'AOD_viirs_snpp', 'AOD_viirs_noaa20')
 
@@ -664,7 +642,8 @@ def build_leo_himawari_offset(
                     leo_mean = np.where(denom > 0, num / denom, np.nan)
 
                 for lv in levels:
-                    var = f'AOD_himawari_{lv}'
+                    # 'himawari' → variable AOD_himawari (v3.2 single-level)
+                    var = 'AOD_himawari' if lv == 'himawari' else f'AOD_himawari_{lv}'
                     if var not in ds.variables:
                         continue
                     hi = np.ma.filled(
@@ -722,14 +701,14 @@ def build_leo_himawari_offset(
             name = f'offset_{lv}_{sea}'
             v = ds.createVariable(name, 'f4', ('lat', 'lon'),
                                   zlib=True, complevel=4)
-            v.long_name = f'Mean Himawari-{lv.upper()} minus LEO_mean, {sea} season'
+            v.long_name = f'Mean Himawari ({lv}) minus LEO_mean, {sea} season'
             v.units     = '1'
             v[:] = arr
         for (lv, sea), arr in pair_counts.items():
             name = f'n_pairs_{lv}_{sea}'
             v = ds.createVariable(name, 'i4', ('lat', 'lon'),
                                   zlib=True, complevel=4)
-            v.long_name = f'Number of (Himawari-{lv.upper()}, LEO) co-located slots, {sea} season'
+            v.long_name = f'Number of (Himawari {lv}, LEO) co-located slots, {sea} season'
             v[:] = arr
 
     # ── Summary ────────────────────────────────────────────────────────────
@@ -748,7 +727,12 @@ def build_leo_himawari_offset(
 def load_leo_himawari_offset(
     fpath: Path | str = LEO_HIMAWARI_OFFSET_FILE,
 ) -> Optional[dict[tuple[str, str], np.ndarray]]:
-    """Return offsets dict keyed by (level, season) ∈ {l2,l3}×{dry,wet}, or None."""
+    """Return offsets dict keyed by (level, season).
+
+    v3.2: level is always 'himawari' (single L3-preferred-L2-fallback grid).
+    Legacy v3.1 files with 'l2'/'l3' levels are still readable for
+    inspection but apply_leo_himawari_offset only looks up 'himawari'.
+    """
     import netCDF4 as nc
     fpath = Path(fpath)
     if not fpath.exists():
@@ -756,7 +740,7 @@ def load_leo_himawari_offset(
     out: dict[tuple[str, str], np.ndarray] = {}
     try:
         with nc.Dataset(str(fpath)) as ds:
-            for lv in ('l2', 'l3'):
+            for lv in ('himawari', 'l2', 'l3'):
                 for sea in ('dry', 'wet'):
                     name = f'offset_{lv}_{sea}'
                     if name in ds.variables:
@@ -773,16 +757,15 @@ def apply_leo_himawari_offset(
     month: int,
     offsets: dict[tuple[str, str], np.ndarray],
 ) -> np.ndarray:
-    """Subtract the LEO-anchored spatial offset from a Himawari grid.
+    """Subtract the LEO-anchored spatial offset from the merged Himawari grid.
 
-    Returns aod_grid unchanged if `sensor` is not Himawari, if `offsets`
-    lacks the relevant (level, season) entry, or for NaN input pixels.
+    Returns aod_grid unchanged if `sensor` is not 'himawari', if `offsets`
+    lacks the relevant entry, or for NaN input pixels.
     """
-    if sensor not in ('himawari_l2', 'himawari_l3'):
+    if sensor != 'himawari':
         return aod_grid
-    lv  = 'l2' if sensor == 'himawari_l2' else 'l3'
     sea = 'dry' if month in DRY_MONTHS else 'wet'
-    off = offsets.get((lv, sea))
+    off = offsets.get(('himawari', sea))
     if off is None:
         return aod_grid
     out = aod_grid.astype(np.float32, copy=True)

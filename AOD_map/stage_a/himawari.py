@@ -38,24 +38,23 @@ import rasterio
 from config import (
     HIMAWARI_L2_DIR, HIMAWARI_L3_DIR,
     HIMAWARI_RF_MIN, HIMAWARI_UNC_MAX,
-    HIMAWARI_WET_RF_MIN, HIMAWARI_WET_UNC_MAX,
     HIMAWARI_SZA_MAX, HIMAWARI_VZA_MAX, HIMAWARI_VZA_SOFT,
     HIMAWARI_SAT_LON, EARTH_RADIUS_KM, GEO_ORBIT_KM,
-    WET_MONTHS,
     LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
 )
 
+# Ångström interpolation 500 nm (JAXA AHI native) → 550 nm (MODIS/VIIRS/AERONET).
+# τ_550 = τ_500 × (550 / 500)^(−AE).  Pixels with AE unavailable are dropped:
+# silently passing 500 nm AOT downstream would mix wavelengths in fusion.
+_HIMAWARI_WL_RATIO = 550.0 / 500.0
 
-def _himawari_qa_thresholds(month: int) -> tuple[float, float]:
-    """Return (rf_min, unc_max) for the given calendar month.
 
-    Wet months (May–Sep, config.WET_MONTHS) use tighter thresholds to suppress
-    cloud-edge contamination that dominates Himawari error during monsoon
-    season (thesis §7.5 wet-season QA, replaces the v3.0 weight-factor band-aid).
-    """
-    if month in WET_MONTHS:
-        return HIMAWARI_WET_RF_MIN, HIMAWARI_WET_UNC_MAX
-    return HIMAWARI_RF_MIN, HIMAWARI_UNC_MAX
+def _wavelength_correct(aot_500: np.ndarray, ae: np.ndarray) -> np.ndarray:
+    """Return AOT at 550 nm, NaN where AE is missing."""
+    out = np.full_like(aot_500, np.nan, dtype=np.float32)
+    ok  = np.isfinite(aot_500) & np.isfinite(ae)
+    out[ok] = aot_500[ok] * np.power(_HIMAWARI_WL_RATIO, -ae[ok], dtype=np.float32)
+    return out
 
 # ── TIF → config grid embedding ───────────────────────────────────────────────
 # The Himawari TIF covers a subdomain (102.1–109.5°E, 8.35–23.4°N) and its
@@ -237,7 +236,7 @@ def read_l2_slot(
     if not files:
         return None
 
-    rf_min, unc_max = _himawari_qa_thresholds(slot_utc.month)
+    rf_min, unc_max = HIMAWARI_RF_MIN, HIMAWARI_UNC_MAX
 
     # Determine TIF subdomain position within the full config grid
     r0, c0, TH, TW = _get_tif_grid_offset(str(files[0]))
@@ -321,6 +320,10 @@ def read_l2_slot(
         full[r0:r0 + TH, c0:c0 + TW] = tif_mean
         result[k_out] = full
 
+    # Ångström 500→550 nm.  AHI AOT is at 500 nm; everything downstream
+    # (MAIAC, VIIRS, AERONET aod_550) is at 550 nm.
+    result['aot'] = _wavelength_correct(result['aot'], result['ae'])
+
     cnt_full = np.zeros(full_shape, dtype=np.int16)
     cnt_full[r0:r0 + TH, c0:c0 + TW] = cnt.astype(np.int16)
     result['n_obs'] = cnt_full
@@ -350,7 +353,7 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
     fpath = files[0]
     fdt   = _parse_l3_utc(fpath.name)
 
-    _, unc_max = _himawari_qa_thresholds(slot_utc.month)
+    unc_max = HIMAWARI_UNC_MAX
 
     r0, c0, TH, TW = _get_tif_grid_offset(str(fpath))
     tif_lats = LATS[r0:r0 + TH]
@@ -363,8 +366,10 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
         unc_merged = _read_band(src, 4)   # AOT_Merged_uncertainty
         ae_merged  = _read_band(src, 6)   # AE_Merged
         aot_l2mean = _read_band(src, 10)  # AOT_L2_Mean (fallback)
+        ae_l2mean  = _read_band(src, 13)  # AE_L2_Mean (fallback for AE)
 
     aot = np.where(~np.isnan(aot_merged), aot_merged, aot_l2mean)
+    ae  = np.where(~np.isnan(ae_merged),  ae_merged,  ae_l2mean)
 
     valid = ~np.isnan(aot)
     if not np.all(np.isnan(unc_merged)):
@@ -391,9 +396,14 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
     vza_flag_full = np.zeros(full_shape, dtype=np.int8)
     vza_flag_full[r0:r0 + TH, c0:c0 + TW] = ((vza_tif > HIMAWARI_VZA_SOFT) & valid).astype(np.int8)
 
+    aot_full = _embed(aot)
+    ae_full  = _embed(ae)
+    # Ångström 500→550 nm.  AHI L3 AOT_Merged is at 500 nm.
+    aot_full = _wavelength_correct(aot_full, ae_full)
+
     return {
-        'aot':         _embed(aot),
-        'ae':          _embed(ae_merged),
+        'aot':         aot_full,
+        'ae':          ae_full,
         'uncertainty': _embed(unc_merged),
         'ssa':         nan_full.copy(),
         'rf':          nan_full.copy(),

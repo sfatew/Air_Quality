@@ -41,16 +41,18 @@ except Exception:
 from config import (
     SENSOR_RMSE_PRIOR,
     MODIS_SOUTH_WEIGHT_FACTOR,
+    HIMAWARI_WET_WEIGHT_FACTOR,
     SENSOR_RMSE_FLOOR,
     CONFIDENCE_FLAG,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
-    NLAT, NLON, BIASC_DIR, DRY_MONTHS,
+    NLAT, NLON, BIASC_DIR, DRY_MONTHS, WET_MONTHS,
 )
 
-# Integer codes for dominant_sensor output variable
+# Integer codes for dominant_sensor output variable.
+# v3.2: a single 'himawari' contribution (L3-preferred, L2-fallback) replaces
+# the separate L2/L3 sensors so ICW weights don't double-count Himawari.
 SENSOR_CODES = {
-    'himawari_l2': 1,
-    'himawari_l3': 2,
+    'himawari':    1,
     'modis_maiac': 3,
     'viirs_snpp':  4,
     'viirs_noaa20':5,
@@ -103,7 +105,7 @@ def _assign_confidence(
     flag  = np.zeros(shape, dtype=np.int8)
 
     leo_keys = ('modis_maiac', 'viirs_snpp', 'viirs_noaa20')
-    hi_keys  = ('himawari_l2', 'himawari_l3')
+    hi_keys  = ('himawari',)
 
     has_hi  = np.zeros(shape, dtype=bool)
     has_leo = np.zeros(shape, dtype=bool)
@@ -197,9 +199,11 @@ def fuse(
                        1.0 / rmse_arr_d ** 2, 0.0)
         if sensor == 'modis_maiac':
             w_d = xp.where(region_code_d == 0, w_d * MODIS_SOUTH_WEIGHT_FACTOR, w_d)
-        # Note: the v3.0 HIMAWARI_WET_WEIGHT_FACTOR has been replaced by tighter
-        # wet-season QA at the L2/L3 read stage (himawari.py).  No fusion-stage
-        # down-weighting is applied here.
+        # Wet-season Himawari down-weight (v3.2): suppress cloud-edge bias
+        # without the v3.1 tight-QA filter that stripped 70% of monsoon
+        # retrievals.
+        if sensor == 'himawari' and month in WET_MONTHS:
+            w_d = w_d * HIMAWARI_WET_WEIGHT_FACTOR
 
         aod_d     = xp.asarray(aod)
         has_d     = xp.asarray(has)

@@ -1,512 +1,219 @@
-"""
-Download ERA5 single-level data for the Vietnam bounding box via CDS API.
+#!/usr/bin/env python3
+"""Download ERA5 over Vietnam, chunked by (variable, month).
+Files for the same month are grouped into subfolder YYYYMM/.
+Parallelized with a thread pool."""
 
-Strategy
-────────
-  Two CDS requests per month (instant + accumulated variables submitted
-  separately → smaller jobs, faster CDS queue scheduling).
-  Checkpoint .nc file per month → merge at the end.
-  Restarting the script skips months already on disk.
-
-Requires
-────────
-  pip install cdsapi xarray netCDF4 scipy
-  ~/.cdsapirc  (or CDSAPI_URL / CDSAPI_KEY env vars) with valid credentials.
-  CDS account: https://cds.climate.copernicus.eu
-
-Output variables (all saved in the final NetCDF)
-────────────────────────────────────────────────
-  T2m          2-m temperature                        [K → °C]
-  Td2m         2-m dewpoint temperature               [K → °C]
-  RH           2-m relative humidity (derived)        [%]
-  Psfc         surface pressure                       [Pa → hPa]
-  U10          10-m U wind component (eastward)       [m/s]
-  V10          10-m V wind component (northward)      [m/s]
-  WS10m        10-m wind speed (derived)              [m/s]
-  WD10m        10-m wind direction met. (derived)     [°]
-  PBLH         boundary layer height                  [m]
-  CloudCover   total cloud cover                      [0–1 → %]
-  SolarRad     surface solar radiation downwelling    [J/m² → W/m²]  ← deaccumulated
-  Precip       total precipitation                    [m → mm]       ← deaccumulated
-  Albedo       forecast surface albedo                [0–1 → %]
-
-Notes on deaccumulation
-────────────────────────
-  ERA5 accumulated fields (ssrd, tp) reset at each 12-h forecast run
-  initialised at 00Z and 12Z UTC.  Step 1 of each run (01Z and 13Z UTC)
-  already represents one hour of accumulation, so no diff is needed there.
-  IMPORTANT: deaccumulation is performed in UTC BEFORE the UTC+7 shift.
-  Do not reorder these two operations.
-"""
-
+import argparse
 import calendar
-import glob
-import os
-import tempfile
 import threading
-import zipfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
+from pathlib import Path
 
 import cdsapi
-import numpy as np
-import pandas as pd
-import xarray as xr
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-BBOX         = [23.5, 102.0, 8.0, 110.0]   # [N, W, S, E] — CDS convention
-START        = (2026, 3)
-END          = (2026, 4)
+VIETNAM_AREA = [23.5, 102.0, 8.0, 110.0]
+GRID = [0.25, 0.25]
 
-# How many months to download concurrently.
-# CDS fair-use limit is ~20 active jobs per user; 2 jobs per month → keep ≤8.
-MAX_WORKERS  = 2
-
-# Retry settings for CDS queue-rejection errors
-MAX_RETRIES  = 5      # max attempts per month
-RETRY_DELAY  = 120    # seconds before first retry (doubles each attempt)
-
-OUTPUT_DIR   = "/home/slow_data/Air_Quality/ERA5"
-OUTPUT_FILE  = os.path.join(OUTPUT_DIR, "Vietnam_ERA5_bbox.nc")
-MONTHLY_DIR  = os.path.join(OUTPUT_DIR, "_monthly_raw")
-
-# ── Split variables by step type for separate CDS requests ────────────────────
-# FIX (performance): mixing instant+accum in one request forces CDS to split
-# them internally and serialise the queue jobs.  Two small requests schedule
-# faster and can run concurrently on the CDS back-end.
-
-CDS_INSTANT_VARS = [
-    "2m_temperature",                      # t2m  — instantaneous [K]
-    "2m_dewpoint_temperature",             # d2m  — instantaneous [K]
-    "surface_pressure",                    # sp   — instantaneous [Pa]
-    "10m_u_component_of_wind",             # u10  — instantaneous [m/s]
-    "10m_v_component_of_wind",             # v10  — instantaneous [m/s]
-    "boundary_layer_height",               # blh  — instantaneous [m]
-    "total_cloud_cover",                   # tcc  — instantaneous [0–1]
-    "forecast_albedo",                     # fal  — instantaneous [0–1]
+ERA5_VARIABLES = [
+    "2m_temperature", "2m_dewpoint_temperature",
+    "surface_pressure", "mean_sea_level_pressure",
+    "10m_u_component_of_wind", "10m_v_component_of_wind",
+    "100m_u_component_of_wind", "100m_v_component_of_wind",
+    "boundary_layer_height", "total_cloud_cover",
+    "cloud_base_height", "total_column_water_vapour",
+    "surface_solar_radiation_downwards", "total_precipitation",
+    "forecast_albedo", "convective_available_potential_energy",
 ]
 
-CDS_ACCUM_VARS = [
-    "surface_solar_radiation_downwards",   # ssrd — accumulated   [J/m²]
-    "total_precipitation",                 # tp   — accumulated   [m]
-]
+SHORT = {
+    "2m_temperature": "t2m", "2m_dewpoint_temperature": "d2m",
+    "surface_pressure": "sp", "mean_sea_level_pressure": "msl",
+    "10m_u_component_of_wind": "u10", "10m_v_component_of_wind": "v10",
+    "100m_u_component_of_wind": "u100", "100m_v_component_of_wind": "v100",
+    "boundary_layer_height": "blh", "total_cloud_cover": "tcc",
+    "cloud_base_height": "cbh", "total_column_water_vapour": "tcwv",
+    "surface_solar_radiation_downwards": "ssrd", "total_precipitation": "tp",
+    "forecast_albedo": "fal", "convective_available_potential_energy": "cape",
+}
 
-# Short CDS names for the accumulated variables (used in deaccumulation)
-ACCUM_SHORT = {"ssrd", "tp"}
+HOURS = [f"{h:02d}:00" for h in range(24)]
 
-os.makedirs(OUTPUT_DIR,  exist_ok=True)
-os.makedirs(MONTHLY_DIR, exist_ok=True)
-
-
-# ── Month iterator ─────────────────────────────────────────────────────────────
-def iter_months(start: tuple[int, int], end: tuple[int, int]):
-    y, m = start
-    while (y, m) <= end:
-        yield y, m
-        m += 1
-        if m > 12:
-            m, y = 1, y + 1
-
-
-# ── CDS download ───────────────────────────────────────────────────────────────
-def _build_request(year: int, month: int, variables: list[str]) -> dict:
-    """Build the CDS API request body for a single month and variable list."""
-    n_days   = calendar.monthrange(year, month)[1]
-    all_days = [f"{d:02d}" for d in range(1, n_days + 1)]
-    all_hrs  = [f"{h:02d}:00" for h in range(24)]
-    return {
-        "product_type": "reanalysis",
-        "variable":     variables,
-        "year":         str(year),
-        "month":        f"{month:02d}",
-        "day":          all_days,
-        "time":         all_hrs,
-        "area":         BBOX,
-        "data_format":  "netcdf",   # FIX: explicit format avoids ambiguous server
-                                    # behaviour; new CDS API key is 'data_format'
-    }
-
-
-def download_month(year: int, month: int,
-                   out_instant: str, out_accum: str) -> None:
-    """
-    Submit instant and accumulated CDS requests concurrently for one month.
-    Each thread gets its own cdsapi.Client so sessions are not shared.
-    """
-    def _fetch(variables, out_path):
-        # quiet=True suppresses per-request progress spam when many months run
-        client = cdsapi.Client(quiet=True)
-        client.retrieve(
-            "reanalysis-era5-single-levels",
-            _build_request(year, month, variables),
-            out_path,
-        )
-
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fi = ex.submit(_fetch, CDS_INSTANT_VARS, out_instant)
-        fa = ex.submit(_fetch, CDS_ACCUM_VARS,   out_accum)
-        fi.result()   # re-raises any exception from the thread
-        fa.result()
-
-
-# ── Open a CDS download (zip or plain nc) ─────────────────────────────────────
-def _open_one_file(path: str) -> xr.Dataset:
-    """
-    Open a single CDS download, handling both ZIP and plain NetCDF formats.
-
-    FIX (critical): xr.open_dataset is lazy.  We call .load() inside the
-    context manager so all data is read into memory before the temp directory
-    (or the original file handle) is released.
-
-    FIX (robustness): the new CDS API may return either a .zip containing one
-    or more .nc files, or a plain .nc directly.  Both are handled here.
-    """
-    if zipfile.is_zipfile(path):
-        with tempfile.TemporaryDirectory() as tmp:
-            with zipfile.ZipFile(path) as z:
-                z.extractall(tmp)
-            nc_files = [
-                os.path.join(tmp, name)
-                for name in os.listdir(tmp)
-                if name.endswith(".nc")
-            ]
-            if not nc_files:
-                raise RuntimeError(f"No .nc files found inside zip: {path}")
-            parts = [xr.open_dataset(f).load() for f in nc_files]  # .load() ← FIX
-            ds = xr.merge(parts, compat="no_conflicts") if len(parts) > 1 else parts[0]
-    else:
-        # Plain NetCDF — load immediately so the file handle is not kept open
-        ds = xr.open_dataset(path).load()
-
-    # Normalise dimension name: new CDS API uses 'valid_time', old uses 'time'
-    if "valid_time" in ds.dims:
-        ds = ds.rename({"valid_time": "time"})
-    if "valid_time" in ds.coords and "valid_time" not in ds.dims:
-        ds = ds.drop_vars("valid_time")
-
-    return ds
-
-
-def open_month_datasets(instant_path: str, accum_path: str) -> xr.Dataset:
-    """Load and merge the two monthly download files."""
-    ds_instant = _open_one_file(instant_path)
-    ds_accum   = _open_one_file(accum_path)
-
-    t_i = ds_instant.time.values
-    t_a = ds_accum.time.values
-
-    if not ds_instant.time.equals(ds_accum.time):
-        # Diagnose the mismatch before deciding what to do
-        _safe_print(
-            f"    ⚠ time mismatch: instant has {len(t_i)} steps "
-            f"({t_i[0]} … {t_i[-1]}), "
-            f"accum has {len(t_a)} steps ({t_a[0]} … {t_a[-1]})"
-        )
-        # Tolerate a minor tail difference (CDS sometimes returns N vs N±1 hours
-        # for the most recent months).  Take the intersection.
-        common = np.intersect1d(t_i, t_a)
-        if len(common) == 0:
-            msg = (
-                "Time axes of instant and accum downloads share no common timestamps"
-                " — CDS returned completely inconsistent data.\n"
-                f"  instant: {len(t_i)} steps  {t_i[0]} ... {t_i[-1]}\n"
-                f"  accum  : {len(t_a)} steps  {t_a[0]} ... {t_a[-1]}"
-            )
-            raise ValueError(msg)
-        dropped = max(len(t_i), len(t_a)) - len(common)
-        _safe_print(f"    → using {len(common)} common timestamps (dropped {dropped} non-overlapping)")
-        ds_instant = ds_instant.sel(time=common)
-        ds_accum   = ds_accum.sel(time=common)
-
-    # Drop CDS metadata variables that differ between instant/accum files
-    # (expver = experiment version, changes for recent near-real-time data)
-    for drop_var in ("expver", "number"):
-        if drop_var in ds_instant:
-            ds_instant = ds_instant.drop_vars(drop_var)
-        if drop_var in ds_accum:
-            ds_accum = ds_accum.drop_vars(drop_var)
-
-    return xr.merge([ds_instant, ds_accum], compat="no_conflicts")
-
-
-# ── Deaccumulation ─────────────────────────────────────────────────────────────
-def deaccumulate_era5(da: xr.DataArray) -> xr.DataArray:
-    """
-    Convert ERA5 accumulated fields (tp, ssrd) to per-hour values.
-
-    ERA5 accumulates from 00Z and 12Z forecast runs.  Step 1 of each run
-    (01Z and 13Z UTC) already IS one hour of accumulation; all other steps
-    are differenced from the previous time step within the same run.
-
-    IMPORTANT: call this function on UTC-stamped data BEFORE applying the
-    UTC+7 offset.  The reset-hour logic (h == 1 or h == 13) is UTC-specific.
-
-    FIX (robustness): we verify that the time axis is contiguous (no missing
-    hours) before differencing; a gap would produce nonsense values.
-    """
-    times = pd.DatetimeIndex(da.time.values)
-
-    # Check for gaps
-    expected_freq = pd.tseries.frequencies.to_offset("1h")
-    inferred      = pd.infer_freq(times)
-    if inferred not in ("h", "H", "T", None):   # 'h'/'H' = hourly in pandas
-        pass  # infer_freq is fragile for long series; use diff check instead
-    diffs = np.diff(times.asi8) // int(1e9)      # seconds between steps
-    if not np.all(diffs == 3600):
-        raise ValueError(
-            f"Time axis of '{da.name}' is not contiguous hourly — "
-            f"deaccumulation would produce incorrect results. "
-            f"Unique gaps (s): {np.unique(diffs)}"
-        )
-
-    values = da.values.astype(np.float64)   # (time, lat, lon)
-    hours  = times.hour                     # UTC hours — must be UTC, not UTC+7
-    result = np.empty_like(values)
-
-    result[0] = values[0]   # first step: no previous step to diff against
-    for t in range(1, len(hours)):
-        h = int(hours[t])
-        if h in (1, 13):
-            # Step 1 of a new forecast run: the stored value is already the
-            # 1-h accumulation for this step (no reset artefact to remove)
-            result[t] = values[t]
-        else:
-            # All other steps: diff within the same run
-            result[t] = np.maximum(values[t] - values[t - 1], 0.0)
-
-    return da.copy(data=result.astype(np.float32))
-
-
-# ── Unit conversions & derived variables ──────────────────────────────────────
-def postprocess(ds: xr.Dataset) -> xr.Dataset:
-    """
-    Deaccumulate, convert units, derive RH / WS / WD, rename, add CF attrs.
-    Must be called on UTC-timestamped data (before UTC+7 shift).
-    """
-    rename_map = {
-        "t2m":   "T2m",
-        "d2m":   "Td2m",
-        "sp":    "Psfc",
-        "u10":   "U10",
-        "v10":   "V10",
-        "blh":   "PBLH",
-        "tcc":   "CloudCover",
-        "ssrd":  "SolarRad",
-        "tp":    "Precip",
-        "fal":   "Albedo",
-    }
-
-    # Deaccumulate BEFORE unit conversion and BEFORE UTC+7 shift
-    for short in ACCUM_SHORT:
-        if short in ds:
-            ds[short] = deaccumulate_era5(ds[short])
-
-    # Rename to output variable names
-    present = {k: v for k, v in rename_map.items() if k in ds}
-    ds = ds.rename(present)
-
-    # Unit conversions
-    if "T2m"      in ds: ds["T2m"]      = ds["T2m"]  - 273.15          # K → °C
-    if "Td2m"     in ds: ds["Td2m"]     = ds["Td2m"] - 273.15          # K → °C
-    if "Psfc"     in ds: ds["Psfc"]     = ds["Psfc"] / 100.0           # Pa → hPa
-    if "SolarRad" in ds:
-        ds["SolarRad"] = (ds["SolarRad"] / 3600.0).clip(min=0)         # J/m²/h → W/m²
-    if "Precip"   in ds:
-        ds["Precip"]   = (ds["Precip"]   * 1000.0).clip(min=0)         # m → mm
-    if "CloudCover" in ds: ds["CloudCover"] = ds["CloudCover"] * 100    # 0–1 → %
-    if "Albedo"     in ds: ds["Albedo"]     = ds["Albedo"]     * 100    # 0–1 → %
-
-    # Relative humidity — August-Roche-Magnus approximation (T, Td in °C)
-    if "T2m" in ds and "Td2m" in ds:
-        T, Td = ds["T2m"], ds["Td2m"]
-        rh = (
-            100.0
-            * np.exp(17.625 * Td / (243.04 + Td))
-            / np.exp(17.625 * T  / (243.04 + T))
-        )
-        ds["RH"] = rh.clip(0, 100).astype(np.float32)
-
-    # 10-m wind speed and direction (meteorological convention)
-    if "U10" in ds and "V10" in ds:
-        u, v = ds["U10"], ds["V10"]
-        ds["WS10m"] = np.sqrt(u**2 + v**2).astype(np.float32)
-        # Direction FROM which wind blows, measured clockwise from North
-        ds["WD10m"] = ((270.0 - np.degrees(np.arctan2(v, u))) % 360.0).astype(np.float32)
-
-    # CF-style variable attributes
-    cf_attrs = {
-        "T2m":        ("2-metre air temperature",                  "degC"),
-        "Td2m":       ("2-metre dewpoint temperature",             "degC"),
-        "RH":         ("2-metre relative humidity",                "%"),
-        "Psfc":       ("surface pressure",                         "hPa"),
-        "U10":        ("10-m U wind component (eastward)",         "m s-1"),
-        "V10":        ("10-m V wind component (northward)",        "m s-1"),
-        "WS10m":      ("10-m wind speed",                          "m s-1"),
-        "WD10m":      ("10-m wind direction (meteorological)",     "degrees"),
-        "PBLH":       ("planetary boundary layer height",          "m"),
-        "CloudCover": ("total cloud cover",                        "%"),
-        "SolarRad":   ("surface solar radiation downwelling",      "W m-2"),
-        "Precip":     ("total precipitation",                      "mm"),
-        "Albedo":     ("forecast surface albedo",                  "%"),
-    }
-    for var, (long_name, units) in cf_attrs.items():
-        if var in ds:
-            ds[var].attrs = {"long_name": long_name, "units": units}
-
-    return ds
-
-
-# ── Per-month worker (called from thread pool) ────────────────────────────────
+# Thread-local CDS clients (mỗi thread giữ 1 client riêng)
+_thread_local = threading.local()
 _print_lock = threading.Lock()
 
-def _safe_print(*args, **kwargs):
+
+def get_client():
+    if not hasattr(_thread_local, "client"):
+        _thread_local.client = cdsapi.Client(quiet=True)
+    return _thread_local.client
+
+
+def log(msg: str):
     with _print_lock:
-        print(*args, **kwargs)
+        print(msg, flush=True)
 
 
-def _process_month(i: int, total: int, year: int, month: int) -> str:
-    """
-    Download + post-process one month.  Returns the path to the clean .nc file.
-    Retries up to MAX_RETRIES times on CDS queue-rejection errors.
-    Designed to be called from a ThreadPoolExecutor worker.
-    """
-    import time
+def month_chunks(start: date, end: date):
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        _, last = calendar.monthrange(y, m)
+        d0 = start.day if (y, m) == (start.year, start.month) else 1
+        d1 = end.day if (y, m) == (end.year, end.month) else last
+        yield y, m, [f"{d:02d}" for d in range(d0, d1 + 1)]
+        if m == 12:
+            y, m = y + 1, 1
+        else:
+            m += 1
 
-    tag      = f"{year}{month:02d}"
-    clean_nc = os.path.join(MONTHLY_DIR, f"era5_{tag}.nc")
 
-    if os.path.exists(clean_nc):
-        _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  skip (cached)")
-        return clean_nc
+def build_jobs(start: date, end: date, out_dir: Path, ext: str):
+    jobs = []
+    for year, month, days in month_chunks(start, end):
+        month_dir = out_dir / f"{year}{month:02d}"
+        for var in ERA5_VARIABLES:
+            short = SHORT[var]
+            fname = month_dir / f"era5_vietnam_{short}_{year}{month:02d}.{ext}"
+            jobs.append((year, month, days, var, fname))
+    return jobs
 
-    raw_instant = os.path.join(MONTHLY_DIR, f"era5_{tag}_instant.nc")
-    raw_accum   = os.path.join(MONTHLY_DIR, f"era5_{tag}_accum.nc")
 
-    last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        # Clean up any partial downloads from a previous attempt
-        for f in (raw_instant, raw_accum):
-            if os.path.exists(f):
-                os.remove(f)
+def fetch_one(job, fmt, retries, sleep):
+    """Trả về (job, status, last_error). status ∈ {'skip','ok','fail'}."""
+    year, month, days, var, fname = job
 
+    if fname.exists() and fname.stat().st_size > 0:
+        return job, "skip", None
+
+    fname.parent.mkdir(parents=True, exist_ok=True)
+    req = {
+        "product_type": "reanalysis",
+        "format": fmt,
+        "variable": var,
+        "year": str(year),
+        "month": f"{month:02d}",
+        "day": days,
+        "time": HOURS,
+        "area": VIETNAM_AREA,
+        "grid": GRID,
+    }
+    client = get_client()
+    last_err = None
+    for attempt in range(1, retries + 1):
         try:
-            if attempt == 1:
-                _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  requesting …")
-            else:
-                delay = RETRY_DELAY * (2 ** (attempt - 2))  # 120 s, 240 s, 480 s …
-                _safe_print(
-                    f"[{i:2d}/{total}] {year}-{month:02d}  retry {attempt}/{MAX_RETRIES} "
-                    f"(waiting {delay}s) …"
-                )
-                time.sleep(delay)
-
-            download_month(year, month, raw_instant, raw_accum)
-            last_exc = None
-            break  # success — exit retry loop
-
-        except Exception as exc:
-            last_exc = exc
-            # Only retry on CDS queue-limit rejections; re-raise anything else
-            if "temporarily limited" not in str(exc) and "rejected" not in str(exc).lower():
-                raise
-
-    if last_exc is not None:
-        raise last_exc
-
-    _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  post-processing …")
-    ds_raw   = open_month_datasets(raw_instant, raw_accum)
-    ds_clean = postprocess(ds_raw)
-
-    # Shift timestamps to UTC+7 AFTER deaccumulation
-    times_utc7 = ds_clean.time.values + np.timedelta64(7 * 3600, "s")
-    ds_clean   = ds_clean.assign_coords(time=times_utc7)
-    ds_clean.time.attrs = {
-        "long_name": "time",
-        "note":      "UTC+7 (Asia/Bangkok), timezone-naive",
-    }
-
-    ds_clean.to_netcdf(clean_nc)
-
-    for f in (raw_instant, raw_accum):
-        if os.path.exists(f):
-            os.remove(f)
-
-    _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  saved → {os.path.basename(clean_nc)}")
-    return clean_nc
+            client.retrieve("reanalysis-era5-single-levels", req, str(fname))
+            return job, "ok", None
+        except Exception as e:
+            last_err = e
+            log(f"[err ] {fname.name} (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(sleep)
+    return job, "fail", last_err
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def fetch_bbox() -> None:
-    months = list(iter_months(START, END))
-    total  = len(months)
-    print(f"ERA5 bounding-box download: {total} months  (MAX_WORKERS={MAX_WORKERS})")
-    print(f"Bbox : N={BBOX[0]} W={BBOX[1]} S={BBOX[2]} E={BBOX[3]}")
-    print(f"Range: {START[0]}-{START[1]:02d}  →  {END[0]}-{END[1]:02d}\n")
-
-    # Download up to MAX_WORKERS months concurrently.
-    # Each month itself downloads its 2 CDS jobs (instant + accum) in parallel,
-    # so the total active CDS jobs = MAX_WORKERS * 2.  Keep MAX_WORKERS ≤ 8.
+def run_pass(jobs, fmt, retries, sleep, workers, out_dir, label):
+    """Chạy song song 1 batch jobs, trả về (stats_delta, failed_jobs)."""
+    stats = {"skip": 0, "ok": 0, "fail": 0}
     failed = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(_process_month, i + 1, total, y, m): (y, m)
-            for i, (y, m) in enumerate(months)
-        }
+    total = len(jobs)
+    done = 0
+
+    log(f"\n=== {label}: {total} requests, {workers} workers ===")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_one, j, fmt, retries, sleep): j
+                   for j in jobs}
         for fut in as_completed(futures):
-            y, m = futures[fut]
-            try:
-                fut.result()
-            except Exception as exc:
-                _safe_print(f"  ✗  {y}-{m:02d} FAILED: {exc}")
-                failed.append((y, m))
+            job, status, err = fut.result()
+            stats[status] += 1
+            done += 1
+            rel = job[4].relative_to(out_dir)
+            log(f"[{done:>3}/{total}] [{status:>4}] {rel}")
+            if status == "fail":
+                failed.append((*job, err))
+    return stats, failed
 
-    if failed:
-        print(f"\nWarning: {len(failed)} month(s) failed and will be missing from the merge:")
-        for y, m in sorted(failed):
-            print(f"  {y}-{m:02d}")
 
-    # ── Merge monthly files ────────────────────────────────────────────────────
-    monthly_files = sorted(glob.glob(os.path.join(MONTHLY_DIR, "era5_??????.nc")))
-    if not monthly_files:
-        print("No monthly files found — nothing to merge.")
-        return
+def download(start, end, out_dir, fmt="netcdf",
+             retries=3, sleep=30, workers=4,
+             final_retries=2, final_sleep=120):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ext = "nc" if fmt == "netcdf" else "grib"
 
-    print(f"\nMerging {len(monthly_files)} monthly files → {OUTPUT_FILE}")
-    # open_mfdataset requires dask; use a plain loop instead
-    datasets = []
-    for fp in monthly_files:
-        ds = xr.open_dataset(fp, engine="netcdf4")
-        # Drop CDS metadata coords that vary across files and block concat
-        for drop_var in ("expver", "number"):
-            if drop_var in ds:
-                ds = ds.drop_vars(drop_var)
-        datasets.append(ds)
-    ds_all = xr.concat(datasets, dim="time")
+    jobs = build_jobs(start, end, out_dir, ext)
+    total = len(jobs)
+    stats = {"skip": 0, "ok": 0, "fail": 0}
 
-    last_day = calendar.monthrange(END[0], END[1])[1]
-    t_end    = pd.Timestamp(f"{END[0]}-{END[1]:02d}-{last_day:02d} 23:00")
-    ds_all   = ds_all.sel(time=slice(None, t_end))
+    # ---------------- pass 1 ----------------
+    delta, failed_jobs = run_pass(jobs, fmt, retries, sleep, workers,
+                                  out_dir, "PASS 1")
+    for k in stats:
+        stats[k] += delta[k]
 
-    rename_dims = {}
-    if "latitude"  not in ds_all.dims and "lat" in ds_all.dims:
-        rename_dims["lat"] = "latitude"
-    if "longitude" not in ds_all.dims and "lon" in ds_all.dims:
-        rename_dims["lon"] = "longitude"
-    if rename_dims:
-        ds_all = ds_all.rename(rename_dims)
+    # ---------------- final retry rounds ----------------
+    for rnd in range(1, final_retries + 1):
+        if not failed_jobs:
+            break
+        log(f"\n=== Sleeping {final_sleep}s before retry round {rnd} ===")
+        time.sleep(final_sleep)
 
-    ds_all.attrs = {
-        "title":           "Vietnam ERA5 single-level weather",
-        "bounding_box":    f"N={BBOX[0]} W={BBOX[1]} S={BBOX[2]} E={BBOX[3]}",
-        "date_range":      f"{START[0]}-{START[1]:02d} to {END[0]}-{END[1]:02d}",
-        "source":          "ERA5 reanalysis — Copernicus Climate Data Store (CDS API)",
-        "timezone":        "UTC+7 (Asia/Bangkok), tz-naive timestamps",
-        "grid_resolution": "0.25 degrees",
-        "created_by":      "ERA5/fetch_era5_bbox.py",
-    }
+        # bỏ phần err ra khỏi tuple để tái dùng fetch_one
+        retry_jobs = [tuple(j[:5]) for j in failed_jobs]
+        delta, failed_jobs = run_pass(
+            retry_jobs, fmt, retries, sleep, workers,
+            out_dir, f"FINAL RETRY round {rnd}",
+        )
+        # các job retry trước đó đã được tính vào "fail" ở pass trước;
+        # giờ trừ ra rồi cộng vào status mới
+        stats["fail"] -= (delta["ok"] + delta["skip"] + delta["fail"])
+        for k in delta:
+            stats[k] += delta[k]
 
-    ds_all.to_netcdf(OUTPUT_FILE)
-    print(f"Done → {OUTPUT_FILE}")
+    # ---------------- summary ----------------
+    print("\n" + "=" * 60)
+    print(f"SUMMARY  ({start} → {end})")
+    print("=" * 60)
+    print(f"  Total requests : {total}")
+    print(f"  Skipped (cached): {stats['skip']}")
+    print(f"  Success         : {stats['ok']}")
+    print(f"  Failed          : {stats['fail']}")
+
+    if failed_jobs:
+        log_path = out_dir / "failed_requests.log"
+        with log_path.open("w") as f:
+            f.write(f"# Failed ERA5 requests ({datetime.now().isoformat()})\n")
+            for year, month, days, var, fname, err in failed_jobs:
+                f.write(f"{year}-{month:02d}\t{var}\t{fname}\t{err}\n")
+        print(f"\n  Failed list written to: {log_path}")
+        print("  Failed files:")
+        for _, _, _, var, fname, _ in failed_jobs:
+            print(f"    - {fname.relative_to(out_dir)}  ({var})")
+    print("=" * 60)
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
+    p.add_argument("--out", default="./era5_vietnam")
+    p.add_argument("--format", choices=["netcdf", "grib"], default="netcdf")
+    p.add_argument("--workers", type=int, default=4,
+                   help="Số request đồng thời (khuyến nghị 4-8, tối đa ~20).")
+    p.add_argument("--retries", type=int, default=3,
+                   help="Số lần retry mỗi request trong pass.")
+    p.add_argument("--final-retries", type=int, default=2,
+                   help="Số vòng final retry cho job lỗi.")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    fetch_bbox()
+    args = parse_args()
+    start = datetime.strptime(args.start, "%Y-%m-%d").date()
+    end = datetime.strptime(args.end, "%Y-%m-%d").date()
+    if end < start:
+        raise SystemExit("end < start")
+    download(start, end, Path(args.out), fmt=args.format,
+             retries=args.retries, final_retries=args.final_retries,
+             workers=args.workers)
+    print("Done.")

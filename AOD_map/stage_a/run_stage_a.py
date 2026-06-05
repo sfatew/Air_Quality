@@ -42,12 +42,15 @@ from config import (
     MERGED_DIR, BIASC_DIR,
     SLOT_MINUTES,
 )
-from himawari        import read_himawari_slot
+from himawari        import read_l2_slot, read_l3_slot
 from viirs           import read_viirs_slot
 from modis           import read_modis_date
 from gridder         import bin_to_grid, grid_from_himawari
 from physics         import apply_physics_correction, close_era5
-from bias_correction import apply_correction_grid, load_all_corrections
+from bias_correction import (
+    apply_correction_grid, load_all_corrections,
+    load_leo_himawari_offset, apply_leo_himawari_offset,
+)
 from fusion          import fuse, load_rmse
 
 _ALL_SENSOR_GROUPS = ('himawari', 'viirs', 'modis')
@@ -204,6 +207,7 @@ def _process_slot_with_modis_cache(
     modis_pixels: Optional[dict],
     use_physics: bool,
     dry_run: bool,
+    leo_himawari_offset: Optional[dict] = None,
 ) -> Optional[Path]:
     """Run Steps A1–A2–A3–A4–A5 for one slot using a pre-loaded MODIS pixel cache."""
     month = slot_utc.month
@@ -211,14 +215,10 @@ def _process_slot_with_modis_cache(
 
     # ── Step A1 + A2: read and grid each sensor ────────────────────────────
     if 'himawari' in sensor_groups:
-        hi_result = read_himawari_slot(slot_utc)
-        if hi_result is not None:
-            hi_g = grid_from_himawari(hi_result)
-            raw_grids['himawari_l2'] = hi_g['aod_mean']
-            raw_grids['himawari_l3'] = hi_g['aod_mean']
-        else:
-            raw_grids['himawari_l2'] = None
-            raw_grids['himawari_l3'] = None
+        l2 = read_l2_slot(slot_utc)
+        l3 = read_l3_slot(slot_utc)
+        raw_grids['himawari_l2'] = grid_from_himawari(l2)['aod_mean'] if l2 is not None else None
+        raw_grids['himawari_l3'] = grid_from_himawari(l3)['aod_mean'] if l3 is not None else None
 
     if 'viirs' in sensor_groups:
         for sensor in ('viirs_snpp', 'viirs_noaa20'):
@@ -250,9 +250,14 @@ def _process_slot_with_modis_cache(
         if aod is None:
             corrected[sensor] = None
             continue
-        corrected[sensor] = apply_correction_grid(
-            aod, sensor, month, lat_2d, lon_2d, corrections
-        )
+        g = apply_correction_grid(aod, sensor, month, lat_2d, lon_2d, corrections)
+        # Step A4b: LEO–Himawari spatial offset (thesis §7.4.2) — applied only to
+        # Himawari grids, after the AERONET-anchored CDF correction.  Pixels far
+        # from either AERONET anchor receive a LEO-derived additive offset that
+        # is otherwise unconstrained.
+        if leo_himawari_offset is not None and sensor in ('himawari_l2', 'himawari_l3'):
+            g = apply_leo_himawari_offset(g, sensor, month, leo_himawari_offset)
+        corrected[sensor] = g
 
     # ── Step A5: ICW fusion ────────────────────────────────────────────────
     valid_corrected = {k: v for k, v in corrected.items() if v is not None}
@@ -300,6 +305,7 @@ def run_day(
     use_physics: bool = True,
     dry_run: bool = False,
     show_slot_bar: bool = False,
+    leo_himawari_offset: Optional[dict] = None,
 ) -> tuple[int, int]:
     """Process all 48 slots for one calendar day.
 
@@ -334,6 +340,7 @@ def run_day(
             out = _process_slot_with_modis_cache(
                 slot_utc, corrections, rmse_dict, lat_2d, lon_2d,
                 sensor_groups, modis_cache, use_physics, dry_run,
+                leo_himawari_offset,
             )
             if out is not None:
                 written += 1
@@ -392,11 +399,13 @@ def main():
     all_sensor_keys = [k for grp in sensors for k in _SENSOR_KEYS.get(grp, [])]
     corrections = load_all_corrections(all_sensor_keys, BIASC_DIR)
     rmse_dict   = load_rmse()
+    leo_offset  = load_leo_himawari_offset() if 'himawari' in sensors else None
     lat_2d, lon_2d = _make_lat_lon_grids()
 
     n_strata = len(corrections)
     print(f'Bias strata      : {n_strata}'
           + ('' if n_strata else '  (none found — using prior RMSE weights, no bias correction)'))
+    print(f'LEO–Himawari off : {"loaded" if leo_offset is not None else "not found (skipping §7.4.2 correction)"}')
 
     # Enumerate calendar days
     days: list[date] = []
@@ -428,6 +437,7 @@ def main():
                             run_day, day, sensors, corrections, rmse_dict,
                             lat_2d, lon_2d, use_physics, args.dry_run,
                             False,   # show_slot_bar=False in subprocesses
+                            leo_offset,
                         ): day
                         for day in days
                     }
@@ -462,6 +472,7 @@ def main():
                     day, sensors, corrections, rmse_dict,
                     lat_2d, lon_2d, use_physics, args.dry_run,
                     show_slot_bar=True,
+                    leo_himawari_offset=leo_offset,
                 )
                 elapsed = time.perf_counter() - t0
                 total_written += n_ok

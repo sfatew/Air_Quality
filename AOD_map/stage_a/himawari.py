@@ -38,10 +38,24 @@ import rasterio
 from config import (
     HIMAWARI_L2_DIR, HIMAWARI_L3_DIR,
     HIMAWARI_RF_MIN, HIMAWARI_UNC_MAX,
+    HIMAWARI_WET_RF_MIN, HIMAWARI_WET_UNC_MAX,
     HIMAWARI_SZA_MAX, HIMAWARI_VZA_MAX, HIMAWARI_VZA_SOFT,
     HIMAWARI_SAT_LON, EARTH_RADIUS_KM, GEO_ORBIT_KM,
+    WET_MONTHS,
     LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
 )
+
+
+def _himawari_qa_thresholds(month: int) -> tuple[float, float]:
+    """Return (rf_min, unc_max) for the given calendar month.
+
+    Wet months (May–Sep, config.WET_MONTHS) use tighter thresholds to suppress
+    cloud-edge contamination that dominates Himawari error during monsoon
+    season (thesis §7.5 wet-season QA, replaces the v3.0 weight-factor band-aid).
+    """
+    if month in WET_MONTHS:
+        return HIMAWARI_WET_RF_MIN, HIMAWARI_WET_UNC_MAX
+    return HIMAWARI_RF_MIN, HIMAWARI_UNC_MAX
 
 # ── TIF → config grid embedding ───────────────────────────────────────────────
 # The Himawari TIF covers a subdomain (102.1–109.5°E, 8.35–23.4°N) and its
@@ -196,10 +210,13 @@ def read_l2_slot(
 
     Step A1 filters applied:
         • AOT not NaN (implicit retrieval-valid check)
-        • RF  ≥ HIMAWARI_RF_MIN  (fine-mode fraction)
-        • |Uncertainty| ≤ HIMAWARI_UNC_MAX
+        • RF  ≥ HIMAWARI_RF_MIN  (fine-mode fraction; tightened in wet months)
+        • |Uncertainty| ≤ HIMAWARI_UNC_MAX  (tightened in wet months)
         • SZA < HIMAWARI_SZA_MAX
         • VZA < HIMAWARI_VZA_MAX  (hard cut; VZA > HIMAWARI_VZA_SOFT flagged)
+
+    During wet months (May–Sep) RF_MIN and UNC_MAX are replaced by the
+    stricter HIMAWARI_WET_* constants to suppress cloud-edge contamination.
 
     Step A2: Multiple 10-min files within the slot are averaged.
 
@@ -220,6 +237,8 @@ def read_l2_slot(
     if not files:
         return None
 
+    rf_min, unc_max = _himawari_qa_thresholds(slot_utc.month)
+
     # Determine TIF subdomain position within the full config grid
     r0, c0, TH, TW = _get_tif_grid_offset(str(files[0]))
     tif_shape = (TH, TW)
@@ -230,12 +249,16 @@ def read_l2_slot(
     tif_lat_2d, tif_lon_2d = np.meshgrid(tif_lats, tif_lons, indexing='ij')
     vza_tif = compute_himawari_vza(tif_lat_2d, tif_lon_2d)
 
-    # Accumulators at TIF resolution
+    # Accumulators at TIF resolution.  AE and SSA have their own counters because
+    # NaN values for those bands occur independently of the AOT-valid mask; using
+    # the AOT count would dilute their means toward zero.
     acc: dict[str, np.ndarray] = {
         k: np.zeros(tif_shape, dtype=np.float64)
         for k in ('aot', 'ae', 'unc', 'ssa', 'rf', 'vza', 'sza')
     }
-    cnt = np.zeros(tif_shape, dtype=np.int32)
+    cnt    = np.zeros(tif_shape, dtype=np.int32)
+    cnt_ae = np.zeros(tif_shape, dtype=np.int32)
+    cnt_ss = np.zeros(tif_shape, dtype=np.int32)
 
     for fpath in files:
         fdt = _parse_l2_utc(fpath.name)
@@ -248,8 +271,8 @@ def read_l2_slot(
 
         # Step A1 QA filters on TIF-shaped arrays
         valid = ~np.isnan(aot)
-        valid &= ~np.isnan(rf)  & (rf  >= HIMAWARI_RF_MIN)
-        valid &= ~np.isnan(unc) & (np.abs(unc) <= HIMAWARI_UNC_MAX)
+        valid &= ~np.isnan(rf)  & (rf  >= rf_min)
+        valid &= ~np.isnan(unc) & (np.abs(unc) <= unc_max)
 
         if apply_vza_filter:
             valid &= vza_tif < HIMAWARI_VZA_MAX
@@ -261,13 +284,21 @@ def read_l2_slot(
             sza_tif = np.full(tif_shape, np.nan, dtype=np.float32)
 
         acc['aot'][valid] += aot[valid]
-        acc['ae'][valid]  += np.where(~np.isnan(ae),  ae,  0.0)[valid]
         acc['unc'][valid] += unc[valid]
-        acc['ssa'][valid] += np.where(~np.isnan(ssa), ssa, 0.0)[valid]
         acc['rf'][valid]  += rf[valid]
         acc['vza'][valid] += vza_tif[valid]
         acc['sza'][valid] += sza_tif[valid]
         cnt[valid] += 1
+
+        # AE/SSA tracked separately so a NaN AE on an otherwise-valid pixel
+        # doesn't pull the mean toward zero.
+        ae_ok = valid & ~np.isnan(ae)
+        acc['ae'][ae_ok] += ae[ae_ok]
+        cnt_ae[ae_ok]    += 1
+
+        ssa_ok = valid & ~np.isnan(ssa)
+        acc['ssa'][ssa_ok] += ssa[ssa_ok]
+        cnt_ss[ssa_ok]     += 1
 
     has_tif = cnt > 0
 
@@ -275,13 +306,17 @@ def read_l2_slot(
     full_shape = (NLAT, NLON)
     result: dict[str, np.ndarray] = {}
 
+    # Per-channel divisor: AE and SSA have their own counters (see accumulation)
+    cnt_for = {'aot': cnt, 'unc': cnt, 'rf': cnt, 'vza': cnt, 'sza': cnt,
+               'ae': cnt_ae, 'ssa': cnt_ss}
     key_map = {'aot': 'aot', 'ae': 'ae', 'unc': 'uncertainty',
                'ssa': 'ssa', 'rf': 'rf', 'vza': 'vza', 'sza': 'sza'}
 
     for k_acc, k_out in key_map.items():
+        c    = cnt_for[k_acc]
         full = np.full(full_shape, np.nan, dtype=np.float32)
-        tif_mean = np.where(has_tif,
-                            acc[k_acc] / np.maximum(cnt, 1),
+        tif_mean = np.where(c > 0,
+                            acc[k_acc] / np.maximum(c, 1),
                             np.nan).astype(np.float32)
         full[r0:r0 + TH, c0:c0 + TW] = tif_mean
         result[k_out] = full
@@ -315,6 +350,8 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
     fpath = files[0]
     fdt   = _parse_l3_utc(fpath.name)
 
+    _, unc_max = _himawari_qa_thresholds(slot_utc.month)
+
     r0, c0, TH, TW = _get_tif_grid_offset(str(fpath))
     tif_lats = LATS[r0:r0 + TH]
     tif_lons = LONS[c0:c0 + TW]
@@ -331,7 +368,7 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
 
     valid = ~np.isnan(aot)
     if not np.all(np.isnan(unc_merged)):
-        valid &= ~np.isnan(unc_merged) & (np.abs(unc_merged) <= HIMAWARI_UNC_MAX)
+        valid &= ~np.isnan(unc_merged) & (np.abs(unc_merged) <= unc_max)
     valid &= vza_tif < HIMAWARI_VZA_MAX
 
     if fdt is not None:
@@ -367,69 +404,3 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
     }
 
 
-# ── Convenience: choose L2 or L3 by region ───────────────────────────────────
-
-def read_himawari_slot(
-    slot_utc: datetime,
-    prefer_l2_north: bool = True,
-    window_min_l2: int = 15,
-    window_min_l3: int = 30,
-) -> dict[str, np.ndarray] | None:
-    """Return the best Himawari AOD for the slot, choosing L2/L3 by region.
-
-    Per the thesis plan:
-        • North (lat ≥ NORTH_CENTRAL_LAT): prefer L2 (preserves high-AOD events)
-        • South (lat < CENTRAL_SOUTH_LAT): prefer L3 (reduces scan noise)
-        • Central: smooth IDW blend weighted toward L2
-
-    If the preferred product is entirely missing for a region, the other level
-    is substituted silently (handled in the caller via n_obs = 0 check).
-    """
-    from config import NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT
-
-    l2 = read_l2_slot(slot_utc, window_min_l2)
-    l3 = read_l3_slot(slot_utc, window_min_l3)
-
-    if l2 is None and l3 is None:
-        return None
-    if l2 is None:
-        return l3
-    if l3 is None:
-        return l2
-
-    lat_2d = np.meshgrid(LATS, LONS, indexing='ij')[0]   # (NLAT, NLON)
-
-    # Blend weights: 0 = all-L3, 1 = all-L2
-    blend_l2 = np.where(
-        lat_2d >= NORTH_CENTRAL_LAT, 1.0,
-        np.where(
-            lat_2d < CENTRAL_SOUTH_LAT, 0.0,
-            # linear blend in central zone
-            (lat_2d - CENTRAL_SOUTH_LAT) / (NORTH_CENTRAL_LAT - CENTRAL_SOUTH_LAT)
-        )
-    ).astype(np.float32)
-
-    out: dict[str, np.ndarray] = {}
-    scalar_keys = ('n_obs', 'vza_flag')
-
-    for key in l2:
-        a2 = l2[key].astype(np.float32)
-        a3 = l3[key].astype(np.float32)
-
-        if key in scalar_keys:
-            # For integer arrays, prefer L2 where both available, else take whichever non-zero
-            out[key] = np.where(a2 > 0, a2, a3).astype(l2[key].dtype)
-            continue
-
-        # For float arrays: blend where both are valid; fallback to whichever is present
-        both  = ~np.isnan(a2) & ~np.isnan(a3)
-        only2 = ~np.isnan(a2) & np.isnan(a3)
-        only3 = np.isnan(a2) & ~np.isnan(a3)
-
-        arr = np.full_like(a2, np.nan)
-        arr[both]  = blend_l2[both] * a2[both] + (1 - blend_l2[both]) * a3[both]
-        arr[only2] = a2[only2]
-        arr[only3] = a3[only3]
-        out[key] = arr
-
-    return out

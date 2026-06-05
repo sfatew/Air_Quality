@@ -41,7 +41,6 @@ except Exception:
 from config import (
     SENSOR_RMSE_PRIOR,
     MODIS_SOUTH_WEIGHT_FACTOR,
-    HIMAWARI_WET_WEIGHT_FACTOR,
     SENSOR_RMSE_FLOOR,
     CONFIDENCE_FLAG,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
@@ -198,8 +197,9 @@ def fuse(
                        1.0 / rmse_arr_d ** 2, 0.0)
         if sensor == 'modis_maiac':
             w_d = xp.where(region_code_d == 0, w_d * MODIS_SOUTH_WEIGHT_FACTOR, w_d)
-        if sensor in ('himawari_l2', 'himawari_l3') and season == 'wet':
-            w_d = w_d * HIMAWARI_WET_WEIGHT_FACTOR
+        # Note: the v3.0 HIMAWARI_WET_WEIGHT_FACTOR has been replaced by tighter
+        # wet-season QA at the L2/L3 read stage (himawari.py).  No fusion-stage
+        # down-weighting is applied here.
 
         aod_d     = xp.asarray(aod)
         has_d     = xp.asarray(has)

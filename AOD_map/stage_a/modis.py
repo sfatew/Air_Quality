@@ -7,6 +7,8 @@ Primary SDS used:
 
 Pixel validity filter:
     • Valid AOD range: 0 ≤ AOD ≤ 5
+    (AOD_QA bit-mask filtering was removed — see commit c8be990; box heterogeneity
+     rejection at extraction time has proven sufficient for MAIAC over Vietnam.)
 
 File naming:
     MCD19A2.A{YYYY}{DOY}.h{HH}v{VV}.061.{proc_time}.hdf

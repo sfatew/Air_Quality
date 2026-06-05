@@ -14,6 +14,10 @@ python run_collocate.py collocate --start 2022-09-01 --end 2024-12-31
 # Train CDF corrections from existing matched CSVs
 python run_collocate.py train
 
+# Build the LEO–Himawari spatial offset map (thesis §7.4.2)
+# Requires a prior Stage A run for [start, end] with Bug 1 fixed.
+python run_collocate.py leo_offset --start 2022-09-01 --end 2024-12-31
+
 # Full pipeline: extract + match + train
 python run_collocate.py all --start 2022-09-01 --end 2024-12-31
 
@@ -26,6 +30,7 @@ import argparse
 import sys
 import time
 from datetime import date
+from pathlib import Path
 
 try:
     from tqdm import tqdm as _tqdm_cls
@@ -43,10 +48,14 @@ def _make_bar(iterable, **kwargs):
 
 import numpy as np
 
-from config import AERONET_SITES, EXTRACT_DIR, COLLOCATE_DIR, BIASC_DIR
+from config import (
+    AERONET_SITES, EXTRACT_DIR, COLLOCATE_DIR, BIASC_DIR,
+    LEO_HIMAWARI_OFFSET_FILE, LEO_HIMAWARI_MIN_PAIRS, LEO_HIMAWARI_SMOOTH_SIGMA,
+    SENSOR_RMSE_EE_OFFSET, SENSOR_RMSE_EE_SLOPE, SENSOR_RMSE_EE_REFAOD,
+)
 from extract_satellite import extract_site
 from collocate import match_site, collocate_site
-from bias_correction import train_all_corrections
+from bias_correction import train_all_corrections, build_leo_himawari_offset
 from fusion import save_rmse
 
 _ALL_SENSORS = ('himawari_l2', 'himawari_l3', 'viirs_snpp', 'viirs_noaa20', 'modis_maiac')
@@ -161,6 +170,35 @@ def cmd_collocate(args: argparse.Namespace) -> None:
     print(f'\nColocation complete.  [total: {_fmt_duration(time.perf_counter() - wall_t0)}]')
 
 
+def cmd_leo_offset(args: argparse.Namespace) -> None:
+    """Build the LEO–Himawari spatial offset map (thesis §7.4.2).
+
+    Requires that Stage A has already been run for [start, end] with the
+    Bug 1 fix in place (so AOD_himawari_l2 and AOD_himawari_l3 in MERGED_DIR
+    are distinct sources, not duplicates).
+    """
+    start = date.fromisoformat(args.start)
+    end   = date.fromisoformat(args.end)
+    out   = Path(args.out) if args.out else LEO_HIMAWARI_OFFSET_FILE
+    min_pairs    = args.min_pairs    if args.min_pairs    is not None else LEO_HIMAWARI_MIN_PAIRS
+    smooth_sigma = args.smooth_sigma if args.smooth_sigma is not None else LEO_HIMAWARI_SMOOTH_SIGMA
+
+    print(f'\nBuilding LEO–Himawari offset map')
+    print(f'  Period       : {start} → {end}')
+    print(f'  Output       : {out}')
+    print(f'  Min pairs    : {min_pairs}')
+    print(f'  Smooth sigma : {smooth_sigma}')
+
+    t0 = time.perf_counter()
+    build_leo_himawari_offset(
+        start_d=start, end_d=end,
+        output_path=out,
+        min_pairs=min_pairs,
+        smooth_sigma=smooth_sigma,
+    )
+    print(f'\nDone.  [{_fmt_duration(time.perf_counter() - t0)}]')
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     sensors = list(args.sensors) if args.sensors else list(_ALL_SENSORS)
     print(f'\nTraining CDF corrections')
@@ -178,15 +216,26 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     # Persist season-stratified post-correction RMSE so fusion.py uses real
     # weights instead of the SENSOR_RMSE_PRIOR fallback.
-    rmse_post = {
-        (s, reg, sea): float(c.rmse_after)
-        for (s, reg, sea), c in corrections.items()
-        if not np.isnan(getattr(c, 'rmse_after', float('nan')))
-    }
+    #
+    # Bug 2 fix: prefer the cross-validated rmse_after_cv; for strata whose CV
+    # value is missing or wildly optimistic, floor against the Sayer/Levy
+    # expected-error envelope at a representative AOD so the fusion weights
+    # never trust an unrealistically small RMSE.
+    ee_floor = SENSOR_RMSE_EE_OFFSET + SENSOR_RMSE_EE_SLOPE * SENSOR_RMSE_EE_REFAOD
+    rmse_post: dict[tuple[str, str, str], float] = {}
+    for (s, reg, sea), c in corrections.items():
+        if c.correction_type == 'none':
+            continue
+        rmse_cv  = float(getattr(c, 'rmse_after_cv', float('nan')))
+        rmse_in  = float(getattr(c, 'rmse_after',     float('nan')))
+        candidate = rmse_cv if np.isfinite(rmse_cv) else rmse_in
+        if not np.isfinite(candidate):
+            continue
+        rmse_post[(s, reg, sea)] = float(max(candidate, ee_floor))
     if rmse_post:
         save_rmse(rmse_post)
-        print(f'  Post-correction RMSE saved ({len(rmse_post)} strata) '
-              f'→ {BIASC_DIR / "post_correction_rmse.json"}')
+        print(f'  Post-correction RMSE saved ({len(rmse_post)} strata, '
+              f'EE-floor={ee_floor:.3f}) → {BIASC_DIR / "post_correction_rmse.json"}')
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -227,6 +276,21 @@ def main() -> None:
     p_tr = sub.add_parser('train', help='Train CDF corrections from matched CSVs')
     p_tr.add_argument('--sensors', nargs='+')
 
+    # leo_offset (thesis §7.4.2)
+    p_leo = sub.add_parser(
+        'leo_offset',
+        help='Build the LEO–Himawari spatial offset map (requires prior Stage A run)',
+    )
+    _add_date_args(p_leo)
+    p_leo.add_argument('--out',           default=None,
+                       help=f'Output NetCDF path (default: {LEO_HIMAWARI_OFFSET_FILE})')
+    p_leo.add_argument('--min-pairs',     type=int,   default=None,
+                       dest='min_pairs',
+                       help=f'Mask cells with fewer pairs (default: {LEO_HIMAWARI_MIN_PAIRS})')
+    p_leo.add_argument('--smooth-sigma',  type=float, default=None,
+                       dest='smooth_sigma',
+                       help=f'Gaussian sigma in grid-cells (default: {LEO_HIMAWARI_SMOOTH_SIGMA})')
+
     # all (extract + match + train)
     p_all = sub.add_parser('all', help='Full pipeline: extract + match + train')
     _add_date_args(p_all)
@@ -243,6 +307,8 @@ def main() -> None:
         cmd_collocate(args)
     elif args.command == 'train':
         cmd_train(args)
+    elif args.command == 'leo_offset':
+        cmd_leo_offset(args)
     elif args.command == 'all':
         cmd_collocate(args)
         cmd_train(args)

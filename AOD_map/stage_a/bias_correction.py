@@ -56,11 +56,22 @@ def _make_bar(iterable, **kwargs):
     return None
 
 from config import (
-    AERONET_SITES, DRY_MONTHS,
+    AERONET_SITES, DRY_MONTHS, WET_MONTHS,
     CDF_N_QUANTILES, CDF_MIN_PAIRS,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
     EARTH_RADIUS_KM, BIASC_DIR,
+    LATS, LONS, NLAT, NLON,
+    LEO_HIMAWARI_OFFSET_FILE, LEO_HIMAWARI_MIN_PAIRS, LEO_HIMAWARI_SMOOTH_SIGMA,
+    MERGED_DIR,
 )
+
+# Quality gates for the linear/quantile fallback paths (Bug 3 fix):
+# strata that fail these checks have correction_type='none', so the fusion
+# falls back to the SENSOR_RMSE_PRIOR weights for that sensor/region/season.
+_FIT_MIN_PEARSON   = 0.30   # minimum Pearson R for any correction to be trusted
+_FIT_MIN_SLOPE     = 0.30   # linear slope sanity range
+_FIT_MAX_SLOPE     = 3.00
+_CV_FOLDS          = 5      # cross-validated RMSE evaluation folds
 
 
 # ── Haversine distance ────────────────────────────────────────────────────────
@@ -121,56 +132,144 @@ class CDFCorrection:
         self.correction_type: str = 'none'
         self.rmse_before: float = np.nan
         self.rmse_after:  float = np.nan
+        self.rmse_after_cv: float = np.nan   # k-fold out-of-sample RMSE (Bug 2)
+        self.pearson_r: float = np.nan
+        self.reject_reason: str = ''
         self._interp = None          # PchipInterpolator or None
         self._lin_slope: float = 1.0
         self._lin_intercept: float = 0.0
 
     # ── Training ──────────────────────────────────────────────────────────────
 
+    def _fit_pair(self, sat: np.ndarray, aer: np.ndarray,
+                  force_type: Optional[str] = None):
+        """Fit one transfer function on (sat, aer) and return a callable correction(x).
+
+        Returns (callable, fit_type, params) where params is a dict of
+        type-specific scalars used to populate self.* if this is the final fit.
+        Raises ValueError if the data fails the sanity gates (Bug 3).
+
+        ``force_type`` pins the model class regardless of N. CV folds pass the
+        production model's type so rmse_after_cv estimates the *deployed*
+        model's out-of-sample error, not a linear fallback.
+        """
+        from scipy.stats import pearsonr
+        if len(sat) < 5:
+            raise ValueError('fewer than 5 pairs')
+
+        # Pearson R sanity gate
+        try:
+            r, _ = pearsonr(sat, aer)
+        except Exception:
+            r = float('nan')
+        if not np.isfinite(r) or r < _FIT_MIN_PEARSON:
+            raise ValueError(f'pearson R={r:.3f} below {_FIT_MIN_PEARSON}')
+
+        use_linear = (force_type == 'linear') if force_type is not None \
+            else (len(sat) < CDF_MIN_PAIRS)
+        if use_linear:
+            slope, intercept = np.polyfit(sat, aer, 1)
+            slope = float(slope); intercept = float(intercept)
+            if not (_FIT_MIN_SLOPE <= slope <= _FIT_MAX_SLOPE):
+                raise ValueError(f'linear slope {slope:.3f} outside [{_FIT_MIN_SLOPE}, {_FIT_MAX_SLOPE}]')
+            return (
+                (lambda x: np.clip(slope * x + intercept, 0, None)),
+                'linear',
+                {'slope': slope, 'intercept': intercept, 'pearson_r': float(r)},
+            )
+
+        # Quantile-mapping (Ahn 2021)
+        q     = np.linspace(0.005, 0.995, CDF_N_QUANTILES)
+        sat_q = np.quantile(sat, q)
+        aer_q = np.quantile(aer, q)
+        sat_all = np.concatenate([[0.0], sat_q, [max(sat.max(), aer.max()) * 1.1]])
+        aer_all = np.concatenate(
+            [[min(0.0, float(aer_q[0]))], aer_q, [max(sat.max(), aer.max()) * 1.1]]
+        )
+        order   = np.argsort(sat_all)
+        sat_all = sat_all[order]
+        aer_all = aer_all[order]
+        _, unique = np.unique(sat_all, return_index=True)
+        sat_all = sat_all[unique]
+        aer_all = aer_all[unique]
+        interp = PchipInterpolator(sat_all, aer_all, extrapolate=True)
+        return (
+            (lambda x, _f=interp: np.clip(_f(x), 0, None)),
+            'quantile_map',
+            {'interp': interp, 'pearson_r': float(r)},
+        )
+
     def fit(self, sat_aod: np.ndarray, aer_aod: np.ndarray) -> 'CDFCorrection':
-        """Fit the transfer function from matched (satellite, AERONET) pairs."""
+        """Fit the transfer function and compute in-sample + CV RMSE.
+
+        Bug 2 fix: report rmse_after_cv from k-fold cross-validation so the
+        fusion weights are not driven by in-sample overfit.
+
+        Bug 3 fix: reject fits whose Pearson R or linear slope are out of
+        sanity range — correction_type stays 'none' and the fusion falls
+        back to SENSOR_RMSE_PRIOR for that stratum.
+        """
         mask = np.isfinite(sat_aod) & np.isfinite(aer_aod) & (sat_aod >= 0) & (aer_aod >= 0)
         sat, aer = sat_aod[mask], aer_aod[mask]
-
         self.n_pairs = len(sat)
+
         if self.n_pairs < 5:
             self.correction_type = 'none'
+            self.reject_reason = f'N={self.n_pairs} < 5'
             return self
 
-        # RMSE before correction
         self.rmse_before = float(np.sqrt(np.mean((sat - aer) ** 2)))
 
-        if self.n_pairs < CDF_MIN_PAIRS:
-            # Linear fallback
-            self.correction_type = 'linear'
-            coeffs = np.polyfit(sat, aer, 1)
-            self._lin_slope     = float(coeffs[0])
-            self._lin_intercept = float(coeffs[1])
-            corrected = self._lin_slope * sat + self._lin_intercept
+        try:
+            fn, ftype, params = self._fit_pair(sat, aer)
+        except ValueError as exc:
+            self.correction_type = 'none'
+            self.reject_reason = str(exc)
+            return self
+
+        self.correction_type = ftype
+        self.pearson_r       = params.get('pearson_r', np.nan)
+        if ftype == 'linear':
+            self._lin_slope     = params['slope']
+            self._lin_intercept = params['intercept']
         else:
-            # Quantile mapping (Ahn 2021 CDF approach)
-            self.correction_type = 'quantile_map'
-            q = np.linspace(0.005, 0.995, CDF_N_QUANTILES)
-            sat_q = np.quantile(sat, q)
-            aer_q = np.quantile(aer, q)
+            self._interp = params['interp']
 
-            # Add endpoints to anchor extrapolation
-            sat_all = np.concatenate([[0.0],           sat_q, [max(sat.max(), aer.max()) * 1.1]])
-            aer_all = np.concatenate([[min(0.0, aer_q[0])], aer_q, [max(sat.max(), aer.max()) * 1.1]])
-
-            # Enforce monotonicity in x (required by PchipInterpolator)
-            order = np.argsort(sat_all)
-            sat_all = sat_all[order]
-            aer_all = aer_all[order]
-            # Remove duplicates
-            _, unique = np.unique(sat_all, return_index=True)
-            sat_all = sat_all[unique]
-            aer_all = aer_all[unique]
-
-            self._interp = PchipInterpolator(sat_all, aer_all, extrapolate=True)
-            corrected = np.clip(self._interp(sat), 0, None)
-
+        corrected = fn(sat)
         self.rmse_after = float(np.sqrt(np.mean((corrected - aer) ** 2)))
+
+        # ── k-fold cross-validated RMSE (Bug 2) ──────────────────────────────
+        # For very small samples, fall back to leave-one-out; for typical
+        # strata, k=5 is enough.  Folds that fail the sanity gate fall back to
+        # the global rmse_before so the stratum is not falsely promoted.
+        k = min(_CV_FOLDS, self.n_pairs)
+        if k < 2:
+            self.rmse_after_cv = self.rmse_after
+        else:
+            rng       = np.random.default_rng(seed=42)
+            perm      = rng.permutation(self.n_pairs)
+            cv_resid  = []
+            for fold in range(k):
+                test_idx  = perm[fold::k]
+                train_idx = np.setdiff1d(perm, test_idx, assume_unique=True)
+                if len(train_idx) < 5:
+                    continue
+                try:
+                    fn_tr, _, _ = self._fit_pair(
+                        sat[train_idx], aer[train_idx],
+                        force_type=self.correction_type,
+                    )
+                except ValueError:
+                    # Bad fold → treat as raw residuals (no correction applied)
+                    cv_resid.append(sat[test_idx] - aer[test_idx])
+                    continue
+                cv_resid.append(fn_tr(sat[test_idx]) - aer[test_idx])
+            if cv_resid:
+                resid = np.concatenate(cv_resid)
+                self.rmse_after_cv = float(np.sqrt(np.mean(resid ** 2)))
+            else:
+                self.rmse_after_cv = self.rmse_after
+
         return self
 
     # ── Inference ─────────────────────────────────────────────────────────────
@@ -266,6 +365,14 @@ def apply_correction_grid(
 
     corr_N = corrections.get((sensor, 'north', season))
     corr_S = corrections.get((sensor, 'south', season))
+
+    # A correction whose quality gates rejected the fit has correction_type='none'
+    # and would pass through unchanged in apply().  Treat it the same as a missing
+    # anchor so the IDW blend never mixes raw AOD with bias-corrected AOD.
+    if corr_N is not None and corr_N.correction_type == 'none':
+        corr_N = None
+    if corr_S is not None and corr_S.correction_type == 'none':
+        corr_S = None
 
     # No corrections available: pass through
     if corr_N is None and corr_S is None:
@@ -411,13 +518,274 @@ def train_all_corrections(
         col_w = 15
         print(f'\n[bias_correction] Summary — {len(corrections)} strata trained:')
         hdr = (f"  {'Sensor':<{col_w}} {'Region':<8} {'Season':<5} "
-               f"{'Type':<13} {'N':>6}  {'RMSE_before':>11} → {'RMSE_after':<10}")
+               f"{'Type':<13} {'N':>6}  {'R':>5}  "
+               f"{'RMSE_b':>7}  {'RMSE_a':>7}  {'RMSE_cv':>7}  Note")
         print(hdr)
         print('  ' + '─' * (len(hdr) - 2))
         for (s, reg, sea), c in sorted(corrections.items()):
-            rmse_b = f'{c.rmse_before:.4f}' if not np.isnan(c.rmse_before) else '   N/A'
-            rmse_a = f'{c.rmse_after:.4f}'  if not np.isnan(c.rmse_after)  else '   N/A'
+            def _f(x, w=7):
+                return f'{x:.4f}' if not np.isnan(x) else '    N/A'
+            r_s    = f'{c.pearson_r:.2f}' if not np.isnan(c.pearson_r) else '  N/A'
+            note   = c.reject_reason if c.correction_type == 'none' else ''
             print(f'  {s:<{col_w}} {reg:<8} {sea:<5} '
-                  f'{c.correction_type:<13} {c.n_pairs:>6}  {rmse_b:>11} → {rmse_a}')
+                  f'{c.correction_type:<13} {c.n_pairs:>6}  {r_s:>5}  '
+                  f'{_f(c.rmse_before)}  {_f(c.rmse_after)}  {_f(c.rmse_after_cv)}  {note}')
 
     return corrections
+
+
+# ── Step A4b: LEO–Himawari spatial-offset correction (thesis §7.4.2) ─────────
+
+def _scan_merged_files_for_offset(start_d, end_d):
+    """Yield Path objects for merged NetCDFs in the [start_d, end_d] range."""
+    import glob
+    from datetime import timedelta
+    d = start_d
+    while d <= end_d:
+        pattern = str(
+            MERGED_DIR / d.strftime('%Y') / d.strftime('%m') /
+            d.strftime('%d') / 'merged_*.nc'
+        )
+        for fpath in sorted(glob.glob(pattern)):
+            yield Path(fpath), d
+        d += timedelta(days=1)
+
+
+def build_leo_himawari_offset(
+    start_d,
+    end_d,
+    output_path: Path | str = LEO_HIMAWARI_OFFSET_FILE,
+    min_pairs: int = LEO_HIMAWARI_MIN_PAIRS,
+    smooth_sigma: float = LEO_HIMAWARI_SMOOTH_SIGMA,
+) -> None:
+    """Compute and persist the Himawari↔LEO spatial offset map (thesis §7.4.2).
+
+    For each grid cell, accumulates the mean residual:
+
+        offset[lat, lon, level, season] = mean( Himawari_corrected
+                                                − mean(LEO_sensors_corrected) )
+
+    over the training period.  The map is then Gaussian-smoothed (mask-weighted
+    so no-data cells do not pollute their neighbours) and written as a NetCDF
+    with one offset grid per (level, season) combination.
+
+    Prerequisite: a Stage A run already exists for [start_d, end_d] so that
+    MERGED_DIR contains `AOD_himawari_l2`, `AOD_himawari_l3`, and at least one
+    of `AOD_modis_maiac` / `AOD_viirs_*` per slot.  Run **after** Bug 1 has
+    been fixed so the L2 and L3 diagnostic grids carry distinct data.
+
+    Parameters
+    ----------
+    start_d, end_d : datetime.date
+        Inclusive date range to scan in MERGED_DIR.
+    output_path : Path
+        Destination NetCDF (default config.LEO_HIMAWARI_OFFSET_FILE).
+    min_pairs : int
+        Cells with fewer co-located pairs are masked (set to 0 offset).
+    smooth_sigma : float
+        Gaussian sigma in grid-cells for spatial smoothing.
+    """
+    import netCDF4 as nc
+    from scipy.ndimage import gaussian_filter
+    from config import SENSOR_RMSE_FLOOR, MODIS_SOUTH_WEIGHT_FACTOR
+    from fusion import load_rmse
+
+    levels   = ('l2', 'l3')
+    seasons  = ('dry', 'wet')
+    leo_vars = ('AOD_modis_maiac', 'AOD_viirs_snpp', 'AOD_viirs_noaa20')
+
+    # ── Per-cell, per-sensor, per-season ICW weight maps ────────────────────
+    # Anchoring on a single LEO would discard the most-common sensors outside
+    # that LEO's overpass window; a plain nanmean lets per-slot availability
+    # swing the reference (MAIAC-only at noon vs VIIRS at 13:30 give a
+    # different "truth").  An ICW-weighted mean with the same 1/RMSE²
+    # convention as fusion.py keeps the reference identity-of-mix-invariant
+    # whenever ≥1 LEO is present.
+    rmse_dict   = load_rmse()
+    lat_2d, _   = np.meshgrid(LATS, LONS, indexing='ij')
+    region_code = np.where(lat_2d >= NORTH_CENTRAL_LAT, 2,
+                           np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1)).astype(np.int8)
+    _reg_codes  = ((0, 'south'), (1, 'central'), (2, 'north'))
+
+    def _weight_grid(sensor: str, season: str) -> np.ndarray:
+        w = np.zeros((NLAT, NLON), dtype=np.float64)
+        for code, reg in _reg_codes:
+            rmse_val = rmse_dict.get(
+                (sensor, reg, season),
+                rmse_dict.get((sensor, reg),
+                              rmse_dict.get((sensor, 'north'), np.nan)),
+            )
+            if not np.isfinite(rmse_val):
+                continue
+            rmse_val = max(float(rmse_val), SENSOR_RMSE_FLOOR)
+            w[region_code == code] = 1.0 / rmse_val ** 2
+        if sensor == 'modis_maiac':
+            w[region_code == 0] *= MODIS_SOUTH_WEIGHT_FACTOR
+        return w
+
+    weight_grids: dict[tuple[str, str], np.ndarray] = {
+        (v, sea): _weight_grid(v.replace('AOD_', ''), sea)
+        for v in leo_vars for sea in seasons
+    }
+
+    shape = (NLAT, NLON)
+    sums   = {(lv, sea): np.zeros(shape, dtype=np.float64) for lv in levels for sea in seasons}
+    counts = {(lv, sea): np.zeros(shape, dtype=np.int32)   for lv in levels for sea in seasons}
+
+    files = list(_scan_merged_files_for_offset(start_d, end_d))
+    print(f'[leo_himawari_offset] scanning {len(files)} merged files '
+          f'in {start_d} → {end_d}')
+
+    bar = _make_bar(files, desc='LEO–Himawari scan', unit='slot', ncols=80)
+    for fpath, day in (bar if bar is not None else files):
+        season = 'dry' if day.month in DRY_MONTHS else 'wet'
+        try:
+            with nc.Dataset(str(fpath)) as ds:
+                # ICW-weighted LEO reference: Σ(w_i · a_i) / Σ(w_i) per cell,
+                # over whatever LEO subset is valid for this slot.
+                num     = np.zeros(shape, dtype=np.float64)
+                denom   = np.zeros(shape, dtype=np.float64)
+                any_leo = False
+                for v in leo_vars:
+                    if v not in ds.variables:
+                        continue
+                    any_leo = True
+                    a = np.ma.filled(
+                        ds.variables[v][:].astype(np.float32), np.nan)
+                    finite = np.isfinite(a)
+                    if not np.any(finite):
+                        continue
+                    wv = np.where(finite, weight_grids[(v, season)], 0.0)
+                    num   += wv * np.where(finite, a, 0.0)
+                    denom += wv
+                if not any_leo:
+                    continue
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    leo_mean = np.where(denom > 0, num / denom, np.nan)
+
+                for lv in levels:
+                    var = f'AOD_himawari_{lv}'
+                    if var not in ds.variables:
+                        continue
+                    hi = np.ma.filled(
+                        ds.variables[var][:].astype(np.float32), np.nan)
+                    valid = np.isfinite(hi) & np.isfinite(leo_mean)
+                    if not np.any(valid):
+                        continue
+                    key = (lv, season)
+                    sums[key][valid]   += (hi[valid] - leo_mean[valid]).astype(np.float64)
+                    counts[key][valid] += 1
+        except Exception as exc:
+            print(f'  skip {fpath.name}: {exc}')
+            continue
+    if bar is not None:
+        bar.close()
+
+    # ── Mean, mask-weighted smoothing, NaN → 0 outside coverage ─────────────
+    offsets: dict[tuple, np.ndarray] = {}
+    pair_counts: dict[tuple, np.ndarray] = {}
+    for key in sums:
+        cnt = counts[key]
+        ok  = cnt >= min_pairs
+        with np.errstate(invalid='ignore', divide='ignore'):
+            raw = np.where(ok, sums[key] / np.maximum(cnt, 1), 0.0)
+        if smooth_sigma > 0 and np.any(ok):
+            # Mask-weighted Gaussian: numerator carries the value × mask,
+            # denominator carries the mask itself; ratio reproduces a valid
+            # weighted average without leaking 0s into surrounding cells.
+            num   = gaussian_filter(raw * ok, sigma=smooth_sigma)
+            denom = gaussian_filter(ok.astype(np.float64), sigma=smooth_sigma)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                smooth = np.where(denom > 0.01, num / denom, 0.0)
+            offsets[key] = smooth.astype(np.float32)
+        else:
+            offsets[key] = raw.astype(np.float32)
+        pair_counts[key] = cnt.astype(np.int32)
+
+    # ── Write NetCDF ─────────────────────────────────────────────────────────
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with nc.Dataset(str(output_path), 'w', format='NETCDF4') as ds:
+        ds.title       = 'Himawari↔LEO spatial offset map (thesis §7.4.2)'
+        ds.train_start = start_d.isoformat()
+        ds.train_end   = end_d.isoformat()
+        ds.min_pairs   = int(min_pairs)
+        ds.smooth_sigma = float(smooth_sigma)
+        ds.createDimension('lat', NLAT)
+        ds.createDimension('lon', NLON)
+        v_lat = ds.createVariable('lat', 'f4', ('lat',))
+        v_lat[:] = LATS.astype(np.float32)
+        v_lon = ds.createVariable('lon', 'f4', ('lon',))
+        v_lon[:] = LONS.astype(np.float32)
+
+        for (lv, sea), arr in offsets.items():
+            name = f'offset_{lv}_{sea}'
+            v = ds.createVariable(name, 'f4', ('lat', 'lon'),
+                                  zlib=True, complevel=4)
+            v.long_name = f'Mean Himawari-{lv.upper()} minus LEO_mean, {sea} season'
+            v.units     = '1'
+            v[:] = arr
+        for (lv, sea), arr in pair_counts.items():
+            name = f'n_pairs_{lv}_{sea}'
+            v = ds.createVariable(name, 'i4', ('lat', 'lon'),
+                                  zlib=True, complevel=4)
+            v.long_name = f'Number of (Himawari-{lv.upper()}, LEO) co-located slots, {sea} season'
+            v[:] = arr
+
+    # ── Summary ────────────────────────────────────────────────────────────
+    print(f'[leo_himawari_offset] saved → {output_path}')
+    for (lv, sea), arr in offsets.items():
+        cnt = pair_counts[(lv, sea)]
+        ok = cnt >= min_pairs
+        if np.any(ok):
+            print(f'  {lv}/{sea}: n_cells_ok={int(ok.sum()):5d}  '
+                  f'mean_offset={float(arr[ok].mean()):+.4f}  '
+                  f'min={float(arr[ok].min()):+.4f}  max={float(arr[ok].max()):+.4f}')
+        else:
+            print(f'  {lv}/{sea}: no cells met min_pairs={min_pairs}')
+
+
+def load_leo_himawari_offset(
+    fpath: Path | str = LEO_HIMAWARI_OFFSET_FILE,
+) -> Optional[dict[tuple[str, str], np.ndarray]]:
+    """Return offsets dict keyed by (level, season) ∈ {l2,l3}×{dry,wet}, or None."""
+    import netCDF4 as nc
+    fpath = Path(fpath)
+    if not fpath.exists():
+        return None
+    out: dict[tuple[str, str], np.ndarray] = {}
+    try:
+        with nc.Dataset(str(fpath)) as ds:
+            for lv in ('l2', 'l3'):
+                for sea in ('dry', 'wet'):
+                    name = f'offset_{lv}_{sea}'
+                    if name in ds.variables:
+                        out[(lv, sea)] = np.ma.filled(
+                            ds.variables[name][:].astype(np.float32), 0.0)
+    except Exception:
+        return None
+    return out if out else None
+
+
+def apply_leo_himawari_offset(
+    aod_grid: np.ndarray,
+    sensor: str,
+    month: int,
+    offsets: dict[tuple[str, str], np.ndarray],
+) -> np.ndarray:
+    """Subtract the LEO-anchored spatial offset from a Himawari grid.
+
+    Returns aod_grid unchanged if `sensor` is not Himawari, if `offsets`
+    lacks the relevant (level, season) entry, or for NaN input pixels.
+    """
+    if sensor not in ('himawari_l2', 'himawari_l3'):
+        return aod_grid
+    lv  = 'l2' if sensor == 'himawari_l2' else 'l3'
+    sea = 'dry' if month in DRY_MONTHS else 'wet'
+    off = offsets.get((lv, sea))
+    if off is None:
+        return aod_grid
+    out = aod_grid.astype(np.float32, copy=True)
+    valid = np.isfinite(out)
+    out[valid] = np.clip(out[valid] - off[valid], 0.0, None)
+    return out

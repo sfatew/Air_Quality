@@ -25,7 +25,7 @@ scipy.interpolate.RegularGridInterpolator.
 """
 
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import numpy as np
@@ -68,7 +68,7 @@ def _nearest_era5_slice(slot_utc: datetime) -> Optional[xr.Dataset]:
     """Return the ERA5 time slice nearest to slot_utc (UTC+7 local time)."""
     ds = _load_era5()
     # Convert slot to local time for ERA5 look-up (ERA5 timestamps are UTC+7)
-    slot_local = slot_utc.replace(tzinfo=None) + __import__('datetime').timedelta(hours=TZ_OFFSET_HOURS)
+    slot_local = slot_utc.replace(tzinfo=None) + timedelta(hours=TZ_OFFSET_HOURS)
     ts = np.datetime64(slot_local.replace(minute=0, second=0, microsecond=0))
 
     # Find the nearest available ERA5 hour

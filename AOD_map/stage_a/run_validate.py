@@ -117,6 +117,8 @@ def _write_summary(
     consistency: pd.DataFrame,
     coverage: pd.DataFrame,
     ransac: pd.DataFrame,
+    pm25_metrics: pd.DataFrame,
+    pm25_cases: pd.DataFrame,
 ) -> None:
     lines = []
     lines.append('=' * 70)
@@ -125,19 +127,6 @@ def _write_summary(
     lines.append('=' * 70)
 
     lines.append('\n§8.1  AERONET Validation Metrics\n')
-    overall = metrics[metrics.get('confidence_flag', pd.Series()).isna()
-                      if 'confidence_flag' in metrics.columns else
-                      metrics['site'].isin(['NGHIA_DO', 'Bac_Lieu'])]
-    for _, row in metrics[metrics.get('season', '').isna()
-                          if 'season' in metrics.columns else
-                          metrics.index < 2].iterrows():
-        pass
-
-    # Summary: one line per station
-    by_site = metrics[
-        ~metrics.get('season', pd.Series(index=metrics.index, dtype=str)).notna()
-        | True
-    ].groupby('site', dropna=False).first().reset_index()
     for _, row in metrics.groupby('site').apply(
             lambda g: g.iloc[0]).reset_index(drop=True).iterrows():
         lines.append(
@@ -188,6 +177,28 @@ def _write_summary(
                 f"inlier={_fmt_metric(row.get('inlier_frac'),2)}"
             )
 
+    lines.append('\n§8.4  AOD–PM2.5 Coupling\n')
+    if not pm25_metrics.empty:
+        overall_pm25 = pm25_metrics[pm25_metrics['label'] == 'ALL']
+        for _, row in overall_pm25.iterrows():
+            lines.append(
+                f"  {row.get('aod_type','?'):22s}  N={int(row.get('N',0)):5d}  "
+                f"Pearson r={_fmt_metric(row.get('pearson_r'))}  "
+                f"RANSAC R²={_fmt_metric(row.get('ransac_r2'))}  "
+                f"Δ={_fmt_metric(row.get('ransac_r2_delta'))} vs Nguyen 2025"
+            )
+        if not pm25_cases.empty:
+            lines.append('\n  Episode case studies (Spearman r, |r|>0.3 = pass):')
+            for ep_type, grp in pm25_cases.groupby('episode_type'):
+                sr_mean = grp['spearman_r'].mean()
+                n_pass  = (grp['spearman_r'].abs() > 0.3).sum()
+                lines.append(
+                    f"  {ep_type:30s}  mean r={_fmt_metric(sr_mean)}  "
+                    f"pass={n_pass}/{len(grp)} stations"
+                )
+    else:
+        lines.append('  No PM2.5 pairs computed (run --mode pm25 or --mode all).')
+
     if not coverage.empty:
         lines.append('\nSpatial Coverage Summary:')
         monthly = coverage.groupby('month')['coverage_pct'].mean()
@@ -208,7 +219,8 @@ def parse_args():
         epilog=__doc__,
     )
     p.add_argument('--mode',  default='all',
-                   choices=['all', 'aeronet', 'consistency', 'precip', 'ransac', 'coverage'],
+                   choices=['all', 'aeronet', 'consistency', 'precip', 'pm25',
+                            'baseline', 'ransac', 'coverage'],
                    help='Which validation check to run')
     p.add_argument('--split', default='test',
                    choices=['test', 'train', 'full'],
@@ -247,6 +259,9 @@ def main():
         baseline_comparison,
         ransac_diagnostic,
         spatial_coverage_stats,
+        extract_aod_pm25_pairs,
+        pm25_coupling_metrics,
+        pm25_case_studies,
     )
 
     wall_t0    = time.perf_counter()
@@ -301,6 +316,42 @@ def main():
         else:
             print('  ERA5_Precip not found in merged files (run with --physics enabled).')
 
+    # ── §8.4 PM2.5 coupling ───────────────────────────────────────────────
+    pm25_met_df  = pd.DataFrame()
+    pm25_case_df = pd.DataFrame()
+
+    if args.mode in ('all', 'pm25'):
+        print('\n[§8.4] AOD–PM2.5 coupling …')
+        t0      = time.perf_counter()
+        pm25_df = extract_aod_pm25_pairs(start, end)
+        print(f'  → {len(pm25_df)} station-days  [{_fmt_duration(time.perf_counter() - t0)}]')
+        if pm25_df.empty:
+            print('  No PM2.5 pairs found.  Check PM25_DIR / STATIONS_META path.')
+        else:
+            pm25_df.to_csv(run_dir / 'pm25_pairs.csv', index=False)
+            print(f'  Saved: pm25_pairs.csv')
+
+            pm25_met_df = pm25_coupling_metrics(pm25_df)
+            pm25_met_df.to_csv(run_dir / 'pm25_coupling_metrics.csv', index=False)
+            _print_table(
+                pm25_met_df[['label', 'aod_type', 'N', 'pearson_r', 'spearman_r',
+                              'ransac_r2', 'ransac_r2_delta', 'inlier_frac']]
+                           .dropna(how='all'),
+                '§8.4  AOD–PM2.5 coupling metrics',
+            )
+
+            pm25_case_df = pm25_case_studies(pm25_df)
+            if not pm25_case_df.empty:
+                pm25_case_df.to_csv(run_dir / 'pm25_case_studies.csv', index=False)
+                _print_table(
+                    pm25_case_df[['episode_type', 'station_name', 'region',
+                                  'N_days', 'spearman_r', 'spearman_p',
+                                  'peak_pm25', 'mean_aod_phys']],
+                    '§8.4  PM2.5 episode case studies',
+                )
+            else:
+                print('  No episodes met criteria (too few days or missing AOD_phys).')
+
     # ── §8.5 Baseline comparison ──────────────────────────────────────────
     if args.mode in ('all', 'baseline') and not pairs.empty:
         print('\n[§8.5] Baseline comparison (merged vs VIIRS-only) …')
@@ -343,7 +394,8 @@ def main():
 
     # ── Summary report ────────────────────────────────────────────────────
     if args.mode == 'all':
-        _write_summary(run_dir, metrics_df, consistency_df, coverage_df, ransac_df)
+        _write_summary(run_dir, metrics_df, consistency_df, coverage_df, ransac_df,
+                       pm25_met_df, pm25_case_df)
 
     print(f'\n{"─" * 64}')
     print(f'Done.  [total: {_fmt_duration(time.perf_counter() - wall_t0)}]')

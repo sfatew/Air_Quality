@@ -60,16 +60,18 @@ SENSOR_RMSE_PRIOR = {
 # MODIS MAIAC gets an extra down-weighting factor in the south (R=0.41 → unreliable)
 MODIS_SOUTH_WEIGHT_FACTOR = 0.1  # effectively removes MAIAC from south fusion
 
-# Himawari wet-season (May–Sep) weight factor.
-# Test-period validation shows R≈0 for both AERONET stations in wet months,
-# caused by cloud-edge contamination that passes the RF/Unc QA filters.
-# Applied analogously to MODIS_SOUTH_WEIGHT_FACTOR.
-HIMAWARI_WET_WEIGHT_FACTOR = 0.1
-
 # Minimum RMSE used when computing ICW weights (1/RMSE²).
 # Wet-season CDF corrections trained on N<20 pairs can reach RMSE≈0.04
 # (overfitting), which gives near-infinite weights and unstable fusion.
 SENSOR_RMSE_FLOOR = 0.05
+
+# Sayer/Levy expected-error envelope used as an additional RMSE floor:
+#   ee(aod) = SENSOR_RMSE_EE_OFFSET + SENSOR_RMSE_EE_SLOPE * mean_aod
+# Combined as max(rmse_after_cv, ee(0.3)) so the fusion never trusts
+# overfit in-sample RMSE values for low-N strata.
+SENSOR_RMSE_EE_OFFSET = 0.05
+SENSOR_RMSE_EE_SLOPE  = 0.15
+SENSOR_RMSE_EE_REFAOD = 0.3   # representative AOD used to evaluate the envelope
 
 # ── Sensor fusion inclusion rules ────────────────────────────────────────────
 # Confidence flag assigned to each merged cell based on contributing sensors.
@@ -94,13 +96,15 @@ HIMAWARI_SZA_MAX = 70.0   # solar zenith angle maximum (degrees)
 HIMAWARI_VZA_MAX = 60.0   # viewing zenith angle hard cut (degrees)
 HIMAWARI_VZA_SOFT = 55.0  # VZA > 55° flagged lower confidence (not discarded)
 
+# Wet-season (May–Sep) Himawari QA tightening: cloud-edge contamination is
+# the dominant error source in monsoon months.  Replaces the v3.0
+# HIMAWARI_WET_WEIGHT_FACTOR band-aid with stricter retrieval-quality gates.
+HIMAWARI_WET_RF_MIN  = 0.7
+HIMAWARI_WET_UNC_MAX = 0.3
+
 # VIIRS Deep Blue L2
 VIIRS_QA_MIN_LAND  = 2   # 0=no retrieval, 1=poor, 2=moderate, 3=good
 VIIRS_QA_MIN_OCEAN = 1
-
-# MODIS MAIAC MCD19A2
-# AOD_QA bits 3–4 = 0 means: not cloud-adjacent AND best algorithm quality
-MODIS_QA_BIT_MASK = 0b00011000   # bits 3 and 4  (value 24)
 
 # ── Satellite geometry ────────────────────────────────────────────────────────
 HIMAWARI_SAT_LON = 140.7     # sub-satellite longitude (degrees E)
@@ -171,6 +175,12 @@ COLLOCATE_DIR    = OUTPUT_DIR / 'collocated'    # satellite–AERONET matched pa
 GRIDDED_DIR      = OUTPUT_DIR / 'gridded'       # per-sensor 30-min gridded arrays
 MERGED_DIR       = OUTPUT_DIR / 'merged'        # final ICW-merged 30-min NetCDFs
 BIASC_DIR        = OUTPUT_DIR / 'bias_corr'     # bias-correction coefficient files
+
+# Thesis §7.4.2: LEO–Himawari spatial-offset map (NetCDF), populated by
+# `run_collocate.py leo_offset` from previously merged Stage A files.
+LEO_HIMAWARI_OFFSET_FILE = BIASC_DIR / 'leo_himawari_offset.nc'
+LEO_HIMAWARI_MIN_PAIRS   = 30          # cells with fewer paired observations are masked
+LEO_HIMAWARI_SMOOTH_SIGMA = 3.0        # Gaussian sigma in cells (~15 km at 0.05°)
 
 # ── VIIRS overpass grouping ───────────────────────────────────────────────────
 # Consecutive granules whose UTC timestamps differ by ≤ this threshold are

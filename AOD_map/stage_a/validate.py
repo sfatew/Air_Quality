@@ -261,15 +261,13 @@ def stratified_metrics(pairs: pd.DataFrame) -> pd.DataFrame:
     rows = []
 
     groupers = [
-        # (stratum_cols, label_fn)
-        (['site'],                            lambda r: r['site']),
-        (['site', 'season'],                  lambda r: f"{r['site']} {r['season']}"),
-        (['site', 'confidence_flag'],         lambda r: f"{r['site']} conf={r['confidence_flag']}"),
-        (['site', 'season', 'confidence_flag'],
-                                              lambda r: f"{r['site']} {r['season']} conf={r['confidence_flag']}"),
+        ['site'],
+        ['site', 'season'],
+        ['site', 'confidence_flag'],
+        ['site', 'season', 'confidence_flag'],
     ]
 
-    for group_cols, _ in groupers:
+    for group_cols in groupers:
         for keys, grp in pairs.groupby(group_cols):
             if isinstance(keys, str):
                 keys = (keys,)
@@ -311,21 +309,29 @@ def inter_sensor_consistency(
 
     Only slots where BOTH sensors have valid data for a given cell are used.
 
+    Uses running sums (N, Σa, Σb, Σa², Σb², Σab, Σ(a−b)²) instead of storing
+    every paired observation — the all-pairs accumulator previously held 8M+
+    tuples per region in memory and was the dominant memory cost of
+    `--mode all` for multi-year ranges.
+
     Returns DataFrame: sensor_a, sensor_b, region, N, R2, RMSE, Bias
     """
-    # Accumulate (a_val, b_val, region) pairs across all files
-    data: dict[tuple[str, str], dict[str, list]] = {
-        pair: {'north': [], 'central': [], 'south': []}
+    # Running sums per (pair, region) — region codes match fusion.py:
+    # 0=south, 1=central, 2=north
+    region_names = {0: 'south', 1: 'central', 2: 'north'}
+    keys = ['N', 'sa', 'sb', 'saa', 'sbb', 'sab', 'sd2']
+    stats_acc: dict[tuple, dict[str, float]] = {
+        (pair, rn): {k: 0.0 for k in keys}
         for pair in sensor_pairs
+        for rn in region_names.values()
     }
 
     # Build per-cell region mask (constant)
     lat_2d = np.meshgrid(LATS, LONS, indexing='ij')[0]
     region_grid = np.where(
-        lat_2d >= NORTH_CENTRAL_LAT, 0,
-        np.where(lat_2d < CENTRAL_SOUTH_LAT, 2, 1)
-    )  # 0=north, 1=central, 2=south
-    region_names = {0: 'north', 1: 'central', 2: 'south'}
+        lat_2d >= NORTH_CENTRAL_LAT, 2,
+        np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1)
+    )
 
     files = _merged_files_for_range(start, end)
     bar   = _make_bar(files, desc='Sensor overlap scan', unit='file', ncols=80)
@@ -356,35 +362,48 @@ def inter_sensor_consistency(
 
             for reg_idx, reg_name in region_names.items():
                 mask = valid & (region_grid == reg_idx)
-                if np.sum(mask) < 1:
+                if not np.any(mask):
                     continue
-                data[pair][reg_name].extend(
-                    zip(a[mask].tolist(), b[mask].tolist())
-                )
+                av = a[mask].astype(np.float64)
+                bv = b[mask].astype(np.float64)
+                d  = stats_acc[(pair, reg_name)]
+                d['N']   += float(av.size)
+                d['sa']  += float(av.sum())
+                d['sb']  += float(bv.sum())
+                d['saa'] += float((av * av).sum())
+                d['sbb'] += float((bv * bv).sum())
+                d['sab'] += float((av * bv).sum())
+                d['sd2'] += float(((av - bv) ** 2).sum())
 
     rows = []
-    for (sen_a, sen_b), region_dict in data.items():
-        for region, pairs_list in region_dict.items():
-            if len(pairs_list) < 10:
-                continue
-            arr = np.array(pairs_list)
-            a_vals, b_vals = arr[:, 0], arr[:, 1]
-            r, _  = stats.pearsonr(a_vals, b_vals)
-            rmse  = float(np.sqrt(np.mean((a_vals - b_vals) ** 2)))
-            bias  = float(np.mean(a_vals - b_vals))
-            baseline_key = (sen_a.replace('AOD_', ''), sen_b.replace('AOD_', ''), region)
-            baseline_r2  = NGUYEN2025_R2_BASELINES.get(baseline_key, np.nan)
-            rows.append({
-                'sensor_a':    sen_a,
-                'sensor_b':    sen_b,
-                'region':      region,
-                'N':           len(pairs_list),
-                'R2':          float(r ** 2),
-                'R2_baseline': baseline_r2,
-                'R2_delta':    float(r ** 2) - baseline_r2 if not np.isnan(baseline_r2) else np.nan,
-                'RMSE':        rmse,
-                'Bias':        bias,
-            })
+    for (pair, region), d in stats_acc.items():
+        n = d['N']
+        if n < 10:
+            continue
+        mean_a = d['sa'] / n
+        mean_b = d['sb'] / n
+        var_a  = max(d['saa'] / n - mean_a * mean_a, 0.0)
+        var_b  = max(d['sbb'] / n - mean_b * mean_b, 0.0)
+        cov_ab = d['sab'] / n - mean_a * mean_b
+        denom  = np.sqrt(var_a * var_b)
+        r      = cov_ab / denom if denom > 0 else np.nan
+        rmse   = float(np.sqrt(d['sd2'] / n))
+        bias   = float(mean_a - mean_b)
+        sen_a, sen_b = pair
+        baseline_key = (sen_a.replace('AOD_', ''), sen_b.replace('AOD_', ''), region)
+        baseline_r2  = NGUYEN2025_R2_BASELINES.get(baseline_key, np.nan)
+        r2_val       = float(r ** 2) if np.isfinite(r) else np.nan
+        rows.append({
+            'sensor_a':    sen_a,
+            'sensor_b':    sen_b,
+            'region':      region,
+            'N':           int(n),
+            'R2':          r2_val,
+            'R2_baseline': baseline_r2,
+            'R2_delta':    (r2_val - baseline_r2) if (np.isfinite(r2_val) and not np.isnan(baseline_r2)) else np.nan,
+            'RMSE':        rmse,
+            'Bias':        bias,
+        })
 
     return pd.DataFrame(rows)
 
@@ -410,7 +429,6 @@ def precip_aware_validation(pairs: pd.DataFrame) -> pd.DataFrame:
     unique_slots = pairs['slot_utc'].unique()
     slot_files   = {}
     for slot in unique_slots:
-        d = slot.date() if hasattr(slot, 'date') else pd.Timestamp(slot).date()
         pattern = str(MERGED_DIR / pd.Timestamp(slot).strftime('%Y') /
                       pd.Timestamp(slot).strftime('%m') /
                       pd.Timestamp(slot).strftime('%d') /
@@ -437,8 +455,9 @@ def precip_aware_validation(pairs: pd.DataFrame) -> pd.DataFrame:
     rain_thresh = 0.1  # mm
 
     def _is_wet(site: str, slot: datetime) -> bool:
-        for lag_h in range(0, 25):
-            t = pd.Timestamp(slot) - pd.Timedelta(hours=lag_h)
+        # Step in 30-min increments to match merged-file granularity
+        for lag_steps in range(0, 49):  # 0–24 h
+            t = pd.Timestamp(slot) - pd.Timedelta(minutes=30 * lag_steps)
             prec = slot_precip.get((site, t.to_pydatetime()))
             if prec is not None and prec >= rain_thresh:
                 return True
@@ -479,12 +498,6 @@ def baseline_comparison(
     sensor_vals: dict[str, list[float]] = {site: [] for site in AERONET_SITES}
     merged_vals: dict[str, list[float]] = {site: [] for site in AERONET_SITES}
     aer_vals:    dict[str, list[float]] = {site: [] for site in AERONET_SITES}
-
-    # Build quick AERONET lookup by (site, 30-min slot)
-    aer_all = load_all_aeronet()
-    aer_all['slot'] = aer_all['datetime'].dt.floor('30min')
-    aer_slot = aer_all.groupby(['site', 'slot'])['aod_550'].mean().reset_index()
-    aer_slot.columns = ['site', 'slot', 'aod_550']
 
     # Read pairs' slots
     for _, row in pairs.iterrows():
@@ -633,3 +646,412 @@ def spatial_coverage_stats(start: date, end: date) -> pd.DataFrame:
         })
 
     return pd.DataFrame(records)
+
+
+# ── §8.4 Indirect validation via PM2.5 case studies ──────────────────────────
+#
+# AOD_phys_corrected = AOD_merged × (1 − RH/100)^0.6 / PBLH  [m⁻¹]
+# Verified present in all merged NetCDFs with correct formula.
+# Values are ~3×10⁻⁴ m⁻¹ (dimensionless AOD ÷ PBLH in metres).
+# Pearson/Spearman/RANSAC are scale-invariant so the small magnitude is fine.
+
+PM25_DIR      = DATA_ROOT / 'historical_full_v2'
+STATIONS_META = Path('/home/work1/projects/Air_Quality/Masterdata/envisoft_station_map.csv')
+
+# Nguyen 2025 §5.2 finding 9: daily Himawari RANSAC R² vs PM2.5 = 0.293
+NGUYEN2025_PM25_RANSAC_R2 = 0.293
+# Minimum fraction of study days with valid PM2.5 to include a station.
+# Lowered from 0.85 — the test period (Jan 2025 – Apr 2026 = 510 days) had no
+# Envisoft station meeting the 85 % bar, which is why §8.4 silently returned
+# zero pairs.  0.50 keeps stations that cover at least half the period.
+PM25_COMPLETENESS_MIN = 0.50
+
+
+def _latlon_rc(lat: float, lon: float) -> tuple[int, int]:
+    """Return (row, col) in the 0.05° config grid for an arbitrary lat/lon."""
+    row = int(round((LAT_MAX - GRID_RES / 2 - lat) / GRID_RES))
+    col = int(round((lon - LON_MIN - GRID_RES / 2) / GRID_RES))
+    return row, col
+
+
+def load_pm25_meta(stations_csv: Path = STATIONS_META) -> pd.DataFrame:
+    """Load Envisoft station metadata with region and file-stem columns.
+
+    Returns DataFrame with columns:
+        stationId, stationName, latitude, longitude, region, file_stem
+    where file_stem is the PM2.5 CSV basename without extension
+    (stationName with ': ' → ' ').
+    """
+    df = pd.read_csv(stations_csv)
+    df['region']    = df['latitude'].apply(_get_region)
+    df['file_stem'] = df['stationName'].str.replace(': ', ' ', regex=False)
+    return df
+
+
+def _load_pm25_station(file_stem: str, pm25_dir: Path = PM25_DIR) -> pd.DataFrame:
+    """Load and clean hourly PM2.5 for one Envisoft station.
+
+    Returns DataFrame with columns [datetime, PM2.5], deduplicated,
+    with sentinel values and out-of-range readings removed.
+    """
+    path = pm25_dir / f'{file_stem}.csv'
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, parse_dates=['Timestamp'])
+    except Exception:
+        return pd.DataFrame()
+    df = df.rename(columns={'Timestamp': 'datetime'})
+    df = df.replace([-9999, -999, 9999], np.nan)
+    if 'PM2.5' in df.columns:
+        df.loc[~df['PM2.5'].between(0, 500), 'PM2.5'] = np.nan
+    df['_vc'] = df.notnull().sum(axis=1)
+    df = (df.sort_values(['datetime', '_vc'], ascending=[True, False])
+           .drop_duplicates(subset='datetime', keep='first')
+           .drop(columns=['_vc'])
+           .reset_index(drop=True))
+    if 'PM2.5' not in df.columns:
+        return pd.DataFrame()
+    return df[['datetime', 'PM2.5']].dropna(subset=['PM2.5'])
+
+
+def extract_aod_pm25_pairs(
+    start: date,
+    end: date,
+    stations_csv: Path = STATIONS_META,
+    pm25_dir: Path = PM25_DIR,
+    completeness_min: float = PM25_COMPLETENESS_MIN,
+) -> pd.DataFrame:
+    """§8.4: Build daily (AOD_merged, AOD_phys_corrected, PM2.5) matched pairs.
+
+    For each calendar day in [start, end]:
+    1. Read all 30-min merged NetCDF slots → daily mean AOD_merged and
+       AOD_phys_corrected at each station's nearest 0.05° grid cell.
+       AOD_phys_corrected is the Step A3 field already written by run_stage_a.py
+       (formula: AOD_merged × (1−RH/100)^0.6 / PBLH).
+    2. Average hourly Envisoft PM2.5 to a daily mean.
+    3. Merge on date; each row is one station × one day.
+
+    Stations whose PM2.5 series covers fewer than
+    completeness_min × total_study_days are dropped.
+
+    Returns DataFrame with columns:
+        date, station_name, region, season, month,
+        aod_merged_daily, aod_phys_daily,
+        pm25_daily, n_aod_slots, n_pm25_obs, confidence_flag_mode
+    """
+    meta = load_pm25_meta(stations_csv)
+
+    pm25_by_stn: dict[str, pd.DataFrame]        = {}
+    station_rc:  dict[str, tuple[int, int, str]] = {}
+
+    for _, row in meta.iterrows():
+        df_pm25 = _load_pm25_station(str(row['file_stem']), pm25_dir)
+        if df_pm25.empty:
+            continue
+        mask = (
+            (df_pm25['datetime'] >= pd.Timestamp(start)) &
+            (df_pm25['datetime'] <  pd.Timestamp(end) + pd.Timedelta(days=1))
+        )
+        df_pm25 = df_pm25[mask].copy()
+        if df_pm25.empty:
+            continue
+        r, c = _latlon_rc(float(row['latitude']), float(row['longitude']))
+        if not (0 <= r < NLAT and 0 <= c < NLON):
+            continue
+        pm25_by_stn[row['stationName']] = df_pm25
+        station_rc[row['stationName']]  = (r, c, str(row['region']))
+
+    if not station_rc:
+        return pd.DataFrame()
+
+    all_days: list[date] = []
+    d = start
+    while d <= end:
+        all_days.append(d)
+        d += timedelta(days=1)
+
+    records: list[dict] = []
+    bar = _make_bar(all_days, desc='PM2.5 AOD scan', unit='day', ncols=80)
+
+    for d in (bar if bar is not None else all_days):
+        day_files = sorted(glob.glob(str(
+            MERGED_DIR / d.strftime('%Y') / d.strftime('%m') /
+            d.strftime('%d') / 'merged_*.nc'
+        )))
+        if not day_files:
+            continue
+
+        aod_m_acc: dict[str, list[float]] = {sn: [] for sn in station_rc}
+        aod_p_acc: dict[str, list[float]] = {sn: [] for sn in station_rc}
+        cflg_acc:  dict[str, list[int]]   = {sn: [] for sn in station_rc}
+
+        for fpath in day_files:
+            try:
+                with nc.Dataset(fpath) as ds:
+                    aod_m_g  = np.ma.filled(
+                        ds.variables['AOD_merged'][:].astype(np.float32), np.nan)
+                    has_phys = 'AOD_phys_corrected' in ds.variables
+                    aod_p_g  = (
+                        np.ma.filled(
+                            ds.variables['AOD_phys_corrected'][:].astype(np.float32),
+                            np.nan)
+                        if has_phys else None
+                    )
+                    cflg_g   = np.ma.filled(
+                        ds.variables['confidence_flag'][:].astype(np.int8), 0)
+            except Exception:
+                continue
+
+            for sn, (r, c, _) in station_rc.items():
+                vm = float(aod_m_g[r, c])
+                if np.isfinite(vm) and vm >= 0:
+                    aod_m_acc[sn].append(vm)
+                    cflg_acc[sn].append(int(cflg_g[r, c]))
+                    if aod_p_g is not None:
+                        vp = float(aod_p_g[r, c])
+                        aod_p_acc[sn].append(vp if np.isfinite(vp) else np.nan)
+                    else:
+                        aod_p_acc[sn].append(np.nan)
+
+        day_ts      = pd.Timestamp(d)
+        next_day_ts = day_ts + pd.Timedelta(days=1)
+
+        for sn, (r, c, region) in station_rc.items():
+            if not aod_m_acc[sn]:
+                continue
+            df_pm25 = pm25_by_stn.get(sn)
+            if df_pm25 is None or df_pm25.empty:
+                continue
+            day_pm25 = df_pm25[
+                (df_pm25['datetime'] >= day_ts) &
+                (df_pm25['datetime'] <  next_day_ts)
+            ]
+            if day_pm25.empty or day_pm25['PM2.5'].isna().all():
+                continue
+
+            phys_vals = [v for v in aod_p_acc[sn] if np.isfinite(v)]
+            cflg_arr  = np.clip(np.array(cflg_acc[sn], dtype=np.int64), 0, 10)
+            cflg_mode = int(np.argmax(np.bincount(cflg_arr))) if len(cflg_arr) else 0
+
+            records.append({
+                'date':                 d,
+                'station_name':         sn,
+                'region':               region,
+                'season':               'dry' if d.month in DRY_MONTHS else 'wet',
+                'month':                d.month,
+                'aod_merged_daily':     float(np.nanmean(aod_m_acc[sn])),
+                'aod_phys_daily':       float(np.nanmean(phys_vals)) if phys_vals else np.nan,
+                'pm25_daily':           float(day_pm25['PM2.5'].mean()),
+                'n_aod_slots':          len(aod_m_acc[sn]),
+                'n_pm25_obs':           int(day_pm25['PM2.5'].notna().sum()),
+                'confidence_flag_mode': cflg_mode,
+            })
+
+    if not records:
+        print(f'[extract_aod_pm25_pairs] no station-days produced — '
+              f'check MERGED_DIR contents and station coordinates.')
+        return pd.DataFrame()
+
+    pairs_df = pd.DataFrame(records)
+
+    if completeness_min > 0:
+        study_days  = (end - start).days + 1
+        day_counts  = pairs_df.groupby('station_name')['pm25_daily'].count()
+        threshold   = completeness_min * study_days
+        keep        = day_counts[day_counts >= threshold].index
+        kept_pairs  = pairs_df[pairs_df['station_name'].isin(keep)]
+        print(f'[extract_aod_pm25_pairs] {len(day_counts)} stations had pairs; '
+              f'{len(keep)} pass completeness ≥ {completeness_min:.0%} '
+              f'(≥ {int(threshold)} of {study_days} days).')
+        if kept_pairs.empty and len(day_counts):
+            top = day_counts.sort_values(ascending=False).head(5)
+            print(f'  Top stations by N_days (none met threshold):')
+            for sn, n in top.items():
+                print(f'    {sn}: {int(n)}/{study_days} ({n/study_days:.0%})')
+        pairs_df = kept_pairs
+
+    return pairs_df.reset_index(drop=True)
+
+
+def pm25_coupling_metrics(pairs: pd.DataFrame) -> pd.DataFrame:
+    """§8.4: AOD–PM2.5 coupling metrics stratified by region, season, and station.
+
+    Fits OLS + RANSAC for both aod_merged_daily and aod_phys_daily vs pm25_daily
+    across four stratum levels: overall, per-region, per-region×season, per-station.
+
+    'ransac_r2_delta' = RANSAC R² minus the Nguyen 2025 Himawari-only baseline
+    (0.293) — positive values indicate the merged product beats the baseline.
+
+    Returns a tidy DataFrame with one row per (stratum, aod_type).
+    """
+
+    def _fit_stratum(
+        aod_col: str,
+        sub: pd.DataFrame,
+        label: str,
+    ) -> Optional[dict]:
+        df = sub[[aod_col, 'pm25_daily']].dropna()
+        if len(df) < 10:
+            return None
+        x = df[aod_col].values.reshape(-1, 1)
+        y = df['pm25_daily'].values
+
+        ols    = LinearRegression().fit(x, y)
+        ols_r2 = float(ols.score(x, y))
+
+        try:
+            ransac      = RANSACRegressor(min_samples=0.5, random_state=42)
+            ransac.fit(x, y)
+            inlier_mask      = ransac.inlier_mask_
+            ransac_r2        = float(ransac.score(x[inlier_mask], y[inlier_mask]))
+            inlier_frac      = float(inlier_mask.mean())
+            ransac_slope     = float(ransac.estimator_.coef_[0])
+            ransac_intercept = float(ransac.estimator_.intercept_)
+        except Exception:
+            ransac_r2 = inlier_frac = ransac_slope = ransac_intercept = np.nan
+
+        pr, _ = stats.pearsonr(df[aod_col].values, y)
+        sr, _ = stats.spearmanr(df[aod_col].values, y)
+
+        return {
+            'label':            label,
+            'aod_type':         aod_col,
+            'N':                len(df),
+            'pearson_r':        float(pr),
+            'spearman_r':       float(sr),
+            'ols_r2':           ols_r2,
+            'ransac_r2':        ransac_r2,
+            'ransac_r2_delta':  (ransac_r2 - NGUYEN2025_PM25_RANSAC_R2)
+                                if not np.isnan(ransac_r2) else np.nan,
+            'inlier_frac':      inlier_frac,
+            'ransac_slope':     ransac_slope,
+            'ransac_intercept': ransac_intercept,
+        }
+
+    rows     = []
+    aod_cols = ['aod_merged_daily', 'aod_phys_daily']
+
+    for aod_col in aod_cols:
+        r = _fit_stratum(aod_col, pairs, 'ALL')
+        if r:
+            rows.append(r)
+
+    for region, grp in pairs.groupby('region'):
+        for aod_col in aod_cols:
+            r = _fit_stratum(aod_col, grp, f'region={region}')
+            if r:
+                r['region'] = region
+                rows.append(r)
+
+    for (region, season), grp in pairs.groupby(['region', 'season']):
+        for aod_col in aod_cols:
+            r = _fit_stratum(aod_col, grp, f'region={region} season={season}')
+            if r:
+                r['region'] = region
+                r['season'] = season
+                rows.append(r)
+
+    for sn, grp in pairs.groupby('station_name'):
+        for aod_col in aod_cols:
+            r = _fit_stratum(aod_col, grp, f'station={sn}')
+            if r:
+                r['station_name'] = sn
+                rows.append(r)
+
+    return pd.DataFrame(rows)
+
+
+def pm25_case_studies(pairs: pd.DataFrame) -> pd.DataFrame:
+    """§8.4: Evaluate 4 pollution episode types from paired (AOD, PM2.5) data.
+
+    Episode types auto-detected from criteria in the pairs DataFrame:
+    1. severe_hanoi_haze      — north, dry, PM2.5 > 100 µg/m³ and AOD_merged > 1.0
+    2. biomass_burning_MarApr — March–April, PM2.5 > 50 µg/m³ (SEA transport)
+    3. monsoon_gap_fill_stress — wet season, ≤ 5 valid AOD slots/day (cloud-dominated)
+    4. precip_washout         — wet season, day-over-day PM2.5 drop ≥ 30 µg/m³
+
+    For each episode group, Spearman rank correlation between aod_phys_daily and
+    pm25_daily is computed per station (AOD_phys_corrected from Step A3).
+
+    Pass criterion (§8.4): |spearman_r| > 0.3 for episodes 1, 2, 4;
+    episode 3 tests gap-fill robustness so weaker coupling is expected.
+
+    Returns one row per (episode_type, station_name).
+    """
+    if pairs.empty or 'aod_phys_daily' not in pairs.columns:
+        return pd.DataFrame()
+
+    pairs = pairs.copy()
+    pairs['date'] = pd.to_datetime(pairs['date'])
+
+    def _ep_row(sub: pd.DataFrame, ep_type: str, sn: str) -> Optional[dict]:
+        df = sub[['aod_phys_daily', 'pm25_daily']].dropna()
+        if len(df) < 3:
+            return None
+        sr, sp = stats.spearmanr(df['aod_phys_daily'], df['pm25_daily'])
+        pr, _  = stats.pearsonr( df['aod_phys_daily'], df['pm25_daily'])
+        return {
+            'episode_type':    ep_type,
+            'station_name':    sn,
+            'region':          sub['region'].iloc[0] if 'region' in sub.columns else '',
+            'N_days':          len(df),
+            'spearman_r':      float(sr),
+            'spearman_p':      float(sp),
+            'pearson_r':       float(pr),
+            'peak_aod_merged': float(sub['aod_merged_daily'].max()),
+            'peak_pm25':       float(sub['pm25_daily'].max()),
+            'mean_aod_phys':   float(df['aod_phys_daily'].mean()),
+            'mean_pm25':       float(df['pm25_daily'].mean()),
+        }
+
+    rows: list[dict] = []
+
+    # Episode 1 — severe Hanoi haze
+    e1 = pairs[
+        (pairs['region'] == 'north') &
+        (pairs['season'] == 'dry') &
+        (pairs['pm25_daily'] > 100) &
+        (pairs['aod_merged_daily'] > 1.0)
+    ]
+    for sn, grp in e1.groupby('station_name'):
+        r = _ep_row(grp, 'severe_hanoi_haze', str(sn))
+        if r:
+            rows.append(r)
+
+    # Episode 2 — biomass-burning transport (March–April)
+    e2 = pairs[
+        (pairs['month'].isin([3, 4])) &
+        (pairs['pm25_daily'] > 50)
+    ]
+    for sn, grp in e2.groupby('station_name'):
+        r = _ep_row(grp, 'biomass_burning_MarApr', str(sn))
+        if r:
+            rows.append(r)
+
+    # Episode 3 — monsoon gap-fill stress (≤ 5 valid AOD slots per day)
+    e3 = pairs[
+        (pairs['season'] == 'wet') &
+        (pairs['n_aod_slots'] <= 5)
+    ]
+    for sn, grp in e3.groupby('station_name'):
+        r = _ep_row(grp, 'monsoon_gap_fill_stress', str(sn))
+        if r:
+            rows.append(r)
+
+    # Episode 4 — precipitation washout (PM2.5 drops ≥ 30 µg/m³ day-over-day)
+    washout_parts: list[pd.DataFrame] = []
+    for sn, grp in pairs[pairs['season'] == 'wet'].groupby('station_name'):
+        grp_s = grp.sort_values('date').copy()
+        grp_s['pm25_delta'] = grp_s['pm25_daily'].diff()
+        washout_days = grp_s[grp_s['pm25_delta'] <= -30]['date']
+        if not washout_days.empty:
+            washout_parts.append(grp_s[grp_s['date'].isin(washout_days)])
+    if washout_parts:
+        e4 = pd.concat(washout_parts, ignore_index=True)
+        for sn, grp in e4.groupby('station_name'):
+            r = _ep_row(grp, 'precip_washout', str(sn))
+            if r:
+                rows.append(r)
+
+    return pd.DataFrame(rows)

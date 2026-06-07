@@ -68,6 +68,11 @@ OUTPUT_DIR   = "/home/slow_data/Air_Quality/ERA5"
 OUTPUT_FILE  = os.path.join(OUTPUT_DIR, "Vietnam_ERA5_bbox.nc")
 MONTHLY_DIR  = os.path.join(OUTPUT_DIR, "_monthly_raw")
 
+# Skip the giant single-file merge.  Downstream code should use ERA5/load.py
+# (xr.open_mfdataset over MONTHLY_DIR), which is more robust, uses less disk,
+# and extends naturally when new months are added.
+MERGE_MONTHLY = False
+
 # ── Split variables by step type for separate CDS requests ────────────────────
 # FIX (performance): mixing instant+accum in one request forces CDS to split
 # them internally and serialise the queue jobs.  Two small requests schedule
@@ -493,36 +498,30 @@ def fetch_bbox() -> None:
         print(f"Failed list written to: {log_path}")
 
     # ── Merge monthly files ────────────────────────────────────────────────────
+    if not MERGE_MONTHLY:
+        print(
+            f"\nMerge step skipped (MERGE_MONTHLY=False). "
+            f"Use ERA5/load.py → load_era5_bbox() to read the monthly files lazily."
+        )
+        return
+
     monthly_files = sorted(glob.glob(os.path.join(MONTHLY_DIR, "era5_??????.nc")))
     if not monthly_files:
         print("No monthly files found — nothing to merge.")
         return
 
     print(f"\nMerging {len(monthly_files)} monthly files → {OUTPUT_FILE}")
-    # open_mfdataset requires dask; use a plain loop instead
-    datasets = []
-    for fp in monthly_files:
-        ds = xr.open_dataset(fp, engine="netcdf4")
-        # Drop CDS metadata coords that vary across files and block concat
-        for drop_var in ("expver", "number"):
-            if drop_var in ds:
-                ds = ds.drop_vars(drop_var)
-        datasets.append(ds)
-    ds_all = xr.concat(datasets, dim="time")
+    # Streaming write: only one month is in RAM at a time (~110 MB).
+    # xarray's to_netcdf(mode="a") doesn't actually extend an unlimited dim
+    # (it just overwrites matching-shape vars), so we use the netCDF4 library
+    # directly to append along the time axis after seeding the file with
+    # month 1 via xarray.
+    import netCDF4
 
     last_day = calendar.monthrange(END[0], END[1])[1]
     t_end    = pd.Timestamp(f"{END[0]}-{END[1]:02d}-{last_day:02d} 23:00")
-    ds_all   = ds_all.sel(time=slice(None, t_end))
 
-    rename_dims = {}
-    if "latitude"  not in ds_all.dims and "lat" in ds_all.dims:
-        rename_dims["lat"] = "latitude"
-    if "longitude" not in ds_all.dims and "lon" in ds_all.dims:
-        rename_dims["lon"] = "longitude"
-    if rename_dims:
-        ds_all = ds_all.rename(rename_dims)
-
-    ds_all.attrs = {
+    global_attrs = {
         "title":           "Vietnam ERA5 single-level weather",
         "bounding_box":    f"N={BBOX[0]} W={BBOX[1]} S={BBOX[2]} E={BBOX[3]}",
         "date_range":      f"{START[0]}-{START[1]:02d} to {END[0]}-{END[1]:02d}",
@@ -532,7 +531,63 @@ def fetch_bbox() -> None:
         "created_by":      "ERA5/fetch_era5_bbox.py",
     }
 
-    ds_all.to_netcdf(OUTPUT_FILE)
+    def _load_month(fp: str) -> xr.Dataset:
+        ds = xr.open_dataset(fp, engine="netcdf4").load()
+        for drop_var in ("expver", "number"):
+            if drop_var in ds:
+                ds = ds.drop_vars(drop_var)
+        rename_dims = {}
+        if "latitude"  not in ds.dims and "lat" in ds.dims:
+            rename_dims["lat"] = "latitude"
+        if "longitude" not in ds.dims and "lon" in ds.dims:
+            rename_dims["lon"] = "longitude"
+        if rename_dims:
+            ds = ds.rename(rename_dims)
+        return ds.sel(time=slice(None, t_end))
+
+    if os.path.exists(OUTPUT_FILE):
+        os.remove(OUTPUT_FILE)
+
+    # Seed the output file with the first month (xarray handles all the
+    # encoding/attrs/coords setup for us; time is the unlimited dim).
+    ds0 = _load_month(monthly_files[0])
+    if ds0.sizes["time"] == 0:
+        raise RuntimeError(f"First monthly file is empty after slicing: {monthly_files[0]}")
+    ds0.attrs = global_attrs
+    ds0.to_netcdf(OUTPUT_FILE, mode="w", unlimited_dims=["time"])
+    _safe_print(f"  seeded {os.path.basename(monthly_files[0])}  ({ds0.sizes['time']} hours)")
+    ds0.close()
+
+    # Append remaining months along the unlimited time axis using netCDF4.
+    for fp in monthly_files[1:]:
+        ds = _load_month(fp)
+        n = ds.sizes["time"]
+        if n == 0:
+            ds.close()
+            continue
+
+        with netCDF4.Dataset(OUTPUT_FILE, mode="a") as nc:
+            t_start = nc.dimensions["time"].size
+            sl = slice(t_start, t_start + n)
+
+            # Append the time coord (convert to the file's numeric units).
+            time_var = nc.variables["time"]
+            time_vals = netCDF4.date2num(
+                pd.DatetimeIndex(ds["time"].values).to_pydatetime(),
+                units=time_var.units,
+                calendar=getattr(time_var, "calendar", "standard"),
+            )
+            time_var[sl] = time_vals
+
+            # Append every data variable that has a time dimension.
+            for vname, da in ds.data_vars.items():
+                if "time" not in da.dims or vname not in nc.variables:
+                    continue
+                nc.variables[vname][sl] = da.values
+
+        _safe_print(f"  appended {os.path.basename(fp)}  ({n} hours)")
+        ds.close()
+
     print(f"Done → {OUTPUT_FILE}")
 
 

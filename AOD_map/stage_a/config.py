@@ -40,7 +40,7 @@ AERONET_SITES = {
 # than the original Nguyen 2025 figures which do not match our data distribution.
 # Key: (sensor_key, region)
 SENSOR_RMSE_PRIOR = {
-    # Single Himawari entry (v3.2): L3 wins per pixel, L2 fills L3 gaps.
+    # Single Himawari entry: L3 wins per pixel, L2 fills L3 gaps.
     # Values seeded from the previous himawari_l3 priors since L3 dominates
     # most pixels.  Updated by post_correction_rmse.json after training.
     ('himawari',    'north'):   0.477,
@@ -173,7 +173,7 @@ VIIRS_SNPP_DIR   = DATA_ROOT / 'VIIRS' / 'L2' / 'AERDB_L2_VIIRS_SNPP'
 VIIRS_N20_DIR    = DATA_ROOT / 'VIIRS' / 'L2' / 'AERDB_L2_VIIRS_NOAA20'
 MODIS_DIR        = DATA_ROOT / 'MODIS_MCD19A2' / 'raw'
 AERONET_DIR      = DATA_ROOT / 'AERONET' / '10'
-ERA5_FILE        = DATA_ROOT / 'ERA5' / 'Vietnam_ERA5_bbox.nc'
+ERA5_MONTHLY_DIR = DATA_ROOT / 'ERA5' / '_monthly_raw'
 
 OUTPUT_DIR       = DATA_ROOT / 'Stage_A'
 EXTRACT_DIR      = OUTPUT_DIR / 'extracted'     # raw satellite AOD time series at stations

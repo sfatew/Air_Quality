@@ -13,18 +13,26 @@ from r = 0.110 to r = 0.162 (1.5× improvement).
 
 ERA5 source
 -----------
-  File  : ERA5_FILE (Vietnam_ERA5_bbox.nc)
+  Dir   : ERA5_MONTHLY_DIR (era5_YYYYMM.nc monthly checkpoints)
   Grid  : 0.25° × 0.25°, 63 × 33 points, N=23.5 W=102.0 S=8.0 E=110.0
   Time  : UTC, hourly, Sep 2022 – Apr 2026
   Vars  : RH (%), PBLH (m)
 
-The ERA5 dataset is opened once as a lazy xarray Dataset and kept in a
-module-level cache to avoid re-opening on every call.  RH and PBLH are
-bilinearly interpolated from 0.25° to the 0.05° AOD grid using
+The monthly files are stitched into one lazy xarray Dataset via
+ERA5.load.load_era5_bbox and kept in a module-level cache to avoid
+re-opening on every call.  RH and PBLH are bilinearly interpolated
+from 0.25° to the 0.05° AOD grid using
 scipy.interpolate.RegularGridInterpolator.
 """
 
 from __future__ import annotations
+import os
+# Disable HDF5 file locking before xarray (and netCDF4/HDF5) is imported.
+# With multi-process workers concurrently opening ERA5 monthly .nc files,
+# HDF5's default locking can race and abort the worker silently (surfaces
+# as BrokenProcessPool).  Safe because access is read-only.
+os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
+
 from datetime import datetime
 from typing import Optional
 
@@ -41,41 +49,70 @@ except Exception:
     _xp = np
 
 from config import (
-    ERA5_FILE, GAMMA, PBLH_MIN,
+    ERA5_MONTHLY_DIR, GAMMA, PBLH_MIN,
     LATS, LONS, NLAT, NLON,
 )
 
 # ── Module-level ERA5 cache ───────────────────────────────────────────────────
-_era5_ds: Optional[xr.Dataset] = None
-_era5_lats: Optional[np.ndarray] = None   # ERA5 latitude array (descending)
-_era5_lons: Optional[np.ndarray] = None   # ERA5 longitude array (ascending)
+# One monthly file is held open per worker process at a time.  Opening all 44
+# files at once via xr.open_mfdataset triggers silent HDF5 crashes (worker
+# SIGABRT → BrokenProcessPool) under high-concurrency multiprocess loads.
+_era5_current_ds: Optional[xr.Dataset] = None
+_era5_current_key: Optional[str]       = None   # 'YYYYMM' of the cached file
+_era5_current_times: Optional[np.ndarray] = None
+_era5_lats: Optional[np.ndarray] = None   # latitude array (descending)
+_era5_lons: Optional[np.ndarray] = None   # longitude array (ascending)
 
 
-def _load_era5() -> xr.Dataset:
-    """Open the ERA5 NetCDF lazily (once per process)."""
-    global _era5_ds, _era5_lats, _era5_lons
-    if _era5_ds is None:
-        _era5_ds   = xr.open_dataset(ERA5_FILE, engine='netcdf4')
-        _era5_lats = _era5_ds['latitude'].values.astype(np.float64)
-        _era5_lons = _era5_ds['longitude'].values.astype(np.float64)
-    return _era5_ds
+def _open_era5_month(yyyymm: str) -> Optional[xr.Dataset]:
+    """Open era5_{yyyymm}.nc, closing any previously cached month."""
+    global _era5_current_ds, _era5_current_key, _era5_current_times
+    global _era5_lats, _era5_lons
+
+    if _era5_current_key == yyyymm and _era5_current_ds is not None:
+        return _era5_current_ds
+
+    if _era5_current_ds is not None:
+        _era5_current_ds.close()
+        _era5_current_ds = None
+        _era5_current_key = None
+        _era5_current_times = None
+
+    path = ERA5_MONTHLY_DIR / f'era5_{yyyymm}.nc'
+    if not path.exists():
+        return None
+
+    ds = xr.open_dataset(path, engine='netcdf4')
+    if _era5_lats is None:
+        _era5_lats = ds['latitude'].values.astype(np.float64)
+        _era5_lons = ds['longitude'].values.astype(np.float64)
+    _era5_current_ds    = ds
+    _era5_current_key   = yyyymm
+    _era5_current_times = ds['time'].values
+    return ds
 
 
 # ── ERA5 nearest-hourly retrieval ─────────────────────────────────────────────
 
 def _nearest_era5_slice(slot_utc: datetime) -> Optional[xr.Dataset]:
-    """Return the ERA5 time slice nearest to slot_utc (UTC)."""
-    ds = _load_era5()
+    """Return the ERA5 time slice nearest to slot_utc (UTC).
+
+    Opens only the monthly file that contains slot_utc's hour.  Handles
+    month-boundary cases by also probing the adjacent month when the slot's
+    nearest hour might live in the neighbouring file.
+    """
     slot_hour = slot_utc.replace(tzinfo=None, minute=0, second=0, microsecond=0)
     ts = np.datetime64(slot_hour)
 
-    # Find the nearest available ERA5 hour
-    era5_times = ds['time'].values
-    idx = int(np.argmin(np.abs(era5_times - ts)))
-    delta_h = abs((era5_times[idx] - ts) / np.timedelta64(1, 'h'))
-    if delta_h > 1.0:
-        return None   # nearest ERA5 step is more than 1 h away
+    ds = _open_era5_month(slot_hour.strftime('%Y%m'))
+    if ds is None:
+        return None
 
+    times = _era5_current_times
+    idx = int(np.argmin(np.abs(times - ts)))
+    delta_h = abs((times[idx] - ts) / np.timedelta64(1, 'h'))
+    if delta_h > 1.0:
+        return None
     return ds.isel(time=idx)
 
 
@@ -195,8 +232,10 @@ def apply_physics_correction(
 
 
 def close_era5() -> None:
-    """Release the ERA5 file handle (call at end of processing run)."""
-    global _era5_ds
-    if _era5_ds is not None:
-        _era5_ds.close()
-        _era5_ds = None
+    """Release the cached ERA5 monthly file handle (call at end of run)."""
+    global _era5_current_ds, _era5_current_key, _era5_current_times
+    if _era5_current_ds is not None:
+        _era5_current_ds.close()
+        _era5_current_ds = None
+        _era5_current_key = None
+        _era5_current_times = None

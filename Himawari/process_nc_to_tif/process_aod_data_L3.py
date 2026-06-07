@@ -131,7 +131,7 @@ if __name__ == "__main__":
     aod_full_path = os.path.join(base_dir, f"aod_full_{filename}.tif")
     aod_vietnam_path = os.path.join(base_dir, f"aod_vietnam_{filename}.tif")
 
-    shapefile_path = "/opt/airflow/dags/GADM_Vietnam/gadm41_VNM_0.shp"
+    shapefile_path = "/home/work1/projects/Air_Quality/GADM_Vietnam/gadm41_VNM_0.shp"
 
     # 1. Convert
     nc_to_geotiff(nc_path, aod_full_path)

@@ -17,7 +17,7 @@ sys.path.append(str(root_dir))
 # --- FTP Configuration ---
 import yaml
 
-with open("config/config.yaml", "r") as f:
+with open(f"{root_dir}/config/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
 FTP_HOST = config['HIMAWARI']['FTP_HOST']
@@ -33,7 +33,7 @@ LEVEL_CONFIG = {
     "L2": {
         "base_dir": "/pub/himawari/L2/ARP/031",
         "local_base": "/home/slow_data/Air_Quality/Himawari/L2_AOD",
-        "process_script": "/opt/airflow/dags/Himawari/process_nc_to_tif/process_aod_data_L2.py",
+        "process_script": "/home/work1/projects/Air_Quality/Himawari/process_nc_to_tif/process_aod_data_L2.py",
         "time_step": timedelta(hours=1),
         "realtime_lookback": [timedelta(hours=6), timedelta(hours=1)],
         "realtime_threshold": timedelta(hours=6),
@@ -41,7 +41,7 @@ LEVEL_CONFIG = {
     "L3": {
         "base_dir": "/pub/himawari/L3/ARP/031",
         "local_base": "/home/slow_data/Air_Quality/Himawari/L3_AOD",
-        "process_script": "/opt/airflow/dags/Himawari/process_nc_to_tif/process_aod_data_L3.py",
+        "process_script": "/home/work1/projects/Air_Quality/Himawari/process_nc_to_tif/process_aod_data_L3.py",
         "time_step": timedelta(days=1),
         "realtime_lookback": [timedelta(days=6), timedelta(days=1)],
         "realtime_threshold": timedelta(hours=6),

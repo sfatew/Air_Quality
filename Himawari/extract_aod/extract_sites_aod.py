@@ -45,13 +45,13 @@ from tqdm import tqdm
 #  Configuration
 # ══════════════════════════════════════════════════════════════════════
 
-STATION_CSV   = "/home/work1/projects/Air_Quality/Masterdata/envisoft_station_map.csv"
-STATION_FILTER = None
+STATION_CSV   = "/home/work1/projects/Air_Quality/Masterdata/AERONET_sites.csv"
+STATION_FILTER = ["Bac_Lieu", "NGHIA_DO"]
 LOG_DIR       = "/home/slow_data/Air_Quality/Himawari/logs"
 
 # ── L2 ────────────────────────────────────────────────────────────────
 L2_AOD_DIR    = "/home/slow_data/Air_Quality/Himawari/L2_AOD"
-L2_OUTPUT_DIR = "/home/slow_data/Air_Quality/Himawari/stations_aod_v4/L2"
+L2_OUTPUT_DIR = "/home/slow_data/Air_Quality/Himawari/sites_aod_v4/L2"
 L2_GLOB_TEMPLATE = r'{year}??/??/??/aod_vietnam_NC_H??_*_L2ARP031_FLDK.*.tif'
 
 # (aot_name, aot_band_idx, qa_name, qa_band_idx) — AOT filtered by paired QA

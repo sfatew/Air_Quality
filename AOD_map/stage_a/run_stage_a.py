@@ -19,6 +19,12 @@ python run_stage_a.py --start 2023-01-01 --end 2023-01-31 --no-physics
 """
 
 from __future__ import annotations
+import os
+# Must be set before xarray / netCDF4 / HDF5 are imported anywhere — disables
+# HDF5 read locks so 8-way concurrent open of the 44 ERA5 monthly files
+# doesn't race and kill workers (BrokenProcessPool).  Read-only access.
+os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
+
 import argparse
 import sys
 import time
@@ -27,6 +33,7 @@ from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Optional
 import concurrent.futures
+import multiprocessing as mp
 
 import numpy as np
 
@@ -171,7 +178,7 @@ def _write_netcdf(
         _add_var('n_sensors',       merged['n_sensors'],
                  'Number of sensors contributing', dtype='i1', fill=-1)
         _add_var('dominant_sensor', merged['dominant_sensor'],
-                 'Sensor with highest ICW weight (1=H-L2,2=H-L3,3=MAIAC,4=SNPP,5=N20)',
+                 'Sensor with highest ICW weight (1=Himawari merged,3=MAIAC,4=SNPP,5=N20)',
                  dtype='i1', fill=0)
         _add_var('confidence_flag', merged['confidence_flag'],
                  'Confidence: 0=none,1=H-only,2=LEO-only,3=H+LEO,4=multi-LEO+H',
@@ -479,7 +486,14 @@ def main():
             _day_bar = (_tqdm(total=n_days, desc='Days', unit='day', ncols=80)
                         if _HAS_TQDM else None)
             try:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as ex:
+                # 'spawn' (not the Linux default 'fork') so each worker starts
+                # with a clean HDF5/netCDF4 state — fork-after-import of these
+                # libraries corrupts HDF5 globals and kills the worker silently
+                # (BrokenProcessPool) when it opens the 44 ERA5 monthly files.
+                _mp_ctx = mp.get_context('spawn')
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=args.workers, mp_context=_mp_ctx
+                ) as ex:
                     futures = {
                         ex.submit(
                             run_day, day, sensors, corrections, rmse_dict,

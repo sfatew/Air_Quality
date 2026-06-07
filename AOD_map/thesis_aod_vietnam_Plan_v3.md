@@ -235,7 +235,7 @@ Each matchup records which spatial tier was used and the within-neighbourhood AO
 | MODIS MAIAC | Each orbit layer separately | ±30 min **per orbit** | Terra (~10:30 LT) and Aqua (~13:30 LT) matched independently using per-orbit timestamps; daily-mean fallback when timestamps are unavailable |
 | Himawari L3 | Daily mean AERONET AOD | Whole day | L3 is itself a daily composite; per-observation matching would introduce noise inconsistent with the L3 aggregation |
 
-The per-orbit MODIS approach avoids confounding diurnal aerosol variation with retrieval bias: Terra and Aqua overpasses are matched independently rather than against a daily mean that mixes morning and afternoon aerosol loading.
+The per-orbit MODIS approach avoids confounding diurnal aerosol variation with retrieval bias: Terra and Aqua overpasses are matched independently rather than against a daily mean that mixes morning and afternoon aerosol loading. The same per-orbit temporal logic is applied in the production fusion pipeline (§7.2.2), so the collocation-trained bias corrections and the gridding step handle MODIS temporal resolution consistently.
 
 ### 7.1 Step A1 — Quality filtering
 
@@ -259,13 +259,36 @@ The per-orbit MODIS approach avoids confounding diurnal aerosol variation with r
 
 ### 7.2 Step A2 — Regridding to 0.05° × 30-min
 
+#### 7.2.1 Spatial aggregation
+
 Box-averaging per Gupta et al. 2020: only pixels whose centre falls inside a 0.05° cell contribute (no nearest-neighbour fill or ring search).
 
 1. Per 30-min window, collect L2 pixels whose centre coordinates fall in each 0.05° cell.
 2. MAIAC (1 km) and VIIRS DB (6 km): box-average to per-cell mean, std, count, mean VZA, mean SZA.
-3. Himawari (0.05° native): already on the target grid. Multiple 10-min L2 files within the slot window are averaged into one slot value.
+3. Himawari (0.05° native): already on the target grid — no spatial resampling needed.
 
 **Output per sensor per 30-min slot:** mean AOD, std AOD, pixel count, mean VZA, mean SZA.
+
+#### 7.2.2 Temporal slot assignment per sensor
+
+The 30-min slot cadence (48 slots/day, centred at 00:00, 00:30, …, 23:30 UTC) is a common reference frame that the four sensors reach by different paths, reflecting their different native temporal resolutions:
+
+| Sensor | Native cadence | Slot strategy | Effective window |
+|--------|---------------|---------------|-----------------|
+| Himawari L2 | 10-min snapshots | All L2 snapshots within ±15 min of the slot centre are **averaged** pixel-by-pixel into one slot grid | ±15 min (~3 files/slot) |
+| Himawari L3 | 1-hour composites | The nearest L3 composite within ±30 min is used as-is; no averaging across composites | ±30 min (1 file/slot) |
+| VIIRS SNPP / NOAA-20 | ~6-min granules, ~1–2 overpasses/day | All granules within ±30 min of the slot centre are pooled, then box-averaged to the 0.05° grid | ±30 min |
+| MODIS MAIAC | Multi-orbit HDF per day (~2 orbits) | Daily HDF loaded once; per-orbit UTC timestamps extracted from file metadata; each orbit's pixels are included only in slots whose ±30-min window overlaps that orbit's overpass time | ±30 min per orbit |
+
+**Consequences of mismatched cadences:**
+
+- **Himawari L2 — no slot duplication.** With a ±15 min window and 10-min file spacing, each L2 snapshot falls in exactly one slot. Up to three consecutive snapshots are averaged into the slot grid, then the 500→550 nm Ångström correction is applied once to the averaged result.
+
+- **Himawari L3 — consecutive slots share one composite.** Because the L3 window is ±30 min but composites are hourly, both the X:00 and X:30 slots within the same clock-hour draw from the same hourly composite. This is intentional: the L3 product already integrates observations across the full hour, so both half-hour slots carry equivalent information content and no temporal interpolation between adjacent composites is attempted.
+
+- **VIIRS — potential single-overpass double-slot contribution.** A VIIRS granule at time *t* is eligible for any slot whose ±30-min window contains *t*. A granule at 10:22 UTC, for example, satisfies the window condition for both the 10:00 and 10:30 slots and is gridded into both. In practice this affects at most one or two slot pairs per overpass per day and is a known limitation (§10 #18).
+
+- **MODIS MAIAC — most slots receive no MODIS data.** Terra overpasses Vietnam around 03:30 UTC (~10:30 local), Aqua around 06:30 UTC (~13:30 local). Only the one or two slot pairs whose ±30-min window overlaps an actual overpass will contain MODIS pixels; all remaining slots leave the MODIS grid as NaN. This is fully consistent with VIIRS slot handling — both LEO sensors contribute exclusively near their overpass time — and avoids contaminating pre-dawn or evening slots with mid-morning retrieval data. When orbit timestamps are absent from the HDF file (attribute unreadable), MODIS falls back to being included in all slots, matching the behaviour of a daily-mean assignment.
 
 ### 7.3 Step A3 — Physics normalization (stored as a separate output, applied after fusion)
 
@@ -551,6 +574,7 @@ Per Nguyen 2025, RANSAC lifts daily Himawari–PM2.5 R² from 0.065 to 0.293. Us
 15. **CDF-fit quality gates can mask whole strata.** Strata that fail the Pearson R or slope sanity check fall back to the `SENSOR_RMSE_PRIOR` weight rather than receiving a correction; for very low-coverage seasons this means an unbias-corrected sensor enters the fusion with its prior RMSE. Trade-off favours robustness over universal correction.
 16. **§8.4 PM2.5 case studies use a relaxed station-completeness threshold (≥50%) over the held-out window.** No Envisoft station meets the ≥85% completeness bar across Jan 2025 – Apr 2026 alone. Case-study correlations therefore include stations whose held-out-window coverage is between 50% and 85% — flagged in the §8.4 tables so they are not mistaken for full-record statistics. The headline 27-station figure in §4.3 still refers to the ≥85% subset over the full Nguyen 2025 study window.
 17. **Himawari L2 and L3 are merged per-pixel before fusion (v3.3), not weighted as separate sources.** L3-corrected wins where finite; L2-corrected fills L3 gaps. This collapses the §5.2 empirical L2-north / L3-south finding into a single grid that is biased toward L3 wherever L3 has any retrieval. The hourly composite (L3) therefore drives the merged product across most pixels and most slots, with L2 contributing primarily at the high-AOD events L3 smooths out. The §5.2 evidence motivating per-region level preference is no longer exploited in the fusion weighting; whether the v3.2 separate-source approach would have outperformed v3.3's per-pixel merge on the held-out window is left as future work.
+18. **VIIRS overpass may contribute to two consecutive 30-min slots.** Because VIIRS granules are matched to any slot whose ±30-min window contains the granule's timestamp, a granule near a slot boundary (e.g., at 10:22 UTC) satisfies the window for both the 10:00 and 10:30 slots and its pixels are gridded into both. At most one or two slot pairs per day per sensor are affected, but the duplicated pixels introduce a mild positive temporal autocorrelation between consecutive slots near the overpass time. Eliminating this would require snapping each granule to its nearest slot, which would leave slot pairs near the boundary systematically thinner (fewer granules per slot); the current inclusive-window approach favours coverage over strict temporal independence.
 
 ---
 

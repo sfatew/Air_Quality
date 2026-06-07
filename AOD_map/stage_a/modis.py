@@ -198,7 +198,7 @@ def _read_modis_tile(
                     Pass ``None`` to include all orbits.
 
     Returns None if no valid pixels overlap the Vietnam domain.
-    Returns a dict with flat 1-D arrays: lat, lon, aod, ae, sza, vza, orbit_idx.
+    Returns a dict with flat 1-D arrays: lat, lon, aod, ae, sza, vza, orbit_idx, orbit_utc_sec.
     """
     try:
         aod_3d, _  = _load_sds(hdf_path, 'Optical_Depth_055')   # (n_orbits, H, W) or (H, W)
@@ -248,6 +248,8 @@ def _read_modis_tile(
     if not np.any(domain):
         return None
 
+    orbit_utc_list = _read_modis_orbit_times(hdf_path)
+
     parts: list[dict] = []
     _orb_iter = orbit_indices if orbit_indices is not None else range(n_orbits)
     for orb in _orb_iter:
@@ -262,6 +264,9 @@ def _read_modis_tile(
         sza_deg = np.degrees(np.arccos(np.clip(cos_sza, -1, 1)))
         vza_deg = np.degrees(np.arccos(np.clip(cos_vza, -1, 1)))
 
+        orb_t = orbit_utc_list[orb] if orb < len(orbit_utc_list) else None
+        orb_t_sec = orb_t.timestamp() if orb_t is not None else np.nan
+
         parts.append({
             'lat': lat[valid].ravel(),
             'lon': lon[valid].ravel(),
@@ -270,6 +275,7 @@ def _read_modis_tile(
             'sza': sza_deg[valid].ravel().astype(np.float32),
             'vza': vza_deg[valid].ravel().astype(np.float32),
             'orbit_idx': np.full(valid.sum(), orb, dtype=np.int8),
+            'orbit_utc_sec': np.full(valid.sum(), orb_t_sec, dtype=np.float64),
         })
 
     if not parts:
@@ -370,7 +376,7 @@ def read_modis_date(date: datetime) -> Optional[dict[str, np.ndarray]]:
     """Return valid MODIS MAIAC pixel arrays for all Vietnam tiles on a date.
 
     Returns a dict with flat 1-D arrays:
-        lat, lon, aod, ae, sza, vza, orbit_idx
+        lat, lon, aod, ae, sza, vza, orbit_idx, orbit_utc_sec
     or None if no valid data found.
     """
     files = _modis_files_for_date(date)
@@ -390,3 +396,32 @@ def read_modis_date(date: datetime) -> Optional[dict[str, np.ndarray]]:
     for key in parts[0]:
         combined[key] = np.concatenate([p[key] for p in parts])
     return combined
+
+
+def filter_modis_slot(
+    pixels: dict[str, np.ndarray],
+    slot_utc: datetime,
+    window_min: int = 30,
+) -> Optional[dict[str, np.ndarray]]:
+    """Return the subset of pixels whose orbit time falls within ±window_min of slot_utc.
+
+    Falls back to returning all pixels when orbit timestamps are unavailable
+    (NaN orbit_utc_sec for every pixel), preserving pre-fix behaviour for files
+    where Orbit_time_stamp is absent or unreadable.
+    Returns None when timestamps are available but no pixel falls in the window.
+    """
+    utc_sec = pixels.get('orbit_utc_sec')
+    if utc_sec is None:
+        return pixels
+
+    has_time = np.isfinite(utc_sec)
+    if not np.any(has_time):
+        return pixels  # no orbit info — include all pixels (fallback)
+
+    slot_sec = slot_utc.timestamp()
+    window_sec = window_min * 60.0
+    in_window = has_time & (np.abs(utc_sec - slot_sec) <= window_sec)
+    if not np.any(in_window):
+        return None
+
+    return {k: v[in_window] for k, v in pixels.items()}

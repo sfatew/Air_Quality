@@ -51,7 +51,7 @@ from config import (
 )
 from himawari        import read_l2_slot, read_l3_slot
 from viirs           import read_viirs_slot
-from modis           import read_modis_date
+from modis           import read_modis_date, filter_modis_slot
 from gridder         import bin_to_grid, grid_from_himawari
 from physics         import apply_physics_correction, close_era5
 from bias_correction import (
@@ -247,9 +247,14 @@ def _process_slot_with_modis_cache(
 
     if 'modis' in sensor_groups:
         if modis_pixels is not None:
-            g = bin_to_grid(modis_pixels['lat'], modis_pixels['lon'],
-                            modis_pixels['aod'], ae=modis_pixels.get('ae'))
-            raw_grids['modis_maiac'] = g['aod_mean']
+            slot_modis = filter_modis_slot(modis_pixels, slot_utc)
+            if slot_modis is not None:
+                g = bin_to_grid(slot_modis['lat'], slot_modis['lon'],
+                                slot_modis['aod'], vza=slot_modis.get('vza'),
+                                sza=slot_modis.get('sza'), ae=slot_modis.get('ae'))
+                raw_grids['modis_maiac'] = g['aod_mean']
+            else:
+                raw_grids['modis_maiac'] = None
         else:
             raw_grids['modis_maiac'] = None
 

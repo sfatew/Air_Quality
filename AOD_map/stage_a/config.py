@@ -124,8 +124,9 @@ LEO_WINDOW_MIN   = 30   # ±minutes window for Himawari L2 / VIIRS–AERONET co-
 MODIS_WINDOW_MIN = 30   # ±minutes window for per-orbit MODIS–AERONET co-location
 
 # ── CDF bias-correction parameters (Ahn et al. 2021) ─────────────────────────
-CDF_N_QUANTILES = 200   # quantile points used to build empirical CDF
-CDF_MIN_PAIRS   = 100   # minimum matched pairs to fit CDF; fall back to linear below
+CDF_N_QUANTILES   = 200  # quantile points used to build empirical CDF
+CDF_MIN_PAIRS     = 100  # minimum matched pairs to fit CDF; fall back to linear below
+CDF_MIN_PAIRS_NONE = 30  # below this threshold correction_type='none' (hard gate)
 
 # ── Collocation spatial sampling (Ichoku et al. 2002; Levy et al. 2010) ───────
 # Flag values written to the spatial_flag column of collocated CSVs

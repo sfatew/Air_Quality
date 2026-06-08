@@ -28,7 +28,6 @@ Output variable
 """
 
 import calendar
-import glob
 import os
 import tempfile
 import threading
@@ -36,14 +35,13 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cdsapi
-import numpy as np
 import pandas as pd
 import xarray as xr
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 BBOX         = [23.5, 102.0, 8.0, 110.0]   # [N, W, S, E] — CDS convention
-START        = (2026, 3)
-END          = (2026, 4)
+START        = (2022, 9)
+END          = (2025, 9)
 
 # How many months to download concurrently.
 # CDS fair-use limit is ~20 active jobs per user; 1 job per month → keep ≤16.
@@ -54,12 +52,18 @@ MAX_RETRIES  = 5      # max attempts per month
 RETRY_DELAY  = 120    # seconds before first retry (doubles each attempt)
 
 OUTPUT_DIR   = "/home/slow_data/Air_Quality/CAM"
-OUTPUT_FILE  = os.path.join(OUTPUT_DIR, "Vietnam_CAMS_AOD550_bbox.nc")
 MONTHLY_DIR  = os.path.join(OUTPUT_DIR, "_monthly_raw")
 
 # ── CDS request constants ─────────────────────────────────────────────────────
 CDS_DATASET   = "cams-global-reanalysis-eac4"
-CDS_VARIABLES = ["total_aerosol_optical_depth_550nm"]
+CDS_VARIABLES =  [
+        "black_carbon_aerosol_optical_depth_550nm",
+        "dust_aerosol_optical_depth_550nm",
+        "organic_matter_aerosol_optical_depth_550nm",
+        "sea_salt_aerosol_optical_depth_550nm",
+        "sulphate_aerosol_optical_depth_550nm",
+        "total_aerosol_optical_depth_550nm"
+    ]
 CDS_TIMES     = [f"{h:02d}:00" for h in (0, 3, 6, 9, 12, 15, 18, 21)]
 
 os.makedirs(OUTPUT_DIR,  exist_ok=True)
@@ -79,17 +83,15 @@ def iter_months(start: tuple[int, int], end: tuple[int, int]):
 # ── CDS download ───────────────────────────────────────────────────────────────
 def _build_request(year: int, month: int) -> dict:
     """Build the CDS API request body for a single month."""
-    n_days   = calendar.monthrange(year, month)[1]
-    all_days = [f"{d:02d}" for d in range(1, n_days + 1)]
+    n_days = calendar.monthrange(year, month)[1]
+    start  = f"{year}-{month:02d}-01"
+    end    = f"{year}-{month:02d}-{n_days:02d}"
     return {
         "variable":    CDS_VARIABLES,
-        "year":        str(year),
-        "month":       f"{month:02d}",
-        "day":         all_days,
+        "date":        f"{start}/{end}",   # new ADS API: single ISO date range
         "time":        CDS_TIMES,
         "area":        BBOX,
-        "data_format": "netcdf",   # explicit format avoids ambiguous server
-                                   # behaviour; new CDS API key is 'data_format'
+        "data_format": "netcdf_zip",
     }
 
 
@@ -143,6 +145,11 @@ def postprocess(ds: xr.Dataset) -> xr.Dataset:
     rename_map = {
         "aod550":   "AOD550",
         "taod550":  "AOD550",
+        "bcaod550": "BCAOD550",
+        "duaod550": "DUAOD550",
+        "omaod550": "OMAOD550",
+        "ssaod550": "SSAOD550",
+        "suaod550": "SUAOD550",
     }
     present = {k: v for k, v in rename_map.items() if k in ds}
     ds = ds.rename(present)
@@ -154,6 +161,11 @@ def postprocess(ds: xr.Dataset) -> xr.Dataset:
 
     cf_attrs = {
         "AOD550": ("total aerosol optical depth at 550 nm", "1"),
+        "BCAOD550": ("black carbon aerosol optical depth at 550 nm", "1"),
+        "DUAOD550": ("dust aerosol optical depth at 550 nm", "1"),
+        "OMAOD550": ("organic matter aerosol optical depth at 550 nm", "1"),
+        "SSAOD550": ("sea salt aerosol optical depth at 550 nm", "1"),
+        "SUAOD550": ("sulfate aerosol optical depth at 550 nm", "1"),
     }
     for var, (long_name, units) in cf_attrs.items():
         if var in ds:
@@ -258,7 +270,7 @@ def fetch_bbox() -> None:
                 failed.append((y, m))
 
     if failed:
-        print(f"\nWarning: {len(failed)} month(s) failed and will be missing from the merge:")
+        print(f"\nWarning: {len(failed)} month(s) failed:")
         for y, m in sorted(failed):
             print(f"  {y}-{m:02d}")
         log_path = os.path.join(OUTPUT_DIR, "failed_requests.log")
@@ -268,48 +280,7 @@ def fetch_bbox() -> None:
                 f.write(f"{y}-{m:02d}\n")
         print(f"Failed list written to: {log_path}")
 
-    # ── Merge monthly files ────────────────────────────────────────────────────
-    monthly_files = sorted(glob.glob(os.path.join(MONTHLY_DIR, "cams_??????.nc")))
-    if not monthly_files:
-        print("No monthly files found — nothing to merge.")
-        return
-
-    print(f"\nMerging {len(monthly_files)} monthly files → {OUTPUT_FILE}")
-    datasets = []
-    for fp in monthly_files:
-        ds = xr.open_dataset(fp, engine="netcdf4")
-        for drop_var in ("expver", "number"):
-            if drop_var in ds:
-                ds = ds.drop_vars(drop_var)
-        datasets.append(ds)
-    ds_all = xr.concat(datasets, dim="time")
-
-    last_day = calendar.monthrange(END[0], END[1])[1]
-    t_end    = pd.Timestamp(f"{END[0]}-{END[1]:02d}-{last_day:02d} 23:00")
-    ds_all   = ds_all.sel(time=slice(None, t_end))
-
-    rename_dims = {}
-    if "latitude"  not in ds_all.dims and "lat" in ds_all.dims:
-        rename_dims["lat"] = "latitude"
-    if "longitude" not in ds_all.dims and "lon" in ds_all.dims:
-        rename_dims["lon"] = "longitude"
-    if rename_dims:
-        ds_all = ds_all.rename(rename_dims)
-
-    ds_all.attrs = {
-        "title":           "Vietnam CAMS global reanalysis (EAC4) — AOD 550 nm",
-        "bounding_box":    f"N={BBOX[0]} W={BBOX[1]} S={BBOX[2]} E={BBOX[3]}",
-        "date_range":      f"{START[0]}-{START[1]:02d} to {END[0]}-{END[1]:02d}",
-        "source":          "CAMS global reanalysis EAC4 — Copernicus Atmosphere Data Store (CDS API)",
-        "dataset_id":      CDS_DATASET,
-        "timezone":        "UTC, tz-naive timestamps",
-        "temporal_resolution": "3-hourly (00, 03, 06, 09, 12, 15, 18, 21 UTC)",
-        "grid_resolution": "0.75 degrees",
-        "created_by":      "CAM/fetch_cams_bbox.py",
-    }
-
-    ds_all.to_netcdf(OUTPUT_FILE)
-    print(f"Done → {OUTPUT_FILE}")
+    print(f"\nDone → monthly files in {MONTHLY_DIR}")
 
 
 if __name__ == "__main__":

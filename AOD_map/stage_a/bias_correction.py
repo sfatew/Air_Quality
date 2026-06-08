@@ -35,14 +35,6 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator
 
 try:
-    import cupy as cp
-    cp.array([0])  # triggers CUDA init — raises if no GPU device
-    _xp = cp
-except Exception:
-    cp = None
-    _xp = np
-
-try:
     from tqdm import tqdm as _tqdm_cls
     _HAS_TQDM = True
 except ImportError:
@@ -306,7 +298,7 @@ class CDFCorrection:
 
 
 # ── Per-region spatial application ───────────────────────────────────────────
-# v3.2: dropped the IDW blend between NGHIA_DO and Bac_Lieu.  The two-anchor
+# dropped the IDW blend between NGHIA_DO and Bac_Lieu.  The two-anchor
 # transect averaged corrections trained on incompatible aerosol regimes for
 # central cells, with no third anchor to constrain the blend.  Central cells
 # now pass through; central Himawari bias is handled by the §7.4.2 LEO
@@ -322,7 +314,7 @@ def apply_correction_grid(
 ) -> np.ndarray:
     """Apply per-region bias correction to a 2-D AOD grid.
 
-    Strategy (v3.2 — no IDW blend):
+    Strategy (no IDW blend):
       • North cells (lat ≥ NORTH_CENTRAL_LAT) → apply the NGHIA_DO-trained
         correction for this stratum.
       • South cells (lat <  CENTRAL_SOUTH_LAT) → apply the Bac_Lieu-trained
@@ -544,7 +536,7 @@ def build_leo_himawari_offset(
     so no-data cells do not pollute their neighbours) and written as a NetCDF
     with one offset grid per season.
 
-    Prerequisite (v3.2): a Stage A run already exists for [start_d, end_d] so
+    Prerequisite: a Stage A run already exists for [start_d, end_d] so
     that MERGED_DIR contains `AOD_himawari` (the merged L3-preferred /
     L2-fallback grid produced after the bug-1/2 fixes) and at least one of
     `AOD_modis_maiac` / `AOD_viirs_*` per slot.  Rebuild after bugs 1-4 land
@@ -567,7 +559,7 @@ def build_leo_himawari_offset(
     from config import SENSOR_RMSE_FLOOR, MODIS_SOUTH_WEIGHT_FACTOR
     from fusion import load_rmse
 
-    # v3.2: a single Himawari level (L3-preferred, L2-fallback merged grid).
+    # a single Himawari level (L3-preferred, L2-fallback merged grid).
     levels   = ('himawari',)
     seasons  = ('dry', 'wet')
     leo_vars = ('AOD_modis_maiac', 'AOD_viirs_snpp', 'AOD_viirs_noaa20')
@@ -642,7 +634,7 @@ def build_leo_himawari_offset(
                     leo_mean = np.where(denom > 0, num / denom, np.nan)
 
                 for lv in levels:
-                    # 'himawari' → variable AOD_himawari (v3.2 single-level)
+                    # 'himawari' → variable AOD_himawari
                     var = 'AOD_himawari' if lv == 'himawari' else f'AOD_himawari_{lv}'
                     if var not in ds.variables:
                         continue
@@ -729,7 +721,7 @@ def load_leo_himawari_offset(
 ) -> Optional[dict[tuple[str, str], np.ndarray]]:
     """Return offsets dict keyed by (level, season).
 
-    v3.2: level is always 'himawari' (single L3-preferred-L2-fallback grid).
+    level is always 'himawari' (single L3-preferred-L2-fallback grid).
     Legacy v3.1 files with 'l2'/'l3' levels are still readable for
     inspection but apply_leo_himawari_offset only looks up 'himawari'.
     """

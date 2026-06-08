@@ -1,13 +1,21 @@
-"""Main Stage A pipeline driver: A1 → A2 → A3 → A4 → A5 per 30-min slot.
+"""Main Stage A pipeline driver: A3 → A4 → A5 per 30-min slot.
+
+A1 (read + QA) and A2 (bin to 0.05°) are now produced once by
+`run_collocate.py grid` and persisted to GRIDDED_DIR — this driver reads
+that intermediate instead of re-gridding from raw files, so binning runs
+exactly once per slot regardless of how many times the rest of the
+pipeline is re-run (e.g. before vs. after the LEO offset is built).
 
 For each calendar day the pipeline:
   1. Iterates over 48 UTC half-hour slots (00:00, 00:30, …, 23:30).
-  2. Reads and QA-filters all sensor sources for the slot (A1).
-  3. Grids VIIRS and MODIS to 0.05° (A2); Himawari is already gridded.
-  4. Applies physics normalization: AOD × (1−RH/100)^0.6 / PBLH (A3).
-  5. Applies pre-trained CDF bias corrections per (sensor, region, season) (A4).
-  6. Fuses the corrected grids with ICW weights (A5).
-  7. Writes one NetCDF file per slot to MERGED_DIR / YYYY / MM / DD.
+  2. Reads the pre-gridded per-sensor AOD from GRIDDED_DIR.
+  3. Applies physics normalization: AOD × (1−RH/100)^0.6 / PBLH (A3).
+  4. Applies pre-trained CDF bias corrections per (sensor, region, season) (A4).
+  5. Fuses the corrected grids with ICW weights (A5).
+  6. Writes one NetCDF file per slot to MERGED_DIR / YYYY / MM / DD.
+
+Prerequisite: `run_collocate.py grid --start … --end …` must have run
+for the same date range, populating GRIDDED_DIR.
 
 Usage
 -----
@@ -49,10 +57,7 @@ from config import (
     MERGED_DIR, BIASC_DIR,
     SLOT_MINUTES,
 )
-from himawari        import read_l2_slot, read_l3_slot
-from viirs           import read_viirs_slot
-from modis           import read_modis_date, filter_modis_slot
-from gridder         import bin_to_grid, grid_from_himawari
+from grid            import read_gridded_slot
 from physics         import apply_physics_correction, close_era5
 from bias_correction import (
     apply_correction_grid, load_all_corrections,
@@ -88,7 +93,6 @@ def _print_env_banner() -> None:
     # Key scientific libraries
     _libs = [
         ("numpy",    "NumPy"),
-        ("cupy",     "CuPy"),
         ("scipy",    "SciPy"),
         ("xarray",   "xarray"),
         ("netCDF4",  "netCDF4"),
@@ -98,28 +102,9 @@ def _print_env_banner() -> None:
     for mod_name, label in _libs:
         try:
             mod = __import__(mod_name)
-            ver = getattr(mod, "__version__", "?")
-            extra = ""
-            if mod_name == "cupy":
-                try:
-                    dev_id = mod.cuda.Device().id
-                    props  = mod.cuda.runtime.getDeviceProperties(dev_id)
-                    gpu_name = props["name"].decode() if isinstance(props["name"], bytes) else str(props["name"])
-                    extra = f"  ← GPU: {gpu_name}"
-                except Exception:
-                    extra = "  ← GPU: (unknown device)"
-            print(f"  {label:<12} {ver}{extra}")
+            print(f"  {label:<12} {getattr(mod, '__version__', '?')}")
         except ImportError:
-            note = "  ← falling back to NumPy (CPU)" if mod_name == "cupy" else ""
-            print(f"  {label:<12} not installed{note}")
-
-    # Active compute backend (shared across gridder / physics / fusion)
-    try:
-        import gridder
-        backend = "CuPy  (GPU-accelerated)" if gridder._xp.__name__ == "cupy" else "NumPy (CPU only)"
-    except Exception:
-        backend = "unknown"
-    print(f"  {'Backend':<12} {backend}")
+            print(f"  {label:<12} not installed")
 
     print("=" * W)
 
@@ -207,66 +192,33 @@ def _write_netcdf(
 
 # ── Per-slot processing ───────────────────────────────────────────────────────
 
-def _process_slot_with_modis_cache(
+def _process_slot(
     slot_utc: datetime,
     corrections: dict,
     rmse_dict: dict,
     lat_2d: np.ndarray,
     lon_2d: np.ndarray,
     sensor_groups: list[str],
-    modis_pixels: Optional[dict],
     use_physics: bool,
     dry_run: bool,
     leo_himawari_offset: Optional[dict] = None,
 ) -> Optional[Path]:
-    """Run Steps A1–A2–A3–A4–A5 for one slot using a pre-loaded MODIS pixel cache."""
+    """Run Steps A3–A4–A5 for one slot using the pre-gridded A2 intermediate."""
     month = slot_utc.month
-    raw_grids: dict[str, Optional[np.ndarray]] = {}
-    # Per-level raw Himawari grids are kept separately through bias correction
-    # so each level uses its own CDF.  They are merged into a single 'himawari'
-    # grid (L3 wins per pixel, L2 fills L3 gaps) immediately before fusion.
-    himawari_l2_raw: Optional[np.ndarray] = None
-    himawari_l3_raw: Optional[np.ndarray] = None
 
-    # ── Step A1 + A2: read and grid each sensor ────────────────────────────
-    if 'himawari' in sensor_groups:
-        l2 = read_l2_slot(slot_utc)
-        l3 = read_l3_slot(slot_utc)
-        himawari_l2_raw = grid_from_himawari(l2)['aod_mean'] if l2 is not None else None
-        himawari_l3_raw = grid_from_himawari(l3)['aod_mean'] if l3 is not None else None
-
-    if 'viirs' in sensor_groups:
-        for sensor in ('viirs_snpp', 'viirs_noaa20'):
-            px = read_viirs_slot(sensor, slot_utc)
-            if px is not None:
-                g = bin_to_grid(px['lat'], px['lon'], px['aod'],
-                                vza=px['vza'], sza=px['sza'])
-                raw_grids[sensor] = g['aod_mean']
-            else:
-                raw_grids[sensor] = None
-
-    if 'modis' in sensor_groups:
-        if modis_pixels is not None:
-            slot_modis = filter_modis_slot(modis_pixels, slot_utc)
-            if slot_modis is not None:
-                g = bin_to_grid(slot_modis['lat'], slot_modis['lon'],
-                                slot_modis['aod'], vza=slot_modis.get('vza'),
-                                sza=slot_modis.get('sza'), ae=slot_modis.get('ae'))
-                raw_grids['modis_maiac'] = g['aod_mean']
-            else:
-                raw_grids['modis_maiac'] = None
-        else:
-            raw_grids['modis_maiac'] = None
-
-    has_any_himawari = any(
-        v is not None and np.any(np.isfinite(v))
-        for v in (himawari_l2_raw, himawari_l3_raw)
-    )
-    has_any = has_any_himawari or any(
-        v is not None and np.any(np.isfinite(v)) for v in raw_grids.values()
-    )
-    if not has_any:
+    # ── Step A1+A2 result: load pre-gridded per-sensor AOD ─────────────────
+    wanted_keys = tuple(k for grp in sensor_groups for k in _SENSOR_KEYS.get(grp, []))
+    grids = read_gridded_slot(slot_utc, sensors=wanted_keys)
+    if grids is None:
         return None
+
+    himawari_l2_raw = grids.get('himawari_l2', {}).get('aod_mean')
+    himawari_l3_raw = grids.get('himawari_l3', {}).get('aod_mean')
+    raw_grids: dict[str, Optional[np.ndarray]] = {}
+    for sensor in ('viirs_snpp', 'viirs_noaa20', 'modis_maiac'):
+        g = grids.get(sensor)
+        raw_grids[sensor] = g['aod_mean'] if g is not None else None
+
     if dry_run:
         return Path('dry_run')
 
@@ -303,7 +255,7 @@ def _process_slot_with_modis_cache(
         himawari_corrected = None
 
     # Step A4b: LEO–Himawari spatial offset (thesis §7.4.2) applied to the
-    # merged Himawari grid (was per-level pre-v3.2 — one offset for the
+    # merged Himawari grid (was per-level — one offset for the
     # downstream sensor.)
     if himawari_corrected is not None and leo_himawari_offset is not None:
         himawari_corrected = apply_leo_himawari_offset(
@@ -375,11 +327,6 @@ def run_day(
     errors  = 0
     skipped = 0
 
-    # Load MODIS once per day (expensive HDF reads)
-    modis_cache: Optional[dict] = None
-    if 'modis' in sensor_groups:
-        modis_cache = read_modis_date(datetime(day.year, day.month, day.day))
-
     slot_range = range(SLOTS_PER_DAY)
     if show_slot_bar and _HAS_TQDM:
         slot_iter = _tqdm(
@@ -397,9 +344,9 @@ def run_day(
         slot_utc = (datetime(day.year, day.month, day.day)
                     + timedelta(minutes=slot_idx * SLOT_MINUTES))
         try:
-            out = _process_slot_with_modis_cache(
+            out = _process_slot(
                 slot_utc, corrections, rmse_dict, lat_2d, lon_2d,
-                sensor_groups, modis_cache, use_physics, dry_run,
+                sensor_groups, use_physics, dry_run,
                 leo_himawari_offset,
             )
             if out is not None:

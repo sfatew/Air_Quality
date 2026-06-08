@@ -150,20 +150,12 @@ BOX_STD_SLOPE = {
     'modis_maiac':  0.10,
 }
 
-# Himawari and MODIS MAIAC are on fixed grids; neighbourhoods use cell-index half-widths
-# (half_width 0 = exact cell, 1 = 3×3 box, 2 = 5×5 box).
-
-# VIIRS uses raw swath data → distance-based neighbourhood using aggregated pixel size
-VIIRS_PIXEL_KM     = 6.0               # aggregated L2 pixel at nadir (~6 km × 6 km)
-VIIRS_EXACT_MAX_KM = VIIRS_PIXEL_KM / 2        #  3.0 km — exact pixel
-VIIRS_3X3_MAX_KM   = VIIRS_PIXEL_KM * 1.5      #  9.0 km — 3×3 VIIRS cells
-VIIRS_5X5_MAX_KM   = VIIRS_PIXEL_KM * 2.5      # 15.0 km — 5×5 VIIRS cells
-
-# MODIS MAIAC is on a 1 km sinusoidal grid; distance thresholds ≡ ±N cells
-MODIS_PIXEL_KM     = 1.0               # MAIAC native 1 km pixel
-MODIS_EXACT_MAX_KM = MODIS_PIXEL_KM / 2        # 0.5 km — exact 1 km cell
-MODIS_3X3_MAX_KM   = MODIS_PIXEL_KM * 1.5      # 1.5 km — ±1 cell (3×3)
-MODIS_5X5_MAX_KM   = MODIS_PIXEL_KM * 2.5      # 2.5 km — ±2 cells (5×5)
+# All sensors share a single neighbourhood scale: the 0.05° config grid.
+# Half-widths used by extract_satellite._sample_cell are 0/1/2 cells (1×1, 3×3,
+# 5×5), matched to the spatial_flag values above.  The old native-pixel km
+# thresholds (VIIRS_*_KM, MODIS_*_KM) were removed when extraction switched
+# from native-pixel sampling to gridded-cell sampling so train and apply
+# operate at the same scale.
 
 # ── Data paths ────────────────────────────────────────────────────────────────
 DATA_ROOT        = Path('/home/slow_data/Air_Quality')
@@ -172,7 +164,7 @@ HIMAWARI_L3_DIR  = DATA_ROOT / 'Himawari' / 'L3_AOD'
 VIIRS_SNPP_DIR   = DATA_ROOT / 'VIIRS' / 'L2' / 'AERDB_L2_VIIRS_SNPP'
 VIIRS_N20_DIR    = DATA_ROOT / 'VIIRS' / 'L2' / 'AERDB_L2_VIIRS_NOAA20'
 MODIS_DIR        = DATA_ROOT / 'MODIS_MCD19A2' / 'raw'
-AERONET_DIR      = DATA_ROOT / 'AERONET' / '10'
+AERONET_DIR      = DATA_ROOT / 'AERONET' / 'raw' / '10'
 ERA5_MONTHLY_DIR = DATA_ROOT / 'ERA5' / '_monthly_raw'
 
 OUTPUT_DIR       = DATA_ROOT / 'Stage_A'

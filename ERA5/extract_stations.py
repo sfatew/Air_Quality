@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Extract ERA5 per-station time series from the merged NetCDF produced by
-fetch_era5_bbox.py.
+"""Extract ERA5 per-station time series from the per-month post-processed
+NetCDFs produced by fetch_era5_bbox.py (the `_monthly_raw/era5_YYYYMM.nc`
+files — already unit-converted with RH/WS10m/WD10m derived).
 
-Input:
-    /home/slow_data/Air_Quality/ERA5/Vietnam_ERA5_bbox.nc
-    (already post-processed: unit conversions and RH/WS10m/WD10m derived)
+Each monthly file is opened sequentially; per-station chunks are concatenated
+in memory and written once at the end as a single CSV per station.
 
 Output: one CSV per station at OUTPUT_DIR/<station_name>.csv with columns
     timestamp, station_name, latitude, longitude, T2m, Td2m, RH, Psfc, MSLP,
@@ -32,8 +32,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_STATION_CSV = Path(
     "/home/work1/projects/Air_Quality/Masterdata/envisoft_station_map.csv"
 )
-DEFAULT_OUTPUT_DIR = Path("/home/slow_data/Air_Quality/ERA5/stations")
-DEFAULT_ERA5_NC    = Path("/home/slow_data/Air_Quality/ERA5/Vietnam_ERA5_bbox.nc")
+DEFAULT_OUTPUT_DIR    = Path("/home/slow_data/Air_Quality/ERA5/stations")
+DEFAULT_MONTHLY_DIR   = Path("/home/slow_data/Air_Quality/ERA5/_monthly_raw")
+MONTHLY_GLOB          = "era5_??????.nc"
 
 EXTRA_STATIONS = {
     "NGHIA_DO": {"lat": 21.048, "lon": 105.800, "city": "Hà Nội"},
@@ -95,21 +96,13 @@ def derive_100m_wind(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-def extract_all_stations(ds: xr.Dataset, stations: dict) -> dict[str, pd.DataFrame]:
+def extract_all_stations(ds: xr.Dataset, stations: dict,
+                         names: list[str],
+                         lat_da: xr.DataArray,
+                         lon_da: xr.DataArray) -> dict[str, pd.DataFrame]:
     """Vectorized nearest-pixel extraction for ALL stations at once.
-    Returns {station_name: DataFrame}."""
-    names = list(stations.keys())
-    lats  = np.array([stations[n]["lat"] for n in names], dtype=np.float64)
-    lons  = np.array([stations[n]["lon"] for n in names], dtype=np.float64)
-
-    lat_da = xr.DataArray(lats, dims="station", coords={"station": names})
-    lon_da = xr.DataArray(lons, dims="station", coords={"station": names})
-
-    pt = ds.sel(latitude=lat_da, longitude=lon_da, method="nearest")
-
-    # Materialise once (triggers the dask read); much faster than per-station
-    logger.info("Loading point data into memory …")
-    pt = pt.load()
+    Returns {station_name: DataFrame} for a single monthly dataset."""
+    pt = ds.sel(latitude=lat_da, longitude=lon_da, method="nearest").load()
 
     df = pt.to_dataframe().reset_index()
     df = df.rename(columns={"time": "timestamp", "station": "station_name"})
@@ -123,36 +116,50 @@ def extract_all_stations(ds: xr.Dataset, stations: dict) -> dict[str, pd.DataFra
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
-def run(era5_nc: Path, output_dir: Path, station_csv: Path,
+def run(monthly_dir: Path, output_dir: Path, station_csv: Path,
         include_extra: bool = True):
     stations = load_stations(station_csv, include_extra=include_extra)
     logger.info(f"Loaded {len(stations)} stations")
 
-    if not era5_nc.exists():
-        raise SystemExit(f"ERA5 file not found: {era5_nc}")
+    if not monthly_dir.is_dir():
+        raise SystemExit(f"Monthly ERA5 directory not found: {monthly_dir}")
+
+    monthly_files = sorted(monthly_dir.glob(MONTHLY_GLOB))
+    if not monthly_files:
+        raise SystemExit(f"No monthly files matching {MONTHLY_GLOB} in {monthly_dir}")
+    logger.info(f"Found {len(monthly_files)} monthly files "
+                f"({monthly_files[0].name} → {monthly_files[-1].name})")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Opening {era5_nc} (chunked) …")
-    ds = xr.open_dataset(era5_nc, engine="netcdf4", chunks={"time": 24 * 30})
-    logger.info(f"  time: {ds.sizes['time']} steps "
-                f"({ds.time.values[0]} → {ds.time.values[-1]})")
-    logger.info(f"  grid: {ds.sizes['latitude']} lat × {ds.sizes['longitude']} lon")
-    logger.info(f"  vars: {sorted(ds.data_vars)}")
+    # Build the station selector once — reused for every monthly file.
+    names = list(stations.keys())
+    lats  = np.array([stations[n]["lat"] for n in names], dtype=np.float64)
+    lons  = np.array([stations[n]["lon"] for n in names], dtype=np.float64)
+    lat_da = xr.DataArray(lats, dims="station", coords={"station": names})
+    lon_da = xr.DataArray(lons, dims="station", coords={"station": names})
 
-    ds = derive_100m_wind(ds)
+    per_station_chunks: dict[str, list[pd.DataFrame]] = {n: [] for n in names}
 
-    try:
-        per_station = extract_all_stations(ds, stations)
-    finally:
-        ds.close()
+    for i, nc_path in enumerate(monthly_files, 1):
+        logger.info(f"[{i:>3}/{len(monthly_files)}] Reading {nc_path.name} …")
+        with xr.open_dataset(nc_path, engine="netcdf4") as ds:
+            ds = derive_100m_wind(ds)
+            chunks = extract_all_stations(ds, stations, names, lat_da, lon_da)
+        for name, sub in chunks.items():
+            if not sub.empty:
+                per_station_chunks[name].append(sub)
 
     n_ok = 0
-    for name in stations:
-        df = per_station.get(name)
-        if df is None or df.empty:
+    for name in names:
+        parts = per_station_chunks[name]
+        if not parts:
             logger.warning(f"No data for station {name}")
             continue
+        df = (pd.concat(parts, ignore_index=True)
+                .drop_duplicates(subset=["timestamp"])
+                .sort_values("timestamp")
+                .reset_index(drop=True))
         out_path = output_dir / f"{safe_filename(name)}.csv"
         df.to_csv(out_path, index=False, float_format="%.4f")
         n_ok += 1
@@ -165,8 +172,9 @@ def run(era5_nc: Path, output_dir: Path, station_csv: Path,
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--era5-nc", type=Path, default=DEFAULT_ERA5_NC,
-                   help="Merged ERA5 NetCDF produced by fetch_era5_bbox.py")
+    p.add_argument("--monthly-dir", type=Path, default=DEFAULT_MONTHLY_DIR,
+                   help="Directory of per-month ERA5 NetCDFs "
+                        "(era5_YYYYMM.nc) produced by fetch_era5_bbox.py")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--station-csv", type=Path, default=DEFAULT_STATION_CSV)
     p.add_argument("--no-extra", action="store_true",
@@ -176,5 +184,5 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    run(args.era5_nc, args.output_dir, args.station_csv,
+    run(args.monthly_dir, args.output_dir, args.station_csv,
         include_extra=not args.no_extra)

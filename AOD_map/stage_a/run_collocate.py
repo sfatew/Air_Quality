@@ -1,8 +1,18 @@
-"""CLI driver: extract satellite AOD at AERONET stations, match pairs, train corrections.
+"""CLI driver: produce Stage A2 gridded slots, extract pairs, train corrections.
+
+Stage A2 (`grid`) writes one NetCDF per 30-min slot containing the raw
+0.05° gridded AOD for every sensor, before any bias correction.  Both
+`extract_satellite.py` (training pair extraction) and `run_stage_a.py`
+(production) consume this intermediate instead of re-gridding from raw
+files, so binning runs exactly once per slot per dataset.
 
 Usage
 -----
-# Extract satellite time series only (fast to re-run match later)
+# Stage A2 — grid raw satellite slots (required before extract / run_stage_a)
+python run_collocate.py grid --start 2022-09-01 --end 2024-12-31
+python run_collocate.py grid --start 2022-09-01 --end 2024-12-31 --workers 4
+
+# Extract satellite time series at stations from the gridded slots
 python run_collocate.py extract --start 2022-09-01 --end 2024-12-31
 
 # Match existing raw CSVs with AERONET (no satellite file I/O)
@@ -18,7 +28,7 @@ python run_collocate.py train
 # Requires a prior Stage A run for [start, end] with Bug 1 fixed.
 python run_collocate.py leo_offset --start 2022-09-01 --end 2024-12-31
 
-# Full pipeline: extract + match + train
+# Full pipeline: grid + extract + match + train
 python run_collocate.py all --start 2022-09-01 --end 2024-12-31
 
 # Single site (for debugging)
@@ -27,9 +37,12 @@ python run_collocate.py collocate --site NGHIA_DO --start 2023-01-01 --end 2023-
 
 from __future__ import annotations
 import argparse
+import concurrent.futures
+import multiprocessing as mp
 import sys
 import time
-from datetime import date
+import traceback
+from datetime import date, timedelta
 from pathlib import Path
 
 try:
@@ -49,7 +62,7 @@ def _make_bar(iterable, **kwargs):
 import numpy as np
 
 from config import (
-    AERONET_SITES, EXTRACT_DIR, COLLOCATE_DIR, BIASC_DIR,
+    AERONET_SITES, EXTRACT_DIR, COLLOCATE_DIR, BIASC_DIR, GRIDDED_DIR,
     LEO_HIMAWARI_OFFSET_FILE, LEO_HIMAWARI_MIN_PAIRS, LEO_HIMAWARI_SMOOTH_SIGMA,
     SENSOR_RMSE_EE_OFFSET, SENSOR_RMSE_EE_SLOPE, SENSOR_RMSE_EE_REFAOD,
 )
@@ -57,9 +70,11 @@ from extract_satellite import extract_site
 from collocate import match_site, collocate_site
 from bias_correction import train_all_corrections, build_leo_himawari_offset
 from fusion import save_rmse
+from grid import grid_day, ALL_SENSORS as _ALL_GRID_SENSORS
 
 _ALL_SENSORS = ('himawari_l2', 'himawari_l3', 'viirs_snpp', 'viirs_noaa20', 'modis_maiac')
 _ALL_SITES   = list(AERONET_SITES.keys())
+_GRID_SLOTS_PER_DAY = 48
 
 
 # ── Environment banner ────────────────────────────────────────────────────────
@@ -92,6 +107,89 @@ def _fmt_duration(seconds: float) -> str:
 
 
 # ── Sub-commands ──────────────────────────────────────────────────────────────
+
+def _enumerate_days(start: date, end: date) -> list[date]:
+    days: list[date] = []
+    d = start
+    while d <= end:
+        days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def cmd_grid(args: argparse.Namespace) -> None:
+    """Stage A2 — write raw per-sensor 0.05° gridded NetCDFs to GRIDDED_DIR."""
+    start   = date.fromisoformat(args.start)
+    end     = date.fromisoformat(args.end)
+    sensors = tuple(args.sensors) if args.sensors else _ALL_GRID_SENSORS
+
+    days = _enumerate_days(start, end)
+
+    print(f'\nStage A2 grid  sensors={list(sensors)}  {start} → {end}')
+    print(f'  Output    : {GRIDDED_DIR}')
+    print(f'  Days      : {len(days)}  ({len(days) * _GRID_SLOTS_PER_DAY} slots)')
+    print(f'  Workers   : {args.workers}')
+    print(f'  Overwrite : {args.overwrite}')
+
+    wall_t0 = time.perf_counter()
+    total_written = 0
+    total_errors  = 0
+
+    if args.workers > 1:
+        # 'spawn' (not the Linux default 'fork') so each worker starts with a
+        # clean HDF5/netCDF4 state — fork-after-import of these libraries
+        # corrupts HDF5 globals and silently kills workers on heavy IO.
+        _mp_ctx = mp.get_context('spawn')
+        day_bar = _make_bar(range(len(days)), desc='Days', unit='day', ncols=80)
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.workers, mp_context=_mp_ctx,
+        ) as ex:
+            futures = {
+                ex.submit(grid_day, day, sensors, GRIDDED_DIR,
+                          args.overwrite, False): day
+                for day in days
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                day = futures[fut]
+                try:
+                    n_ok, n_err = fut.result()
+                    total_written += n_ok
+                    total_errors  += n_err
+                    msg = f'  {day}: {n_ok} new slot(s)' + (f', {n_err} error(s)' if n_err else '')
+                except Exception:
+                    msg = f'  {day}: FAILED\n{traceback.format_exc()}'
+                if day_bar is not None:
+                    day_bar.write(msg)   # type: ignore[union-attr]
+                    day_bar.update(1)    # type: ignore[union-attr]
+                else:
+                    print(msg)
+        if day_bar is not None:
+            day_bar.close()
+    else:
+        day_bar = _make_bar(days, desc='Days', unit='day', ncols=80)
+        day_iter = day_bar if day_bar is not None else days
+        for day in day_iter:
+            t0 = time.perf_counter()
+            n_ok, n_err = grid_day(
+                day, sensors=sensors, base=GRIDDED_DIR,
+                overwrite=args.overwrite, show_slot_bar=True,
+            )
+            total_written += n_ok
+            total_errors  += n_err
+            summary = (f'  {day}: {n_ok} new slot(s)'
+                       + (f', {n_err} error(s)' if n_err else '')
+                       + f'  [{_fmt_duration(time.perf_counter() - t0)}]')
+            if day_bar is not None:
+                day_bar.write(summary)   # type: ignore[union-attr]
+            else:
+                print(summary)
+        if day_bar is not None:
+            day_bar.close()
+
+    print(f'\nStage A2 grid complete.  {total_written} slot(s) written'
+          + (f', {total_errors} error(s)' if total_errors else '')
+          + f'  [total: {_fmt_duration(time.perf_counter() - wall_t0)}]')
+
 
 def cmd_extract(args: argparse.Namespace) -> None:
     """Read satellite files and write raw time-series CSVs to EXTRACT_DIR."""
@@ -258,6 +356,19 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest='command')
 
+    # grid (Stage A2)
+    p_grid = sub.add_parser(
+        'grid',
+        help='Stage A2 — produce raw per-sensor gridded NetCDFs in GRIDDED_DIR',
+    )
+    _add_date_args(p_grid)
+    p_grid.add_argument('--sensors',   nargs='+',
+                        help='Sensor(s) to grid (default: all)')
+    p_grid.add_argument('--workers',   type=int, default=1,
+                        help='Parallel worker processes (default: 1)')
+    p_grid.add_argument('--overwrite', action='store_true',
+                        help='Re-grid slots whose NetCDF already exists')
+
     # extract
     p_ext = sub.add_parser('extract', help='Extract satellite AOD time series at stations')
     _add_date_args(p_ext)
@@ -291,15 +402,21 @@ def main() -> None:
                        dest='smooth_sigma',
                        help=f'Gaussian sigma in grid-cells (default: {LEO_HIMAWARI_SMOOTH_SIGMA})')
 
-    # all (extract + match + train)
-    p_all = sub.add_parser('all', help='Full pipeline: extract + match + train')
+    # all (grid + extract + match + train)
+    p_all = sub.add_parser('all', help='Full pipeline: grid + extract + match + train')
     _add_date_args(p_all)
     _add_site_sensor_args(p_all)
+    p_all.add_argument('--workers',   type=int, default=1,
+                       help='Parallel workers for the grid step (default: 1)')
+    p_all.add_argument('--overwrite', action='store_true',
+                       help='Re-grid slots whose NetCDF already exists')
 
     args = parser.parse_args()
     _print_env_banner()
 
-    if args.command == 'extract':
+    if args.command == 'grid':
+        cmd_grid(args)
+    elif args.command == 'extract':
         cmd_extract(args)
     elif args.command == 'match':
         cmd_match(args)
@@ -310,6 +427,7 @@ def main() -> None:
     elif args.command == 'leo_offset':
         cmd_leo_offset(args)
     elif args.command == 'all':
+        cmd_grid(args)
         cmd_collocate(args)
         cmd_train(args)
     else:

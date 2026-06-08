@@ -30,14 +30,6 @@ from pathlib import Path
 
 import numpy as np
 
-try:
-    import cupy as cp
-    cp.array([0])  # triggers CUDA init — raises if no GPU device
-    _xp = cp
-except Exception:
-    cp = None
-    _xp = np
-
 from config import (
     SENSOR_RMSE_PRIOR,
     MODIS_SOUTH_WEIGHT_FACTOR,
@@ -49,7 +41,7 @@ from config import (
 )
 
 # Integer codes for dominant_sensor output variable.
-# v3.2: a single 'himawari' contribution (L3-preferred, L2-fallback) replaces
+# a single 'himawari' contribution (L3-preferred, L2-fallback) replaces
 # the separate L2/L3 sensors so ICW weights don't double-count Himawari.
 SENSOR_CODES = {
     'himawari':    1,
@@ -154,21 +146,19 @@ def fuse(
     if rmse_dict is None:
         rmse_dict = load_rmse()
 
-    xp     = _xp
     season = 'dry' if month in DRY_MONTHS else 'wet'
     shape  = (NLAT, NLON)
 
-    # Region codes on GPU: 0=south, 1=central, 2=north (avoids string arrays)
+    # Region codes: 0=south, 1=central, 2=north (avoids string arrays).
     region_code = np.where(lat_2d >= NORTH_CENTRAL_LAT, 2,
                            np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1)).astype(np.int8)
-    region_code_d = xp.asarray(region_code)
 
-    weighted_sum_d  = xp.zeros(shape, dtype=np.float64)
-    weight_total_d  = xp.zeros(shape, dtype=np.float64)
-    weighted_sq_d   = xp.zeros(shape, dtype=np.float64)
-    dominant_wt_d   = xp.zeros(shape, dtype=np.float64)
-    dominant_code_d = xp.zeros(shape, dtype=np.int8)
-    n_sensors_d     = xp.zeros(shape, dtype=np.int8)
+    weighted_sum   = np.zeros(shape, dtype=np.float64)
+    weight_total   = np.zeros(shape, dtype=np.float64)
+    weighted_sq    = np.zeros(shape, dtype=np.float64)
+    dominant_wt    = np.zeros(shape, dtype=np.float64)
+    dominant_code  = np.zeros(shape, dtype=np.int8)
+    n_sensors      = np.zeros(shape, dtype=np.int8)
     sensor_has_data: dict[str, np.ndarray] = {}
 
     _reg_codes = ((0, 'south'), (1, 'central'), (2, 'north'))
@@ -181,9 +171,8 @@ def fuse(
         if not np.any(has):
             continue
 
-        # Build per-cell RMSE on GPU using integer region codes.
-        # Look up season-specific key first, fall back to region-only, then 'north'.
-        rmse_arr_d = xp.full(shape, np.nan, dtype=np.float64)
+        # Per-cell RMSE: season-specific key first, fall back to region-only, then 'north'.
+        rmse_arr = np.full(shape, np.nan, dtype=np.float64)
         for code, reg in _reg_codes:
             rmse_val = rmse_dict.get(
                 (sensor, reg, season),
@@ -192,55 +181,49 @@ def fuse(
             )
             if not np.isnan(rmse_val):
                 rmse_val = max(float(rmse_val), SENSOR_RMSE_FLOOR)
-            rmse_arr_d[region_code_d == code] = rmse_val
+            rmse_arr[region_code == code] = rmse_val
 
         # ICW weight = 1 / RMSE²; apply per-sensor down-weight factors
-        w_d = xp.where(xp.isfinite(rmse_arr_d) & (rmse_arr_d > 0),
-                       1.0 / rmse_arr_d ** 2, 0.0)
+        w = np.where(np.isfinite(rmse_arr) & (rmse_arr > 0),
+                     1.0 / rmse_arr ** 2, 0.0)
         if sensor == 'modis_maiac':
-            w_d = xp.where(region_code_d == 0, w_d * MODIS_SOUTH_WEIGHT_FACTOR, w_d)
-        # Wet-season Himawari down-weight (v3.2): suppress cloud-edge bias
+            w = np.where(region_code == 0, w * MODIS_SOUTH_WEIGHT_FACTOR, w)
+        # Wet-season Himawari down-weight: suppress cloud-edge bias
         # without the v3.1 tight-QA filter that stripped 70% of monsoon
         # retrievals.
         if sensor == 'himawari' and month in WET_MONTHS:
-            w_d = w_d * HIMAWARI_WET_WEIGHT_FACTOR
+            w = w * HIMAWARI_WET_WEIGHT_FACTOR
 
-        aod_d     = xp.asarray(aod)
-        has_d     = xp.asarray(has)
-        valid_w_d = has_d & (w_d > 0)
-        s_code    = SENSOR_CODES.get(sensor, 0)
+        valid_w = has & (w > 0)
+        s_code  = SENSOR_CODES.get(sensor, 0)
 
-        weighted_sum_d[valid_w_d]  += w_d[valid_w_d] * aod_d[valid_w_d]
-        weight_total_d[valid_w_d]  += w_d[valid_w_d]
-        weighted_sq_d[valid_w_d]   += w_d[valid_w_d] * aod_d[valid_w_d] ** 2
-        n_sensors_d[valid_w_d]     += 1
+        weighted_sum[valid_w] += w[valid_w] * aod[valid_w]
+        weight_total[valid_w] += w[valid_w]
+        weighted_sq[valid_w]  += w[valid_w] * aod[valid_w] ** 2
+        n_sensors[valid_w]    += 1
 
-        update_d = valid_w_d & (w_d > dominant_wt_d)
-        dominant_wt_d[update_d]   = w_d[update_d]
-        dominant_code_d[update_d] = s_code
+        update = valid_w & (w > dominant_wt)
+        dominant_wt[update]   = w[update]
+        dominant_code[update] = s_code
 
-    has_any_d = weight_total_d > 0
-    safe_w_d  = xp.where(has_any_d, weight_total_d, 1.0)
-    aod_merged = np.asarray(
-        xp.where(has_any_d, weighted_sum_d / safe_w_d, np.nan).astype(np.float32)
-    )
+    has_any = weight_total > 0
+    safe_w  = np.where(has_any, weight_total, 1.0)
+    aod_merged = np.where(has_any, weighted_sum / safe_w, np.nan).astype(np.float32)
 
-    variance_d = xp.where(
-        has_any_d & (n_sensors_d > 1),
-        weighted_sq_d / safe_w_d - (weighted_sum_d / safe_w_d) ** 2,
+    variance = np.where(
+        has_any & (n_sensors > 1),
+        weighted_sq / safe_w - (weighted_sum / safe_w) ** 2,
         np.nan,
     )
-    variance_d = xp.clip(variance_d, 0, None)
-    aod_std = np.asarray(
-        xp.where(xp.isfinite(variance_d), xp.sqrt(variance_d), np.nan).astype(np.float32)
-    )
+    variance = np.clip(variance, 0, None)
+    aod_std  = np.where(np.isfinite(variance), np.sqrt(variance), np.nan).astype(np.float32)
 
     conf_flag = _assign_confidence(sensor_has_data)
 
     return {
         'aod_merged':      aod_merged,
         'aod_std':         aod_std,
-        'n_sensors':       np.asarray(n_sensors_d),
-        'dominant_sensor': np.asarray(dominant_code_d),
+        'n_sensors':       n_sensors,
+        'dominant_sensor': dominant_code,
         'confidence_flag': conf_flag,
     }

@@ -68,7 +68,7 @@ EE_OFFSET   = 0.05
 EE_SLOPE    = 0.15
 
 # Nguyen 2025 inter-sensor R² baselines (MODIS–Himawari, per region).
-# v3.2: a single 'AOD_himawari' grid replaces the separate L2/L3 grids,
+# a single 'AOD_himawari' grid replaces the separate L2/L3 grids,
 # so the baseline key is keyed by 'himawari'.
 NGUYEN2025_R2_BASELINES = {
     ('modis_maiac', 'himawari', 'north'):   0.621,
@@ -310,7 +310,7 @@ def inter_sensor_consistency(
 ) -> pd.DataFrame:
     """§8.2: Inter-sensor R² by region using daily means at Envisoft station pixels.
 
-    Methodology (v3.2 — aligned with EDA Regional Comparison and Nguyen 2025):
+    Methodology (aligned with EDA Regional Comparison and Nguyen 2025):
       1. Extract each sensor's AOD at every Envisoft station pixel, every slot.
       2. Aggregate to daily means per (station, date, sensor).
       3. For each (sensor_a, sensor_b, region), regress all (station, date)
@@ -563,24 +563,23 @@ def ransac_diagnostic(pairs: pd.DataFrame) -> pd.DataFrame:
     Quantifies outlier influence — the merged product is NOT filtered,
     this is a diagnostic only.
 
-    Returns one row per site with OLS R², RANSAC R², inlier fraction.
+    Stratification (one row per stratum):
+      • site   ∈ AERONET_SITES ∪ {ALL}
+      • region ∈ {north, central, south, ALL}
+      • season ∈ {dry, wet, ALL}
+    The 'ALL' label means the stratum aggregates that axis.
     """
-    rows = []
-    for site in (list(AERONET_SITES.keys()) + ['ALL']):
-        sub = pairs if site == 'ALL' else pairs[pairs['site'] == site]
+    def _fit(sub: pd.DataFrame, label: dict) -> Optional[dict]:
         sat = sub['merged_aod'].values.reshape(-1, 1)
         aer = sub['aeronet_aod'].values
-
         mask = np.isfinite(sat.ravel()) & np.isfinite(aer)
-        sat  = sat[mask];  aer  = aer[mask]
+        sat  = sat[mask];  aer = aer[mask]
         if len(sat) < 10:
-            continue
+            return None
 
-        # OLS
-        ols     = LinearRegression().fit(sat, aer)
-        ols_r2  = float(ols.score(sat, aer))
+        ols    = LinearRegression().fit(sat, aer)
+        ols_r2 = float(ols.score(sat, aer))
 
-        # RANSAC
         try:
             ransac      = RANSACRegressor(min_samples=0.5, random_state=42)
             ransac.fit(sat, aer)
@@ -595,16 +594,43 @@ def ransac_diagnostic(pairs: pd.DataFrame) -> pd.DataFrame:
             slope       = np.nan
             intercept   = np.nan
 
-        rows.append({
-            'site':         site,
-            'N':            len(sat),
-            'OLS_R2':       ols_r2,
-            'RANSAC_R2':    ransac_r2,
-            'RANSAC_R2_lift': float(ransac_r2 - ols_r2) if not np.isnan(ransac_r2) else np.nan,
-            'inlier_frac':  inlier_frac,
-            'ransac_slope': slope,
+        out = {
+            'N':                len(sat),
+            'OLS_R2':           ols_r2,
+            'RANSAC_R2':        ransac_r2,
+            'RANSAC_R2_lift':   float(ransac_r2 - ols_r2) if not np.isnan(ransac_r2) else np.nan,
+            'inlier_frac':      inlier_frac,
+            'ransac_slope':     slope,
             'ransac_intercept': intercept,
-        })
+        }
+        out.update(label)
+        return out
+
+    rows: list[dict] = []
+
+    # Per site (incl. ALL)
+    for site in (list(AERONET_SITES.keys()) + ['ALL']):
+        sub = pairs if site == 'ALL' else pairs[pairs['site'] == site]
+        r = _fit(sub, {'site': site, 'region': 'ALL', 'season': 'ALL'})
+        if r: rows.append(r)
+
+    # Per site × season
+    if 'season' in pairs.columns:
+        for (site, season), sub in pairs.groupby(['site', 'season']):
+            r = _fit(sub, {'site': str(site), 'region': 'ALL', 'season': str(season)})
+            if r: rows.append(r)
+
+    # Per region
+    if 'region' in pairs.columns:
+        for region, sub in pairs.groupby('region'):
+            r = _fit(sub, {'site': 'ALL', 'region': str(region), 'season': 'ALL'})
+            if r: rows.append(r)
+
+    # Per region × season
+    if {'region', 'season'}.issubset(pairs.columns):
+        for (region, season), sub in pairs.groupby(['region', 'season']):
+            r = _fit(sub, {'site': 'ALL', 'region': str(region), 'season': str(season)})
+            if r: rows.append(r)
 
     return pd.DataFrame(rows)
 
@@ -891,7 +917,7 @@ def extract_aod_pm25_pairs(
 def pm25_coupling_metrics(pairs: pd.DataFrame) -> pd.DataFrame:
     """§8.4: AOD–PM2.5 coupling metrics stratified by region, season, and station.
 
-    Methodology (v3.2 — aligned with EDA_MODIS_AQI.ipynb):
+    Methodology (aligned with EDA_MODIS_AQI.ipynb):
       • Per-station strata: one row per (station, aod_type) with that station's
         own Pearson/Spearman/OLS/RANSAC fit.
       • Aggregate strata (ALL, region, region×season): compute the per-station

@@ -150,10 +150,11 @@ def _write_summary(
                 val_col = 'R' if 'R_' in target_key else 'RMSE'
                 val     = m_site.iloc[0].get(val_col, np.nan)
                 if pd.notna(val):
-                    passed = (val >= target_val) if 'R' in val_col else (val <= target_val)
+                    is_r   = (val_col == 'R')
+                    passed = (val >= target_val) if is_r else (val <= target_val)
                     mark   = '✓ PASS' if passed else '✗ FAIL'
                     lines.append(f'  {mark}  {target_key}: {_fmt_metric(val)} '
-                                 f'(target {"≥" if "R" in val_col else "≤"} {target_val})')
+                                 f'(target {"≥" if is_r else "≤"} {target_val})')
 
     lines.append('\n§8.2  Inter-sensor R²\n')
     if not consistency.empty:
@@ -170,7 +171,10 @@ def _write_summary(
     if not ransac.empty:
         for _, row in ransac.iterrows():
             lines.append(
-                f"  {row.get('site','?'):10s}  N={int(row.get('N',0)):5d}  "
+                f"  site={str(row.get('site','?')):10s} "
+                f"region={str(row.get('region','ALL')):8s} "
+                f"season={str(row.get('season','ALL')):4s}  "
+                f"N={int(row.get('N',0)):5d}  "
                 f"OLS R²={_fmt_metric(row.get('OLS_R2'))}  "
                 f"RANSAC R²={_fmt_metric(row.get('RANSAC_R2'))}  "
                 f"lift={_fmt_metric(row.get('RANSAC_R2_lift'))}  "
@@ -374,7 +378,8 @@ def main():
         if not ransac_df.empty:
             ransac_df.to_csv(run_dir / 'ransac_diagnostic.csv', index=False)
             _print_table(
-                ransac_df[['site', 'N', 'OLS_R2', 'RANSAC_R2', 'RANSAC_R2_lift',
+                ransac_df[['site', 'region', 'season', 'N',
+                            'OLS_R2', 'RANSAC_R2', 'RANSAC_R2_lift',
                             'inlier_frac', 'ransac_slope', 'ransac_intercept']],
                 '§8.6  RANSAC outlier diagnostic',
             )

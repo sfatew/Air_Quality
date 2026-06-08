@@ -40,14 +40,6 @@ import numpy as np
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
 
-try:
-    import cupy as cp
-    cp.array([0])  # triggers CUDA init — raises if no GPU device
-    _xp = cp
-except Exception:
-    cp = None
-    _xp = np
-
 from config import (
     ERA5_MONTHLY_DIR, GAMMA, PBLH_MIN,
     LATS, LONS, NLAT, NLON,
@@ -217,18 +209,16 @@ def apply_physics_correction(
         rh   = era5['RH']
         pblh = era5['PBLH']
 
-    xp       = _xp
-    rh_d     = xp.asarray(rh.astype(np.float64))
-    pblh_d   = xp.asarray(pblh.astype(np.float64))
-    aod_d    = xp.asarray(aod.astype(np.float64))
+    rh64   = rh.astype(np.float64)
+    pblh64 = pblh.astype(np.float64)
+    aod64  = aod.astype(np.float64)
 
-    hygro_d  = xp.power(1.0 - rh_d / 100.0, GAMMA)
-    hygro_d  = xp.clip(hygro_d, 0.0, 1.0)
+    hygro = np.clip(np.power(1.0 - rh64 / 100.0, GAMMA), 0.0, 1.0)
 
-    aod_phys_d = aod_d * hygro_d / pblh_d
-    aod_phys_d = xp.where(xp.isfinite(aod_d), aod_phys_d, np.nan).astype(np.float32)
+    aod_phys = aod64 * hygro / pblh64
+    aod_phys = np.where(np.isfinite(aod64), aod_phys, np.nan).astype(np.float32)
 
-    return np.asarray(aod_phys_d), rh, pblh
+    return aod_phys, rh, pblh
 
 
 def close_era5() -> None:

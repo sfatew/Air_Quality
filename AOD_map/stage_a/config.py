@@ -40,9 +40,10 @@ AERONET_SITES = {
 # than the original Nguyen 2025 figures which do not match our data distribution.
 # Key: (sensor_key, region)
 SENSOR_RMSE_PRIOR = {
-    # Single Himawari entry: L3 wins per pixel, L2 fills L3 gaps.
-    # Values seeded from the previous himawari_l3 priors since L3 dominates
-    # most pixels.  Updated by post_correction_rmse.json after training.
+    # Single Himawari entry: run_stage_a picks whichever level (L2 or L3)
+    # has the lower post-correction RMSE per (region, season); the other
+    # level fills its gaps.  These priors are used only before training;
+    # post_correction_rmse.json overrides them once it exists.
     ('himawari',    'north'):   0.477,
     ('himawari',    'central'): 0.399,
     ('himawari',    'south'):   0.321,
@@ -79,6 +80,13 @@ SENSOR_RMSE_FLOOR = 0.05
 SENSOR_RMSE_EE_OFFSET = 0.05
 SENSOR_RMSE_EE_SLOPE  = 0.15
 SENSOR_RMSE_EE_REFAOD = 0.3   # representative AOD used to evaluate the envelope
+
+# Down-weight applied to strata whose CDF-correction decision tree returns
+# 'none' (failed R / slope / N gate).  The saved RMSE for that stratum becomes
+# NONE_PENALTY_FACTOR × prior, so the fusion weight (∝ 1/RMSE²) drops by the
+# square of the factor.  2.0 → fusion weight cut by ~4× relative to a healthy
+# post-correction RMSE.
+NONE_PENALTY_FACTOR = 2.0
 
 # ── Sensor fusion inclusion rules ────────────────────────────────────────────
 # Confidence flag assigned to each merged cell based on contributing sensors.

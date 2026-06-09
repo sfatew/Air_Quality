@@ -519,8 +519,11 @@ Pass criterion: the merged product captures the temporal pattern of the correspo
 The merged product is compared against:
 
 - **B1.** Best-single-sensor: bias-corrected VIIRS-only daily product.
-- **B2.** Gupta et al. 2024 equal-weight DT merged product (re-sampled to 0.05°).
+- **B2.** Gupta et al. 2024 equal-weight DT merged product (re-sampled to 0.05°). 
+Sensor–satellite Number of pairs EE% Bias RMSE R Slope Intercept
+Merged 272 725 65.45 0.051 0.147 0.833 1.10 0.020
 - **B3.** Ahn et al. 2021 NE Asia composite product (where it overlaps Vietnam temporally).
+
 - **B4.** Nguyen et al. 2025's daily Himawari-only RANSAC result (R² = 0.293 vs PM2.5).
 
 Hypothesis: this thesis's product beats all four on AERONET-validated R, RMSE, %EE.

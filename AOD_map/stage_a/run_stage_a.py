@@ -56,6 +56,8 @@ from config import (
     LATS, LONS, NLAT, NLON,
     MERGED_DIR, BIASC_DIR,
     SLOT_MINUTES,
+    DRY_MONTHS,
+    NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
 )
 from grid            import read_gridded_slot
 from physics         import apply_physics_correction, close_era5
@@ -68,7 +70,9 @@ from fusion          import fuse, load_rmse
 _ALL_SENSOR_GROUPS = ('himawari', 'viirs', 'modis')
 # Training keys (bias-correction CDFs).  Himawari L2 and L3 each train their
 # own CDF from their own AERONET collocation CSVs.  Fusion sees only the
-# merged 'himawari' grid (L3-preferred, L2-fallback).
+# merged 'himawari' grid; for each (region, season) we use whichever level
+# has the lower post-correction RMSE as the per-pixel primary, with the
+# other level filling its gaps (see _himawari_prefer_l2_mask below).
 _SENSOR_KEYS = {
     'himawari': ['himawari_l2', 'himawari_l3'],
     'viirs':    ['viirs_snpp', 'viirs_noaa20'],
@@ -76,6 +80,29 @@ _SENSOR_KEYS = {
 }
 
 SLOTS_PER_DAY = 48
+
+
+def _himawari_prefer_l2_mask(
+    lat_2d: np.ndarray,
+    month: int,
+    rmse_dict: dict,
+) -> np.ndarray:
+    """Per-pixel boolean mask: True where L2's post-correction RMSE beats L3's.
+
+    Looked up per (region, season) from rmse_dict (the same source fusion
+    uses for ICW weights).  Ties and missing entries default to False
+    (L3-first), preserving legacy behaviour when only one level is trained.
+    """
+    season = 'dry' if month in DRY_MONTHS else 'wet'
+    region_code = np.where(lat_2d >= NORTH_CENTRAL_LAT, 2,
+                           np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1))
+    mask = np.zeros(lat_2d.shape, dtype=bool)
+    for code, reg in ((0, 'south'), (1, 'central'), (2, 'north')):
+        l2 = rmse_dict.get(('himawari_l2', reg, season))
+        l3 = rmse_dict.get(('himawari_l3', reg, season))
+        if l2 is not None and l3 is not None and l2 < l3:
+            mask[region_code == code] = True
+    return mask
 
 
 # ── Environment banner ────────────────────────────────────────────────────────
@@ -224,8 +251,12 @@ def _process_slot(
 
     # ── Step A4: bias correction ───────────────────────────────────────────
     # Each Himawari level uses its own CDF (different retrieval quality);
-    # the corrected per-level grids are then merged into one 'himawari' grid
-    # with L3 winning per pixel, L2 filling L3 gaps.
+    # the corrected per-level grids are then merged into one 'himawari' grid.
+    # Per-pixel preference is stratum-aware: for each (region, season) the
+    # level with the lower post-correction RMSE wins; the other fills its
+    # gaps.  Post-correction RMSEs show L2 outperforms L3 in every healthy
+    # stratum (L3's hourly composite smears retrievals; L2's tighter QA chain
+    # produces lower residuals vs AERONET).
     corrected: dict[str, Optional[np.ndarray]] = {}
 
     if himawari_l3_raw is not None:
@@ -242,10 +273,11 @@ def _process_slot(
         himawari_l2_corrected = None
 
     if himawari_l3_corrected is not None and himawari_l2_corrected is not None:
+        prefer_l2 = _himawari_prefer_l2_mask(lat_2d, month, rmse_dict)
+        primary  = np.where(prefer_l2, himawari_l2_corrected, himawari_l3_corrected)
+        fallback = np.where(prefer_l2, himawari_l3_corrected, himawari_l2_corrected)
         himawari_corrected = np.where(
-            np.isfinite(himawari_l3_corrected),
-            himawari_l3_corrected,
-            himawari_l2_corrected,
+            np.isfinite(primary), primary, fallback
         ).astype(np.float32)
     elif himawari_l3_corrected is not None:
         himawari_corrected = himawari_l3_corrected

@@ -41,8 +41,11 @@ from config import (
 )
 
 # Integer codes for dominant_sensor output variable.
-# a single 'himawari' contribution (L3-preferred, L2-fallback) replaces
-# the separate L2/L3 sensors so ICW weights don't double-count Himawari.
+# A single merged 'himawari' contribution replaces the separate L2/L3
+# sensors so ICW weights don't double-count Himawari (their errors are
+# correlated — L3 is an hourly composite of L2-like retrievals).  The
+# per-pixel merge (run_stage_a) picks whichever level has the lower
+# post-correction RMSE per (region, season).
 SENSOR_CODES = {
     'himawari':    1,
     'modis_maiac': 3,

@@ -71,6 +71,12 @@ _FIT_MIN_SLOPE   = 0.30
 _FIT_MAX_SLOPE   = 3.00
 _CV_FOLDS        = 5
 
+# Decile-density gate: a decile bin "counts" only if it holds at least this many
+# matched pairs.  Matches the acceptance-summary threshold in
+# validate_collocate_coverage.ipynb (Diagnostic 5).
+DECILE_MIN_PAIRS = 5
+DECILE_N_BINS    = 10
+
 
 # ── Stratum helpers ───────────────────────────────────────────────────────────
 
@@ -143,7 +149,11 @@ class CDFCorrection:
     ks_stat                : KS statistic, matched sample vs full distribution
     range_ratio            : p99 of matched / p99 of full satellite distribution
     decile_coverage        : how many of the full distribution's 10 decile bins
-                             contain at least one matched pair (0–10)
+                             contain at least DECILE_MIN_PAIRS matched pairs (0–10)
+    decile_counts          : per-decile match counts (length 10) — full breakdown
+                             behind decile_coverage; useful when triaging fails
+    matched_p95            : 95th percentile of matched AERONET AOD (= numerator
+                             of range_ratio); kept for downstream audit
     n_quantiles_used       : number of quantile points used (200 for CDF, 0 for linear)
     notes                  : human-readable annotation of the fit decision
     rmse_before, rmse_after: RMSE vs AERONET before and after correction
@@ -168,6 +178,8 @@ class CDFCorrection:
         self.ks_stat:         float         = np.nan
         self.range_ratio:     float         = np.nan
         self.decile_coverage: int           = 0
+        self.decile_counts:   list[int]     = []
+        self.matched_p95:     float         = np.nan
         self.n_quantiles_used: int          = 0
         self.clip_above:      Optional[float] = None
         self.notes:           str           = ''
@@ -192,8 +204,13 @@ class CDFCorrection:
         satellite systematically missed high-AOD events, so the CDF transfer
         function is trained on a clean-biased sample and will distort the tail.
 
-        When full_aer_aod is None the metrics are left as NaN and the decision
-        tree defaults to the full-CDF path for qualifying strata.
+        When full_aer_aod is None the KS / range_ratio metrics are left as NaN
+        and decile_coverage defaults to DECILE_N_BINS (no gate trip) — so the
+        decision tree falls back to the full-CDF path for qualifying strata.
+
+        A decile bin is counted toward decile_coverage only if it holds at
+        least DECILE_MIN_PAIRS matched pairs (= the acceptance-summary
+        threshold in validate_collocate_coverage.ipynb).
         """
         from scipy.stats import ks_2samp
 
@@ -203,20 +220,34 @@ class CDFCorrection:
         else:
             full_clean = None
 
-        ref = full_clean if (full_clean is not None and len(full_clean) >= 10) else aer
-
-        # decile_coverage: how many of the full-AERONET decile bins contain ≥1 pair
-        if len(ref) >= 10 and len(aer) >= 1:
-            edges = np.percentile(ref, np.linspace(0, 100, 11))
-            edges = np.unique(edges)
-            if len(edges) >= 2:
-                counts, _ = np.histogram(aer, bins=edges)
-                self.decile_coverage = int(np.sum(counts > 0))
-            else:
-                self.decile_coverage = 1
+        # ── Decile binning ────────────────────────────────────────────────────
+        # A bin "counts" only if it holds ≥ DECILE_MIN_PAIRS matched pairs —
+        # matches the acceptance-summary threshold in
+        # validate_collocate_coverage.ipynb (Diagnostic 5).  Always 10 bins:
+        # ties in np.percentile are broken with a tiny epsilon (np.unique would
+        # silently collapse the bin count and inflate the "X of 10" semantics);
+        # the endpoints are padded so matched values equal to ref's min/max are
+        # not dropped by np.histogram's half-open bin convention.
+        ref = full_clean if (full_clean is not None and len(full_clean) >= 10) else None
+        if ref is not None and len(aer) >= 1:
+            edges = np.percentile(ref, np.linspace(0, 100, DECILE_N_BINS + 1))
+            # Force strictly monotonic edges (break ties at the low-AOD floor)
+            for i in range(1, len(edges)):
+                if edges[i] <= edges[i - 1]:
+                    edges[i] = edges[i - 1] + 1e-9
+            edges[0]  -= 1e-9
+            edges[-1] += 1e-9
+            counts, _            = np.histogram(aer, bins=edges)
+            self.decile_counts   = counts.astype(int).tolist()
+            self.decile_coverage = int(np.sum(counts >= DECILE_MIN_PAIRS))
         else:
-            self.decile_coverage = min(10, len(aer))
+            # No usable reference distribution → don't penalise on this axis;
+            # 10 means "gate not triggered" so the N-vs-CDF_MIN_PAIRS check
+            # alone decides linear-vs-CDF.
+            self.decile_counts   = []
+            self.decile_coverage = DECILE_N_BINS
 
+        # ── KS + range_ratio (range_ratio uses p95, matches the notebook) ─────
         if full_clean is not None and len(full_clean) >= 5 and len(aer) >= 5:
             try:
                 ks, _ = ks_2samp(aer, full_clean)
@@ -224,13 +255,14 @@ class CDFCorrection:
             except Exception:
                 self.ks_stat = np.nan
 
-            # range_ratio uses p95 (matches notebook acceptance check)
             p95_matched      = float(np.percentile(aer, 95))
             p95_full         = float(np.percentile(full_clean, 95))
+            self.matched_p95 = p95_matched
             self.range_ratio = float(p95_matched / p95_full) if p95_full > 0 else np.nan
         else:
             self.ks_stat     = np.nan
             self.range_ratio = np.nan
+            self.matched_p95 = float(np.percentile(aer, 95)) if len(aer) >= 5 else np.nan
 
     def _fit_cdf(self, sat: np.ndarray, aer: np.ndarray) -> PchipInterpolator:
         """Build PCHIP CDF transfer function from paired (sat, aer) arrays."""

@@ -65,6 +65,7 @@ from config import (
     AERONET_SITES, EXTRACT_DIR, COLLOCATE_DIR, BIASC_DIR, GRIDDED_DIR,
     LEO_HIMAWARI_OFFSET_FILE, LEO_HIMAWARI_MIN_PAIRS, LEO_HIMAWARI_SMOOTH_SIGMA,
     SENSOR_RMSE_EE_OFFSET, SENSOR_RMSE_EE_SLOPE, SENSOR_RMSE_EE_REFAOD,
+    SENSOR_RMSE_PRIOR, NONE_PENALTY_FACTOR,
 )
 from extract_satellite import extract_site
 from collocate import match_site, collocate_site
@@ -315,14 +316,36 @@ def cmd_train(args: argparse.Namespace) -> None:
     # Persist season-stratified post-correction RMSE so fusion.py uses real
     # weights instead of the SENSOR_RMSE_PRIOR fallback.
     #
-    # Bug 2 fix: prefer the cross-validated rmse_after_cv; for strata whose CV
-    # value is missing or wildly optimistic, floor against the Sayer/Levy
-    # expected-error envelope at a representative AOD so the fusion weights
-    # never trust an unrealistically small RMSE.
+    # Three concerns combined here:
+    #   1. Prefer cross-validated rmse_after_cv; floor by the Sayer/Levy EE
+    #      envelope at a representative AOD so fusion never trusts an
+    #      unrealistically small in-sample RMSE on low-N strata.
+    #   2. 'none' strata: write an explicit penalty (NONE_PENALTY_FACTOR ×
+    #      prior) instead of silently dropping the entry — otherwise fusion
+    #      falls back to the unpenalised prior and the failed correction is
+    #      effectively unweighted.
+    #   3. Himawari L2/L3 are per-pixel-merged into a single 'himawari' input
+    #      *before* fusion (run_stage_a.py: L3 wins, L2 fills gaps).  Fusion
+    #      therefore looks up ('himawari', reg, sea), which the per-level
+    #      training never writes.  Derive it from L3-with-L2-fallback to
+    #      mirror the merge logic.
     ee_floor = SENSOR_RMSE_EE_OFFSET + SENSOR_RMSE_EE_SLOPE * SENSOR_RMSE_EE_REFAOD
+
+    def _prior_for(sensor: str, region: str):
+        # himawari_l2/l3 share the merged 'himawari' prior in config.
+        if sensor in ('himawari_l2', 'himawari_l3'):
+            sensor = 'himawari'
+        return SENSOR_RMSE_PRIOR.get((sensor, region))
+
     rmse_post: dict[tuple[str, str, str], float] = {}
+    n_penalised = 0
     for (s, reg, sea), c in corrections.items():
         if c.correction_type == 'none':
+            prior = _prior_for(s, reg)
+            if prior is None:
+                continue
+            rmse_post[(s, reg, sea)] = float(max(prior * NONE_PENALTY_FACTOR, ee_floor))
+            n_penalised += 1
             continue
         rmse_cv  = float(getattr(c, 'rmse_after_cv', float('nan')))
         rmse_in  = float(getattr(c, 'rmse_after',     float('nan')))
@@ -330,10 +353,34 @@ def cmd_train(args: argparse.Namespace) -> None:
         if not np.isfinite(candidate):
             continue
         rmse_post[(s, reg, sea)] = float(max(candidate, ee_floor))
+
+    # Roll L2/L3 RMSE up to a merged 'himawari' entry per (region, season).
+    # run_stage_a's per-pixel merge picks whichever level has the lower
+    # post-correction RMSE as the primary (the other fills gaps), so the
+    # merged-grid RMSE that fusion should weight by is min(L2, L3) where
+    # both exist; fall back to the single level otherwise.
+    n_himawari_rollup = 0
+    for reg in ('north', 'south', 'central'):
+        for sea in ('dry', 'wet'):
+            l3 = rmse_post.get(('himawari_l3', reg, sea))
+            l2 = rmse_post.get(('himawari_l2', reg, sea))
+            if l2 is not None and l3 is not None:
+                merged = min(l2, l3)
+            elif l2 is not None:
+                merged = l2
+            else:
+                merged = l3
+            if merged is not None:
+                rmse_post[('himawari', reg, sea)] = merged
+                n_himawari_rollup += 1
+
     if rmse_post:
         save_rmse(rmse_post)
         print(f'  Post-correction RMSE saved ({len(rmse_post)} strata, '
-              f'EE-floor={ee_floor:.3f}) → {BIASC_DIR / "post_correction_rmse.json"}')
+              f'EE-floor={ee_floor:.3f}, '
+              f'{n_penalised} penalised "none" @ ×{NONE_PENALTY_FACTOR}, '
+              f'{n_himawari_rollup} himawari roll-ups) '
+              f'→ {BIASC_DIR / "post_correction_rmse.json"}')
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

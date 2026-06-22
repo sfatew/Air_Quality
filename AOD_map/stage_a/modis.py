@@ -3,12 +3,13 @@
 Primary SDS used:
     Optical_Depth_055  – MAIAC AOD at 550 nm (1 km, multi-orbit)
     AngstromExp_470-780
+    AOD_QA             – uint16 bitfield (1 km, multi-orbit); bits 8–11 hold
+                         the per-pixel AOD QA level (0=Best, higher=worse)
     cosSZA / cosVZA    – 5 km grid (resampled to 1 km below)
 
 Pixel validity filter:
     • Valid AOD range: 0 ≤ AOD ≤ 5
-    (AOD_QA bit-mask filtering was removed — see commit c8be990; box heterogeneity
-     rejection at extraction time has proven sufficient for MAIAC over Vietnam.)
+    • AOD_QA bits 8–11 ≤ MODIS_QA_BITS_MAX (matches MODIS/v2/crawl.py)
 
 File naming:
     MCD19A2.A{YYYY}{DOY}.h{HH}v{VV}.061.{proc_time}.hdf
@@ -36,6 +37,7 @@ from rasterio.transform import rowcol
 from config import (
     MODIS_DIR,
     LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
+    MODIS_QA_BITS_MAX,
 )
 
 # MODIS sinusoidal projection
@@ -158,6 +160,37 @@ def _load_sds(hdf_path: str, sds_name: str) -> tuple[np.ndarray, dict]:
     return data, attrs
 
 
+def _load_aod_qa(hdf_path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Load the raw uint16 AOD_QA bitfield (1 km grid, no scale/offset applied).
+
+    Returns ``(qa_int, fill_mask)``:
+        qa_int    : int64 array, shape (n_orbits, H, W) or (H, W)
+        fill_mask : bool, True where the source pixel was the HDF fill value
+    """
+    path = f'HDF4_EOS:EOS_GRID:"{hdf_path}":grid1km:AOD_QA'
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='.*no geotransform.*')
+        da = rioxarray.open_rasterio(path, masked=False, lock=False)
+    raw = da.values
+    attrs = dict(da.attrs)
+    if raw.ndim == 3 and raw.shape[0] == 1:
+        raw = raw.squeeze(0)
+    qa_int = raw.astype(np.int64)
+    fill = attrs.get('_FillValue')
+    fill_mask = (qa_int == int(fill)) if fill is not None else np.zeros_like(qa_int, dtype=bool)
+    return qa_int, fill_mask
+
+
+def _aod_qa_pass(qa_int: np.ndarray, fill_mask: np.ndarray) -> np.ndarray:
+    """MAIAC AOD-QA gate: bits 8–11 (the AOD QA nibble) ≤ MODIS_QA_BITS_MAX.
+
+    0=Best, 1=Water/Sediments, … higher = lower confidence.  Pixels with the
+    fill sentinel are always rejected.
+    """
+    qa_aod_bits = (qa_int >> 8) & 0xF
+    return (qa_aod_bits <= MODIS_QA_BITS_MAX) & ~fill_mask
+
+
 def _tile_pixel_latlon(hdf_path: str) -> tuple[np.ndarray, np.ndarray]:
     """Build per-pixel WGS-84 lat/lon arrays for the 1 km grid of a tile.
 
@@ -203,6 +236,7 @@ def _read_modis_tile(
     try:
         aod_3d, _  = _load_sds(hdf_path, 'Optical_Depth_055')   # (n_orbits, H, W) or (H, W)
         ae_3d, _   = _load_sds(hdf_path, 'AngstromExp_470-780')
+        qa_3d, qa_fill_3d = _load_aod_qa(hdf_path)               # raw uint16 bitfield
         cos_sza, _ = _load_sds(hdf_path, 'cosSZA')  # 5 km → same shape after resize
         cos_vza, _ = _load_sds(hdf_path, 'cosVZA')
     except Exception:
@@ -212,6 +246,9 @@ def _read_modis_tile(
     if aod_3d.ndim == 2:
         aod_3d = aod_3d[np.newaxis]
         ae_3d  = ae_3d[np.newaxis]
+    if qa_3d.ndim == 2:
+        qa_3d      = qa_3d[np.newaxis]
+        qa_fill_3d = qa_fill_3d[np.newaxis]
 
     n_orbits, H, W = aod_3d.shape
 
@@ -255,8 +292,13 @@ def _read_modis_tile(
     for orb in _orb_iter:
         aod_2d = aod_3d[orb]
         ae_2d  = ae_3d[orb]
+        qa_pass = _aod_qa_pass(qa_3d[orb], qa_fill_3d[orb])
 
-        valid = domain & ~np.isnan(aod_2d) & (aod_2d >= 0.0) & (aod_2d <= 5.0)
+        valid = (
+            domain
+            & ~np.isnan(aod_2d) & (aod_2d >= 0.0) & (aod_2d <= 5.0)
+            & qa_pass
+        )
 
         if not np.any(valid):
             continue
@@ -328,11 +370,15 @@ def _read_modis_tile_aod2d(
     orbit_times = _read_modis_orbit_times(hdf_path)
     try:
         aod_3d, _ = _load_sds(hdf_path, 'Optical_Depth_055')
+        qa_3d, qa_fill_3d = _load_aod_qa(hdf_path)
     except Exception:
         return None
 
     if aod_3d.ndim == 2:
         aod_3d = aod_3d[np.newaxis]
+    if qa_3d.ndim == 2:
+        qa_3d      = qa_3d[np.newaxis]
+        qa_fill_3d = qa_fill_3d[np.newaxis]
 
     n_orbits, H, W = aod_3d.shape
 
@@ -364,7 +410,11 @@ def _read_modis_tile_aod2d(
 
     for orb in range(n_orbits):
         aod_2d = aod_3d[orb].copy().astype(np.float32)
-        valid  = ~np.isnan(aod_2d) & (aod_2d >= 0.0) & (aod_2d <= 5.0)
+        qa_pass = _aod_qa_pass(qa_3d[orb], qa_fill_3d[orb])
+        valid  = (
+            ~np.isnan(aod_2d) & (aod_2d >= 0.0) & (aod_2d <= 5.0)
+            & qa_pass
+        )
         aod_2d[~valid] = np.nan
         aod_2d_list.append(aod_2d)
         angle_list.append((vza_2d, sza_2d))

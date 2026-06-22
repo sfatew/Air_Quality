@@ -1,28 +1,39 @@
-"""Stage A validation — Sections 8.1–8.6 of the thesis plan.
+"""Stage A validation — Section 8.1 of the thesis plan (v3.3.2).
 
-§8.1  Held-out AERONET validation
-      Temporal split: train Sep 2022–Dec 2024 | test Jan 2025–Apr 2026
-      Metrics: R, R², RMSE, MAE, Bias, %EE
-      Strata : station × season × confidence_flag
+§8.1.1  Held-out AERONET validation (the headline test)
+        `extract_aeronet_pairs`, `stratified_metrics`.
+        Matches `AOD_merged` at AERONET cells against AERONET ±30 min, then
+        slices the metric panel (N, R, R², RMSE, MAE, Bias, %EE) by
+        site × season × confidence_flag.
 
-§8.2  Internal-consistency check
-      Where multiple sensors overlap, compute per-pair R² by region.
-      Baseline from Nguyen 2025: MODIS–Himawari R² = 0.621/0.474/0.756 (N/C/S)
+§8.1.2  Pre/post-correction comparison  → see `validate_bias_correction.ipynb`,
+        which works off `bias_correction.CDFCorrection` directly.
 
-§8.3  Precipitation-aware validation  (requires ERA5 Precip from Stage A NetCDFs)
-      Dry intervals (>24 h since rain) vs post-rain (0–12 h).
-      GPM IMERG ≥ 0.1 mm/hr defines a rain event (uses ERA5 Precip as proxy here).
+§8.1.3  Inter-sensor consistency
+        `inter_sensor_consistency(source='merged'|'gridded', …)` — per-region
+        R² of daily means at Envisoft pixels, before (raw GRIDDED_DIR) and
+        after (corrected MERGED_DIR) the §7.4 CDF correction.  Baselines from
+        Nguyen 2025 §3.1.4 + §5.2 finding 5 are subtracted to report ΔR².
 
-§8.5  Baseline comparison
-      B1: VIIRS-only daily (extracted from per-sensor grid in merged NetCDFs)
-      B4: Himawari-only baseline — R² = 0.293 (Nguyen 2025, RANSAC daily)
+§8.1.4  Baseline comparison
+        `baseline_comparison` — B1 (best single sensor) and B2
+        (Gupta-2024-style equal-weight merge of the same bias-corrected
+        per-sensor grids) at AERONET, on the same matched pairs.
 
-§8.6  RANSAC diagnostic
-      Fit OLS and RANSAC to (merged_aod, aeronet_aod) pairs; report outlier fraction.
+§8.1.5  Precipitation-aware validation
+        `precip_aware_validation` — three bins per the plan (dry > 24 h since
+        rain, recovery 12–24 h, post-rain 0–12 h) from ERA5 Precip stored
+        per slot.
+
+§8.1.6  Case studies
+        `pm25_case_studies` + `extract_aod_pm25_pairs` — Spearman r between
+        merged AOD_phys and Envisoft PM2.5 over event windows defined in
+        the plan (severe Hanoi haze, March–April biomass burning,
+        precipitation washout).
 """
 
 from __future__ import annotations
-from datetime import datetime, timedelta, date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 import glob
@@ -50,30 +61,33 @@ def _make_bar(iterable, **kwargs):
 from config import (
     AERONET_SITES, DRY_MONTHS,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
-    MERGED_DIR, TZ_OFFSET_HOURS,
+    GRIDDED_DIR, MERGED_DIR, TZ_OFFSET_HOURS,
     LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
     DATA_ROOT,
+    TRAIN_START, TRAIN_END, TEST_START, TEST_END,
 )
 from aeronet import load_all_aeronet
 
 _TZ = pd.Timedelta(hours=TZ_OFFSET_HOURS)  # UTC → UTC+7 (AERONET datetimes are UTC+7)
 
-# ── Study period splits ────────────────────────────────────────────────────────
-TRAIN_END   = date(2024, 12, 31)   # inclusive training period end
-TEST_START  = date(2025, 1, 1)     # held-out test period start
-TEST_END    = date(2026, 4, 30)    # held-out test period end
-
 # Expected-error envelope (MODIS Deep Blue / DT land standard)
 EE_OFFSET   = 0.05
 EE_SLOPE    = 0.15
 
-# Nguyen 2025 inter-sensor R² baselines (MODIS–Himawari, per region).
-# a single 'AOD_himawari' grid replaces the separate L2/L3 grids,
-# so the baseline key is keyed by 'himawari'.
+# Nguyen 2025 inter-sensor R² baselines, keyed by (sensor_a, sensor_b, region).
+# Source: Nguyen 2025 §3.1.4 and §5.2 finding 5.  v3.3.2 collapses the L2/L3
+# Himawari grids into one merged channel, so 'himawari' is the key downstream
+# code uses.  Pairs not separately reported in Nguyen 2025 (e.g. MODIS-Himawari
+# north was reported, VIIRS-Himawari north was not) are simply absent.
 NGUYEN2025_R2_BASELINES = {
-    ('modis_maiac', 'himawari', 'north'):   0.621,
-    ('modis_maiac', 'himawari', 'central'): 0.474,
-    ('modis_maiac', 'himawari', 'south'):   0.756,
+    ('modis_maiac',  'himawari',    'north'):   0.621,
+    ('modis_maiac',  'himawari',    'central'): 0.474,
+    ('modis_maiac',  'himawari',    'south'):   0.756,
+    ('viirs_noaa20', 'himawari',    'central'): 0.450,
+    ('viirs_noaa20', 'himawari',    'south'):   0.756,
+    ('modis_maiac',  'viirs_noaa20','north'):   0.837,
+    ('modis_maiac',  'viirs_noaa20','central'): 0.638,
+    ('modis_maiac',  'viirs_noaa20','south'):   0.545,
 }
 
 
@@ -110,10 +124,18 @@ def _merged_files_for_range(start: date, end: date) -> list[Path]:
 
 
 def _parse_slot_utc(fpath: str) -> Optional[datetime]:
-    """Parse UTC slot datetime from merged NetCDF filename."""
-    stem = Path(fpath).stem   # merged_YYYYMMDD_HHMM
+    """Parse UTC slot datetime from a Stage A slot NetCDF filename.
+
+    Accepts either `merged_YYYYMMDD_HHMM` (MERGED_DIR) or
+    `gridded_YYYYMMDD_HHMM` (GRIDDED_DIR) stems.
+    """
+    stem = Path(fpath).stem
+    for prefix in ('merged_', 'gridded_'):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+            break
     try:
-        return datetime.strptime(stem, 'merged_%Y%m%d_%H%M')
+        return datetime.strptime(stem, '%Y%m%d_%H%M')
     except ValueError:
         return None
 
@@ -296,32 +318,75 @@ def stratified_metrics(pairs: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ── §8.2 Internal-consistency check ──────────────────────────────────────────
+# ── §8.1.3 Inter-sensor consistency (internal uncertainty) ───────────────────
+
+DEFAULT_SENSOR_PAIRS = (
+    ('AOD_modis_maiac',  'AOD_himawari'),
+    ('AOD_viirs_noaa20', 'AOD_himawari'),
+    ('AOD_viirs_snpp',   'AOD_himawari'),
+    ('AOD_viirs_noaa20', 'AOD_modis_maiac'),
+    ('AOD_viirs_snpp',   'AOD_modis_maiac'),
+    ('AOD_viirs_noaa20', 'AOD_viirs_snpp'),
+)
+
+
+def _slot_files_for_range(source: str, start: date, end: date) -> list[str]:
+    """Discover slot NetCDFs for either gridded (raw) or merged (post-correction)."""
+    base = GRIDDED_DIR if source == 'gridded' else MERGED_DIR
+    stem = 'gridded_' if source == 'gridded' else 'merged_'
+    files: list[str] = []
+    d = start
+    while d <= end:
+        pattern = str(base / d.strftime('%Y') / d.strftime('%m')
+                      / d.strftime('%d') / f'{stem}*.nc')
+        files.extend(glob.glob(pattern))
+        d += timedelta(days=1)
+    return sorted(files)
+
+
+def _baseline_lookup(sensor_a: str, sensor_b: str, region: str) -> float:
+    """Look up Nguyen 2025 R² baseline; sensor pair is order-invariant."""
+    a = sensor_a.replace('AOD_', '')
+    b = sensor_b.replace('AOD_', '')
+    v = NGUYEN2025_R2_BASELINES.get((a, b, region),
+          NGUYEN2025_R2_BASELINES.get((b, a, region), np.nan))
+    return float(v) if v is not None else np.nan
+
 
 def inter_sensor_consistency(
     start: date,
     end:   date,
-    sensor_pairs: list[tuple[str, str]] = (
-        ('AOD_modis_maiac', 'AOD_himawari'),
-        ('AOD_viirs_noaa20', 'AOD_himawari'),
-        ('AOD_viirs_noaa20', 'AOD_modis_maiac'),
-    ),
+    sensor_pairs: list[tuple[str, str]] = DEFAULT_SENSOR_PAIRS,
+    source: str = 'merged',
     stations_csv: Path = None,
 ) -> pd.DataFrame:
-    """§8.2: Inter-sensor R² by region using daily means at Envisoft station pixels.
+    """§8.1.3: inter-sensor R² by region using daily means at Envisoft pixels.
 
-    Methodology (aligned with EDA Regional Comparison and Nguyen 2025):
+    Parameters
+    ----------
+    source : {'merged', 'gridded'}
+        - 'merged'  → read post-correction `AOD_<sensor>` from MERGED_DIR.
+        - 'gridded' → read raw `AOD_<sensor>` from GRIDDED_DIR (Stage A2 output,
+          before §7.4 CDF correction).  In gridded mode Himawari is split into
+          `AOD_himawari_l2` and `AOD_himawari_l3`; pass either explicitly via
+          `sensor_pairs`.
+
+    Methodology
+    -----------
       1. Extract each sensor's AOD at every Envisoft station pixel, every slot.
       2. Aggregate to daily means per (station, date, sensor).
       3. For each (sensor_a, sensor_b, region), regress all (station, date)
          daily-mean pairs within that region.
 
-    The v3.1 all-cell-all-slot scan produced 10⁶-tick scatter dominated by
-    QA-edge and IDW-blend artefacts; Nguyen 2025 reports station-level daily
-    R², so the previous "vs baseline" deltas were apples-to-oranges.
+    Station-level daily aggregation matches Nguyen 2025 §3.1.4; pooling raw
+    pixel pairs would be dominated by QA-edge artefacts.
 
-    Returns DataFrame: sensor_a, sensor_b, region, N, R2, RMSE, Bias
+    Returns DataFrame: sensor_a, sensor_b, region, source, N, R2, R2_baseline,
+                       R2_delta, RMSE, Bias.
     """
+    if source not in ('merged', 'gridded'):
+        raise ValueError(f"source must be 'merged' or 'gridded', got {source!r}")
+
     if stations_csv is None:
         stations_csv = STATIONS_META
     meta = load_pm25_meta(stations_csv)
@@ -336,14 +401,14 @@ def inter_sensor_consistency(
         return pd.DataFrame()
 
     # Per (station, date, sensor) daily accumulators
-    # daily[(station, date, sensor)] = [values from each valid slot]
     from collections import defaultdict
     daily: dict[tuple[str, date, str], list[float]] = defaultdict(list)
 
     sensor_vars = sorted({s for pair in sensor_pairs for s in pair})
 
-    files = _merged_files_for_range(start, end)
-    bar   = _make_bar(files, desc='Sensor overlap scan', unit='file', ncols=80)
+    files = _slot_files_for_range(source, start, end)
+    bar   = _make_bar(files, desc=f'Sensor overlap scan ({source})',
+                     unit='file', ncols=80)
 
     for fpath in (bar if bar is not None else files):
         slot = _parse_slot_utc(fpath)
@@ -400,16 +465,12 @@ def inter_sensor_consistency(
             r2   = float(r ** 2)
             rmse = float(np.sqrt(np.mean((a - b) ** 2)))
             bias = float(np.mean(a - b))
-            baseline_key = (
-                sen_a.replace('AOD_', ''),
-                sen_b.replace('AOD_', ''),
-                region,
-            )
-            baseline_r2 = NGUYEN2025_R2_BASELINES.get(baseline_key, np.nan)
+            baseline_r2 = _baseline_lookup(sen_a, sen_b, region)
             rows.append({
                 'sensor_a':    sen_a,
                 'sensor_b':    sen_b,
                 'region':      region,
+                'source':      source,
                 'N':           int(n),
                 'R2':          r2,
                 'R2_baseline': baseline_r2,
@@ -422,40 +483,33 @@ def inter_sensor_consistency(
     return pd.DataFrame(rows)
 
 
-# ── §8.3 Precipitation-aware validation ───────────────────────────────────────
+# ── §8.1.5 Precipitation-aware validation ─────────────────────────────────────
 
-def precip_aware_validation(pairs: pd.DataFrame) -> pd.DataFrame:
-    """§8.3: Validate separately for dry vs post-rain intervals.
+def precip_label_pairs(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Annotate matched-pair rows with `hours_since_rain` and `precip_bin`.
 
-    Uses ERA5 precipitation already stored in merged NetCDFs.
-    For each matched pair, look up the ERA5_Precip at the AERONET pixel and
-    reconstruct an approximate 'hours since last rain' flag.
+    Reads ERA5_Precip from each slot's merged NetCDF at the station pixel,
+    then for every matched pair walks back 24 h in 30-min steps to find the
+    most recent slot with precipitation ≥ 0.1 mm/h.
 
-    NOTE: Full implementation requires loading ERA5_Precip from the NetCDFs
-    sequentially to compute time-since-last-rain.  This version uses a simplified
-    approach: flag a slot as 'wet' if ERA5_Precip at the station pixel > 0.1 mm
-    in the current or any of the previous 24 h.
+    Adds two columns and returns a new DataFrame:
+        hours_since_rain  : float, np.inf if no rain in lookback window
+        precip_bin        : 'post-rain' (≤12 h), 'recovery' (12-24 h), 'dry' (>24 h)
     """
     station_rc = {site: _station_rc(site) for site in AERONET_SITES}
     slot_precip: dict[tuple[str, datetime], float] = {}
 
-    # Load precip for each slot in the pairs
     unique_slots = pairs['slot_utc'].unique()
-    slot_files   = {}
     for slot in unique_slots:
-        pattern = str(MERGED_DIR / pd.Timestamp(slot).strftime('%Y') /
-                      pd.Timestamp(slot).strftime('%m') /
-                      pd.Timestamp(slot).strftime('%d') /
-                      f'merged_{pd.Timestamp(slot).strftime("%Y%m%d_%H%M")}.nc')
-        slot_files[slot] = pattern
-
-    for slot, fpath in slot_files.items():
+        s = pd.Timestamp(slot)
+        fpath = str(MERGED_DIR / s.strftime('%Y') / s.strftime('%m') /
+                    s.strftime('%d') / f'merged_{s.strftime("%Y%m%d_%H%M")}.nc')
         try:
             with nc.Dataset(fpath) as ds:
                 if 'ERA5_Precip' not in ds.variables:
                     continue
-                precip = np.array(ds.variables['ERA5_Precip'][:], dtype=np.float32)
-                precip[precip == -9999.0] = np.nan
+                precip = np.ma.filled(ds.variables['ERA5_Precip'][:].astype(np.float32),
+                                       np.nan)
                 for site, (row, col) in station_rc.items():
                     if 0 <= row < NLAT and 0 <= col < NLON:
                         slot_precip[(site, slot)] = float(precip[row, col])
@@ -463,94 +517,234 @@ def precip_aware_validation(pairs: pd.DataFrame) -> pd.DataFrame:
             continue
 
     if not slot_precip:
+        out = pairs.copy()
+        out['hours_since_rain'] = np.nan
+        out['precip_bin']       = 'unknown'
+        return out
+
+    rain_thresh = 0.1  # mm/h
+    def _hours_since(site: str, slot) -> float:
+        for lag in range(0, 49):                      # 0–24 h in 30-min steps
+            t = pd.Timestamp(slot) - pd.Timedelta(minutes=30 * lag)
+            prec = slot_precip.get((site, t.to_pydatetime()
+                                    if hasattr(t, 'to_pydatetime') else t))
+            if prec is not None and np.isfinite(prec) and prec >= rain_thresh:
+                return lag / 2.0
+        return np.inf
+
+    def _bin(h: float) -> str:
+        if not np.isfinite(h):
+            return 'dry'
+        if h <= 12.0:
+            return 'post-rain'
+        if h <= 24.0:
+            return 'recovery'
+        return 'dry'
+
+    out = pairs.copy()
+    out['hours_since_rain'] = out.apply(lambda r: _hours_since(r['site'], r['slot_utc']),
+                                        axis=1)
+    out['precip_bin']       = out['hours_since_rain'].apply(_bin)
+    return out
+
+
+def precip_aware_validation(pairs: pd.DataFrame) -> pd.DataFrame:
+    """§8.1.5: metric panel per (site × precip_bin).
+
+    See `precip_label_pairs` for the binning rule (dry > 24 h since rain,
+    recovery 12-24 h, post-rain 0-12 h).  Bins with < 3 pairs are dropped.
+    """
+    labelled = precip_label_pairs(pairs)
+    if 'precip_bin' not in labelled.columns or (labelled['precip_bin'] == 'unknown').all():
         return pd.DataFrame()
 
-    # Build time-since-last-rain: scan 24 h back
-    rain_thresh = 0.1  # mm
-
-    def _is_wet(site: str, slot: datetime) -> bool:
-        # Step in 30-min increments to match merged-file granularity
-        for lag_steps in range(0, 49):  # 0–24 h
-            t = pd.Timestamp(slot) - pd.Timedelta(minutes=30 * lag_steps)
-            prec = slot_precip.get((site, t.to_pydatetime()))
-            if prec is not None and prec >= rain_thresh:
-                return True
-        return False
-
-    pairs = pairs.copy()
-    pairs['wet_flag'] = pairs.apply(
-        lambda r: _is_wet(r['site'], r['slot_utc']), axis=1
-    )
-
     rows = []
-    for wet, label in [(False, 'dry (>24h since rain)'), (True, 'post-rain (≤24h)')]:
+    for bin_lbl in ('dry', 'recovery', 'post-rain'):
         for site in AERONET_SITES:
-            sub = pairs[(pairs['site'] == site) & (pairs['wet_flag'] == wet)]
+            sub = labelled[(labelled['site'] == site) & (labelled['precip_bin'] == bin_lbl)]
             if len(sub) < 3:
                 continue
             m = compute_metrics(sub['merged_aod'].values, sub['aeronet_aod'].values,
-                                 label=f'{site} {label}')
-            m['site']     = site
-            m['wet_flag'] = wet
+                                 label=f'{site} {bin_lbl}')
+            m['site']       = site
+            m['precip_bin'] = bin_lbl
             rows.append(m)
     return pd.DataFrame(rows)
 
 
-# ── §8.5 Baseline comparison ──────────────────────────────────────────────────
+# ── §8.1.4 Baseline comparison (B1 single-sensor, B2 equal-weight, B3 ICW) ───
+
+def compute_per_sensor_aeronet_rmse(
+    start: date,
+    end:   date,
+    sensor_keys: tuple[str, ...] = (
+        'AOD_viirs_noaa20', 'AOD_viirs_snpp',
+        'AOD_modis_maiac',  'AOD_himawari',
+    ),
+    window_min: int = 30,
+) -> dict[str, float]:
+    """Per-sensor RMSE vs AERONET on [start, end] — feeds B3 (Ahn 2021 ICW).
+
+    Ahn 2021 §2.2.3 defines ICW weights as w_i = (1/RMSE_i) / Σ(1/RMSE_j) with
+    one RMSE per sensor (no region/season stratification).  This helper
+    reproduces that recipe: for every merged NetCDF in the window, sample
+    `AOD_<sensor>` at each AERONET station pixel, pair with AERONET ±window_min
+    min (same matching rule as `extract_aeronet_pairs`), then collapse to one
+    global RMSE per sensor.
+
+    Should be called on the *training* window — the held-out window is reserved
+    for B3 evaluation.
+    """
+    aer_all     = load_all_aeronet()
+    aer_by_site = {site: grp.copy() for site, grp in aer_all.groupby('site')}
+    station_rc  = {site: _station_rc(site) for site in AERONET_SITES}
+
+    sq: dict[str, list[float]] = {sk: [] for sk in sensor_keys}
+    files = _merged_files_for_range(start, end)
+    bar   = _make_bar(files, desc='B3 per-sensor RMSE', unit='file', ncols=80)
+
+    for fpath in (bar if bar is not None else files):
+        slot = _parse_slot_utc(fpath)
+        if slot is None:
+            continue
+        try:
+            with nc.Dataset(fpath) as ds:
+                available = set(ds.variables.keys())
+                grids: dict[str, np.ndarray] = {}
+                for sk in sensor_keys:
+                    if sk in available:
+                        grids[sk] = np.ma.filled(
+                            ds.variables[sk][:].astype(np.float32), np.nan)
+        except Exception:
+            continue
+        if not grids:
+            continue
+
+        slot_local_ts = pd.Timestamp(slot) + _TZ
+        delta         = pd.Timedelta(minutes=window_min)
+        for site, (row, col) in station_rc.items():
+            if not (0 <= row < NLAT and 0 <= col < NLON):
+                continue
+            site_df = aer_by_site.get(site)
+            if site_df is None or site_df.empty:
+                continue
+            in_win = site_df[
+                (site_df['datetime'] >= slot_local_ts - delta) &
+                (site_df['datetime'] <= slot_local_ts + delta)
+            ]
+            if in_win.empty:
+                continue
+            aer = float(in_win['aod_550'].mean())
+            for sk, g in grids.items():
+                v = float(g[row, col])
+                if np.isfinite(v) and v >= 0:
+                    sq[sk].append((v - aer) ** 2)
+
+    return {sk: float(np.sqrt(np.mean(d))) if d else float('nan')
+            for sk, d in sq.items()}
+
 
 def baseline_comparison(
     pairs: pd.DataFrame,
-    sensor_key: str = 'AOD_viirs_noaa20',
+    sensor_keys: tuple[str, ...] = (
+        'AOD_viirs_noaa20', 'AOD_viirs_snpp',
+        'AOD_modis_maiac',  'AOD_himawari',
+    ),
     merged_nc_dir: Path = MERGED_DIR,
+    b3_weights: Optional[dict[str, float]] = None,
 ) -> pd.DataFrame:
-    """§8.5 B1: Compare bias-corrected single-sensor VIIRS vs merged product.
+    """§8.1.4 B1/B2/B3: merged vs per-sensor / equal-weight / Ahn-2021-ICW.
 
-    Reads the per-sensor grid from the merged NetCDFs, extracts at AERONET pixels,
-    and computes metrics for (sensor_key) vs AERONET — the 'B1' baseline.
+    For every (slot, site) pair already matched in `pairs` (see §8.1.1
+    `extract_aeronet_pairs`), reopen the merged NetCDF and read each per-sensor
+    bias-corrected grid at the station pixel.  Then:
+
+      * B1 — single-sensor:  each `AOD_<sensor>` evaluated against AERONET.
+        Best single sensor (typically VIIRS NOAA-20) is the §8.1.4 B1 baseline.
+      * B2 — equal-weight (Gupta 2024 §4):  arithmetic mean of valid sensors
+        at the cell.  Same inputs as the thesis fusion but uniform weights.
+      * B3 — Ahn 2021 §2.2.3 ICW:  Σ wᵢ · AODᵢ with wᵢ ∝ 1/RMSEᵢ over sensors
+        valid at the cell.  RMSEᵢ is the global per-sensor AERONET RMSE passed
+        in `b3_weights` (compute once on the training window via
+        `compute_per_sensor_aeronet_rmse`).  B3 rows are emitted only when
+        `b3_weights` is provided.
+      * Reference — `merged`:  the thesis TC-weighted AOD_merged from `pairs`.
+
+    Returns rows per (site, season, product) and per (site, season='ALL',
+    product).  Columns: standard `compute_metrics` output plus `product`,
+    `site`, `season`.
     """
     station_rc = {site: _station_rc(site) for site in AERONET_SITES}
-    sensor_vals: dict[str, list[float]] = {site: [] for site in AERONET_SITES}
-    merged_vals: dict[str, list[float]] = {site: [] for site in AERONET_SITES}
-    aer_vals:    dict[str, list[float]] = {site: [] for site in AERONET_SITES}
+    records: list[dict] = []
 
-    # Read pairs' slots
     for _, row in pairs.iterrows():
-        site  = row['site']
-        slot  = pd.Timestamp(row['slot_utc'])
-        fpath = str(merged_nc_dir / slot.strftime('%Y') / slot.strftime('%m') /
-                    slot.strftime('%d') / f"merged_{slot.strftime('%Y%m%d_%H%M')}.nc")
+        site   = row['site']
+        season = row.get('season', 'ALL')
+        slot   = pd.Timestamp(row['slot_utc'])
+        fpath  = str(merged_nc_dir / slot.strftime('%Y') / slot.strftime('%m') /
+                     slot.strftime('%d') / f"merged_{slot.strftime('%Y%m%d_%H%M')}.nc")
+
+        per_sen: dict[str, float] = {}
         try:
             with nc.Dataset(fpath) as ds:
-                if sensor_key not in ds.variables:
-                    continue
-                sen_grid = np.array(ds.variables[sensor_key][:], dtype=np.float32)
-                sen_grid[sen_grid == -9999.0] = np.nan
+                available = set(ds.variables.keys())
+                for sk in sensor_keys:
+                    if sk in available:
+                        grid = np.ma.filled(
+                            ds.variables[sk][:].astype(np.float32), np.nan)
+                        v = float(grid[station_rc[site]])
+                        if np.isfinite(v) and v >= 0:
+                            per_sen[sk] = v
         except Exception:
             continue
 
-        r, c = station_rc[site]
-        val  = float(sen_grid[r, c])
-        if not np.isfinite(val):
+        base = {'site': site, 'season': season,
+                'aer':  float(row['aeronet_aod'])}
+
+        records.append({**base, 'product': 'merged',
+                        'sat': float(row['merged_aod'])})
+        for sk in sensor_keys:
+            records.append({**base, 'product': sk,
+                            'sat': per_sen.get(sk, np.nan)})
+        records.append({**base, 'product': 'B2_equal_weight',
+                        'sat': float(np.mean(list(per_sen.values())))
+                               if per_sen else np.nan})
+
+        if b3_weights is not None:
+            valid = {sk: v for sk, v in per_sen.items()
+                     if sk in b3_weights
+                     and np.isfinite(b3_weights[sk])
+                     and b3_weights[sk] > 0}
+            if valid:
+                inv = {sk: 1.0 / b3_weights[sk] for sk in valid}
+                tot = sum(inv.values())
+                icw = sum(inv[sk] / tot * valid[sk] for sk in valid)
+            else:
+                icw = np.nan
+            records.append({**base, 'product': 'B3_ahn2021_icw', 'sat': icw})
+
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+
+    rows: list[dict] = []
+    for (site, season, product), grp in df.groupby(['site', 'season', 'product']):
+        mask = np.isfinite(grp['sat'].values) & np.isfinite(grp['aer'].values)
+        if mask.sum() < 3:
             continue
-
-        sensor_vals[site].append(val)
-        merged_vals[site].append(float(row['merged_aod']))
-        aer_vals[site].append(float(row['aeronet_aod']))
-
-    rows = []
-    for site in AERONET_SITES:
-        if len(aer_vals[site]) < 3:
+        m = compute_metrics(grp['sat'].values[mask], grp['aer'].values[mask],
+                             label=f'{site} {season} {product}')
+        m.update({'site': site, 'season': season, 'product': product})
+        rows.append(m)
+    # Season-aggregated rows
+    for (site, product), grp in df.groupby(['site', 'product']):
+        mask = np.isfinite(grp['sat'].values) & np.isfinite(grp['aer'].values)
+        if mask.sum() < 3:
             continue
-        aer = np.array(aer_vals[site])
-        m_merged = compute_metrics(np.array(merged_vals[site]), aer, label=f'{site} merged')
-        m_merged['product'] = 'merged'
-        m_merged['site']    = site
-        rows.append(m_merged)
-
-        m_single = compute_metrics(np.array(sensor_vals[site]), aer, label=f'{site} {sensor_key}')
-        m_single['product'] = sensor_key
-        m_single['site']    = site
-        rows.append(m_single)
+        m = compute_metrics(grp['sat'].values[mask], grp['aer'].values[mask],
+                             label=f'{site} ALL {product}')
+        m.update({'site': site, 'season': 'ALL', 'product': product})
+        rows.append(m)
 
     return pd.DataFrame(rows)
 

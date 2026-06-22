@@ -1,955 +1,755 @@
-"""Step A4: region/season-aware bias correction via CDF quantile mapping.
+"""Step A4 — MERRA-2-anchored soft calibration with AERONET fallback (§7.4.1).
 
-Design (Ahn et al. 2021, adapted for Vietnam):
+For each (sensor, region, season) stratum, fit a linear transfer function
 
-  1. For each (sensor, region, season) stratum, fit a transfer function from
-     collocated (satellite, AERONET) pairs using the following decision tree
-     (from validate_collocate_coverage.ipynb):
+    MERRA-2 = α · sat + β     ⇒     sat_corrected = α · sat + β
 
-     Compute (N, R, linear_slope, KS_matched_vs_full, range_ratio,
-              decile_coverage) per stratum, then:
+over the training window (Sep 2022 – Dec 2024), with MERRA-2 hourly AOD
+bilinearly resampled from its native 0.5° × 0.625° grid onto the 0.05°
+production grid and nearest-hour matched to the 30-min slot centre.  The
+linear form (rather than a full PCHIP CDF) follows Ding et al. (2025) and
+avoids over-flattening the satellite tails against MERRA-2's smoother field.
 
-       if R < 0.30 or slope ∉ [0.30, 3.00] or N < CDF_MIN_PAIRS_NONE (30):
-           → correction_type='none', down-weight in fusion
-       elif N < CDF_MIN_PAIRS (100) or decile_coverage < 7:
-           → 'linear'; if range_ratio < 0.70, also clip above matched 90th pct
-       elif KS > 0.20:
-           → 'cdf_clipped' above matched 90th pct
-       elif KS > 0.10 or range_ratio < 0.85:
-           → 'cdf_clipped' above matched 95th pct
-       else:
-           → 'cdf' (200-quantile full CDF, no clipping)
+CV-time guard rail (MERRA-2 anchor)
+-----------------------------------
+5-fold cross-validated α and β are computed alongside the in-sample fit.
+A stratum routes to 'none' from the MERRA-2 anchor when:
 
-     KS, range_ratio, and decile_coverage compare the matched AERONET subsample
-     against the full AERONET record at the site (all obs in the training period,
-     not just AERONET-coincident pairs).  When full_aer_aod is not supplied to
-     fit(), these diagnostics are NaN/0 and the tree defaults to 'cdf' for
-     qualifying strata.
+    * N < SOFT_CAL_MIN_PAIRS, or
+    * CV α ∉ [SOFT_CAL_ALPHA_MIN, SOFT_CAL_ALPHA_MAX], or
+    * |CV β| > SOFT_CAL_BETA_ABSMAX, or
+    * §8.1.2 gate A — rmse_after_cv > rmse_before − GATE_A_RMSE_DROP_MIN.
 
-  2. Spatial extension (no IDW):
-     North cells (lat ≥ NORTH_CENTRAL_LAT) → Nghia-Do-trained correction.
-     South cells (lat < CENTRAL_SOUTH_LAT) → Bac-Lieu-trained correction.
-     Central cells → pass through; central Himawari bias is handled by the
-     §7.4.2 LEO–Himawari spatial-offset map.
+Gate B (held-out RMSE inflation) is evaluated separately in
+validate_bias_correction.ipynb and never feeds back into the JSON.
 
-  3. Saved as pickle files in BIASC_DIR so training and production are decoupled.
+AERONET-anchored fallback (§7.4.1.1)
+------------------------------------
+When the MERRA-2 anchor routes a stratum to 'none' (and the stratum's region
+has an AERONET station — i.e. north or south, never central), a one-shot
+fallback fit is attempted on every AERONET pair in [TRAIN_START, TRAIN_END]
+for that (region, season), gated on k-fold CV that mirrors the MERRA-2
+anchor's CV gate.  The §8 held-out window (Jan 2025 – Apr 2026) is never
+touched.
+
+The fallback uses *widened* α/β bounds (AERONET_FALLBACK_ALPHA_MIN/MAX,
+AERONET_FALLBACK_BETA_ABSMAX — currently α∈[0.3, 3.0], |β|≤0.4) to admit the
+strong scale biases AERONET reveals in wet-season monsoon strata.  These are
+coupled with a *stricter* RMSE-drop requirement (AERONET_FALLBACK_RMSE_DROP_MIN
+= 0.05 vs 0.02 on the MERRA-2 anchor): gain a larger correction window in
+exchange for proving more improvement on CV.
+
+Gate (on k-fold CV mean):
+
+    α_aer_cv ∈ [AERONET_FALLBACK_ALPHA_MIN, AERONET_FALLBACK_ALPHA_MAX]
+    |β_aer_cv| ≤ AERONET_FALLBACK_BETA_ABSMAX
+    rmse_aer_after_cv ≤ rmse_aer_before − AERONET_FALLBACK_RMSE_DROP_MIN
+
+When the fallback passes, the persisted SoftCal swaps `alpha`/`beta` to the
+AERONET-anchored in-sample fit and records `anchor='aeronet'`; route flips
+to 'apply'.  When it fails, the stratum stays 'none' and `anchor` records
+which side failed last ('merra2' if AERONET was never tried, 'aeronet' if
+it was).
+
+Persistence
+-----------
+All trained strata for a sensor are saved as one JSON file at
+SOFT_CAL_FILE (= BIASC_DIR / 'soft_calibration.json'), keyed by sensor.
+Schema is small and human-inspectable:
+
+    {
+      "himawari_l2": {
+        "north|dry":    {"alpha": 0.92, "beta": 0.03, "alpha_cv": 0.91, ...,
+                          "n_pairs": 14323, "route": "apply"},
+        "central|wet":  {... "route": "none", ...},
+        ...
+      },
+      "modis_maiac": { ... },
+      ...
+    }
+
+run_stage_a.py loads the file once at startup and applies the per-sensor
+per-stratum (α, β) to that sensor's gridded AOD in O(NLAT · NLON) per slot.
 """
 
 from __future__ import annotations
-import pickle
+
+import json
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, date
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Iterable
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator
-
-try:
-    from tqdm import tqdm as _tqdm_cls
-    _HAS_TQDM = True
-except ImportError:
-    _tqdm_cls = None  # type: ignore[assignment]
-    _HAS_TQDM = False
-
-
-def _make_bar(iterable, **kwargs):
-    if _HAS_TQDM and _tqdm_cls is not None:
-        return _tqdm_cls(iterable, **kwargs)
-    return None
+import pandas as pd
 
 from config import (
     DRY_MONTHS, WET_MONTHS,
-    CDF_N_QUANTILES, CDF_MIN_PAIRS, CDF_MIN_PAIRS_NONE,
+    REGIONS, SEASONS,
+    AERONET_SITES,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
-    BIASC_DIR,
-    LATS, LONS, NLAT, NLON,
-    LEO_HIMAWARI_OFFSET_FILE, LEO_HIMAWARI_MIN_PAIRS, LEO_HIMAWARI_SMOOTH_SIGMA,
-    MERGED_DIR, AERONET_SITES,
+    NLAT, NLON, LATS, LONS,
+    SLOT_MINUTES,
+    SOFT_CAL_FILE,
+    SOFT_CAL_ALPHA_MIN, SOFT_CAL_ALPHA_MAX,
+    SOFT_CAL_BETA_ABSMAX,
+    SOFT_CAL_CV_FOLDS,
+    SOFT_CAL_MIN_PAIRS,
+    SOFT_CAL_OUTPUT_MIN, SOFT_CAL_OUTPUT_MAX,
+    SOFTCAL_BLEND_HALF_WIDTH,
+    GATE_A_RMSE_DROP_MIN,
+    TRAIN_START, TRAIN_END,
+    AERONET_FALLBACK_MIN_PAIRS,
+    AERONET_FALLBACK_ALPHA_MIN, AERONET_FALLBACK_ALPHA_MAX,
+    AERONET_FALLBACK_BETA_ABSMAX,
+    AERONET_FALLBACK_RMSE_DROP_MIN,
+    COLLOCATE_DIR,
+)
+from grid import read_gridded_slot, ALL_SENSORS as _ALL_GRID_SENSORS
+import merra2
+
+try:
+    from tqdm import tqdm as _tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _tqdm = None
+    _HAS_TQDM = False
+
+
+_SENSORS_TO_CALIBRATE: tuple[str, ...] = (
+    'himawari_l2', 'himawari_l3',
+    'modis_maiac', 'viirs_snpp', 'viirs_noaa20',
 )
 
-_FIT_MIN_PEARSON = 0.30
-_FIT_MIN_SLOPE   = 0.30
-_FIT_MAX_SLOPE   = 3.00
-_CV_FOLDS        = 5
 
-# Decile-density gate: a decile bin "counts" only if it holds at least this many
-# matched pairs.  Matches the acceptance-summary threshold in
-# validate_collocate_coverage.ipynb (Diagnostic 5).
-DECILE_MIN_PAIRS = 5
-DECILE_N_BINS    = 10
-
-
-# ── Stratum helpers ───────────────────────────────────────────────────────────
-
-def get_stratum(month: int, lat: float) -> tuple[str, str]:
-    """Return (region, season) stratum for a given month and latitude."""
-    season = 'dry' if month in DRY_MONTHS else 'wet'
-    region = (
-        'north' if lat >= NORTH_CENTRAL_LAT else
-        'south' if lat < CENTRAL_SOUTH_LAT  else
-        'central'
-    )
-    return region, season
-
-
-# ── Full AERONET loader (used by train_all_corrections) ───────────────────────
-
-def _load_full_aeronet_distributions(
-    train_start,
-    train_end,
-) -> dict[tuple[str, str], np.ndarray]:
-    """Return full AERONET AOD distributions per (region, season).
-
-    Loads every AERONET observation in [train_start, train_end] at each site,
-    groups by (region, season), and returns the `aod_550` arrays.  These are
-    used to compute the KS statistic and range_ratio that drive the decision
-    tree — we check whether the collocated AERONET subsample (those timestamps
-    that happened to coincide with a valid satellite retrieval) is representative
-    of the full AERONET record.  The comparison is entirely in AERONET space;
-    satellite values are not used here.
-    """
-    import pandas as pd
-    from aeronet import load_aeronet
-
-    full: dict[tuple[str, str], np.ndarray] = {}
-    t_start = pd.Timestamp(train_start)
-    t_end   = pd.Timestamp(train_end) + pd.Timedelta(days=1)
-
-    for site, meta in AERONET_SITES.items():
-        region = meta['region']
-        try:
-            df = load_aeronet(site)
-        except Exception as exc:
-            print(f'[bias_correction] warning: could not load AERONET {site}: {exc}')
-            continue
-
-        df = df[(df['datetime'] >= t_start) & (df['datetime'] <= t_end)]
-        df = df[df['aod_550'].notna() & (df['aod_550'] >= 0)]
-
-        for season in ('dry', 'wet'):
-            sea_months = DRY_MONTHS if season == 'dry' else WET_MONTHS
-            vals = df[df['datetime'].dt.month.isin(sea_months)]['aod_550'].values.astype(float)
-            if len(vals) >= 10:
-                full[(region, season)] = np.asarray(vals, dtype=float)
-
-    return full
-
-
-# ── CDF correction fitting ────────────────────────────────────────────────────
-
-class CDFCorrection:
-    """Quantile-mapping transfer function for one (sensor, region, season) stratum.
-
-    Attributes
-    ----------
-    sensor, region, season : stratum identifiers
-    n_pairs                : number of training pairs
-    correction_type        : 'cdf' | 'cdf_clipped' | 'linear' | 'none'
-    clip_above             : AOD threshold above which apply() passes through
-                             (no correction); None means no clipping
-    ks_stat                : KS statistic, matched sample vs full distribution
-    range_ratio            : p99 of matched / p99 of full satellite distribution
-    decile_coverage        : how many of the full distribution's 10 decile bins
-                             contain at least DECILE_MIN_PAIRS matched pairs (0–10)
-    decile_counts          : per-decile match counts (length 10) — full breakdown
-                             behind decile_coverage; useful when triaging fails
-    matched_p95            : 95th percentile of matched AERONET AOD (= numerator
-                             of range_ratio); kept for downstream audit
-    n_quantiles_used       : number of quantile points used (200 for CDF, 0 for linear)
-    notes                  : human-readable annotation of the fit decision
-    rmse_before, rmse_after: RMSE vs AERONET before and after correction
-    rmse_after_cv          : k-fold out-of-sample RMSE (used for fusion weights)
-    """
-
-    def __init__(self, sensor: str, region: str, season: str):
-        self.sensor  = sensor
-        self.region  = region
-        self.season  = season
-        self.n_pairs = 0
-        self.correction_type: str = 'none'
-        self.rmse_before:  float = np.nan
-        self.rmse_after:   float = np.nan
-        self.rmse_after_cv: float = np.nan
-        self.pearson_r:    float = np.nan
-        self.reject_reason: str  = ''
-        self._interp          = None
-        self._lin_slope:     float = 1.0
-        self._lin_intercept: float = 0.0
-        # Distribution-diagnostic attributes (decision tree inputs)
-        self.ks_stat:         float         = np.nan
-        self.range_ratio:     float         = np.nan
-        self.decile_coverage: int           = 0
-        self.decile_counts:   list[int]     = []
-        self.matched_p95:     float         = np.nan
-        self.n_quantiles_used: int          = 0
-        self.clip_above:      Optional[float] = None
-        self.notes:           str           = ''
-
-    # ── Private helpers ────────────────────────────────────────────────────────
-
-    def _compute_diagnostics(
-        self,
-        aer: np.ndarray,
-        full_aer_aod: Optional[np.ndarray],
-    ) -> None:
-        """Compute KS, range_ratio, decile_coverage — all in AERONET space.
-
-        Parameters
-        ----------
-        aer          : AERONET AOD from the collocated pairs (the matched subset)
-        full_aer_aod : all AERONET obs at the site/season in the training period
-
-        The question answered: does the collocated AERONET subsample (those
-        timestamps coinciding with a valid satellite retrieval) represent the
-        full AERONET distribution?  A large KS or low range_ratio means the
-        satellite systematically missed high-AOD events, so the CDF transfer
-        function is trained on a clean-biased sample and will distort the tail.
-
-        When full_aer_aod is None the KS / range_ratio metrics are left as NaN
-        and decile_coverage defaults to DECILE_N_BINS (no gate trip) — so the
-        decision tree falls back to the full-CDF path for qualifying strata.
-
-        A decile bin is counted toward decile_coverage only if it holds at
-        least DECILE_MIN_PAIRS matched pairs (= the acceptance-summary
-        threshold in validate_collocate_coverage.ipynb).
-        """
-        from scipy.stats import ks_2samp
-
-        if full_aer_aod is not None:
-            full_clean = full_aer_aod[np.isfinite(full_aer_aod)
-                                      & (full_aer_aod.astype(float) >= 0)]
-        else:
-            full_clean = None
-
-        # ── Decile binning ────────────────────────────────────────────────────
-        # A bin "counts" only if it holds ≥ DECILE_MIN_PAIRS matched pairs —
-        # matches the acceptance-summary threshold in
-        # validate_collocate_coverage.ipynb (Diagnostic 5).  Always 10 bins:
-        # ties in np.percentile are broken with a tiny epsilon (np.unique would
-        # silently collapse the bin count and inflate the "X of 10" semantics);
-        # the endpoints are padded so matched values equal to ref's min/max are
-        # not dropped by np.histogram's half-open bin convention.
-        ref = full_clean if (full_clean is not None and len(full_clean) >= 10) else None
-        if ref is not None and len(aer) >= 1:
-            edges = np.percentile(ref, np.linspace(0, 100, DECILE_N_BINS + 1))
-            # Force strictly monotonic edges (break ties at the low-AOD floor)
-            for i in range(1, len(edges)):
-                if edges[i] <= edges[i - 1]:
-                    edges[i] = edges[i - 1] + 1e-9
-            edges[0]  -= 1e-9
-            edges[-1] += 1e-9
-            counts, _            = np.histogram(aer, bins=edges)
-            self.decile_counts   = counts.astype(int).tolist()
-            self.decile_coverage = int(np.sum(counts >= DECILE_MIN_PAIRS))
-        else:
-            # No usable reference distribution → don't penalise on this axis;
-            # 10 means "gate not triggered" so the N-vs-CDF_MIN_PAIRS check
-            # alone decides linear-vs-CDF.
-            self.decile_counts   = []
-            self.decile_coverage = DECILE_N_BINS
-
-        # ── KS + range_ratio (range_ratio uses p95, matches the notebook) ─────
-        if full_clean is not None and len(full_clean) >= 5 and len(aer) >= 5:
-            try:
-                ks, _ = ks_2samp(aer, full_clean)
-                self.ks_stat = float(ks)
-            except Exception:
-                self.ks_stat = np.nan
-
-            p95_matched      = float(np.percentile(aer, 95))
-            p95_full         = float(np.percentile(full_clean, 95))
-            self.matched_p95 = p95_matched
-            self.range_ratio = float(p95_matched / p95_full) if p95_full > 0 else np.nan
-        else:
-            self.ks_stat     = np.nan
-            self.range_ratio = np.nan
-            self.matched_p95 = float(np.percentile(aer, 95)) if len(aer) >= 5 else np.nan
-
-    def _fit_cdf(self, sat: np.ndarray, aer: np.ndarray) -> PchipInterpolator:
-        """Build PCHIP CDF transfer function from paired (sat, aer) arrays."""
-        q     = np.linspace(0.005, 0.995, CDF_N_QUANTILES)
-        sat_q = np.quantile(sat, q)
-        aer_q = np.quantile(aer, q)
-        sat_all = np.concatenate([[0.0], sat_q])
-        aer_all = np.concatenate([[min(0.0, float(aer_q[0]))], aer_q])
-        order   = np.argsort(sat_all)
-        sat_all = sat_all[order]
-        aer_all = aer_all[order]
-        _, unique = np.unique(sat_all, return_index=True)
-        return PchipInterpolator(sat_all[unique], aer_all[unique], extrapolate=True)
-
-    def _fit_pair(self, sat: np.ndarray, aer: np.ndarray,
-                  force_type: Optional[str] = None):
-        """Fit one transfer function; used by fit() and CV folds.
-
-        force_type='linear' → linear regardless of N.
-        force_type=anything_else (e.g. 'cdf') → quantile_map regardless of N.
-        force_type=None → decide by N vs CDF_MIN_PAIRS.
-
-        Returns (callable, fit_type_str, params_dict).
-        Raises ValueError on sanity failures so callers can fall back.
-        """
-        from scipy.stats import pearsonr
-        if len(sat) < 5:
-            raise ValueError('fewer than 5 pairs')
-
-        try:
-            r, _ = pearsonr(sat, aer)
-        except Exception:
-            r = float('nan')
-        if not np.isfinite(r) or r < _FIT_MIN_PEARSON:
-            raise ValueError(f'pearson R={r:.3f} below {_FIT_MIN_PEARSON}')
-
-        use_linear = (force_type == 'linear') if force_type is not None \
-            else (len(sat) < CDF_MIN_PAIRS)
-
-        if use_linear:
-            slope, intercept = np.polyfit(sat, aer, 1)
-            slope     = float(slope)
-            intercept = float(intercept)
-            if not (_FIT_MIN_SLOPE <= slope <= _FIT_MAX_SLOPE):
-                raise ValueError(f'linear slope {slope:.3f} outside '
-                                  f'[{_FIT_MIN_SLOPE}, {_FIT_MAX_SLOPE}]')
-            return (
-                (lambda x: np.clip(slope * x + intercept, 0, None)),
-                'linear',
-                {'slope': slope, 'intercept': intercept, 'pearson_r': float(r)},
-            )
-
-        interp = self._fit_cdf(sat, aer)
-        return (
-            (lambda x, _f=interp: np.clip(_f(x), 0, None)),
-            'quantile_map',
-            {'interp': interp, 'pearson_r': float(r)},
-        )
-
-    def _compute_cv_rmse(self, sat: np.ndarray, aer: np.ndarray) -> None:
-        """Set rmse_after_cv via k-fold cross-validation on the deployed model type."""
-        k = min(_CV_FOLDS, self.n_pairs)
-        if k < 2:
-            self.rmse_after_cv = self.rmse_after
-            return
-        rng      = np.random.default_rng(seed=42)
-        perm     = rng.permutation(self.n_pairs)
-        cv_resid = []
-        force    = 'linear' if self.correction_type == 'linear' else 'cdf'
-        for fold in range(k):
-            test_idx  = perm[fold::k]
-            train_idx = np.setdiff1d(perm, test_idx, assume_unique=True)
-            if len(train_idx) < 5:
-                continue
-            try:
-                fn_tr, _, _ = self._fit_pair(sat[train_idx], aer[train_idx],
-                                              force_type=force)
-            except ValueError:
-                cv_resid.append(sat[test_idx] - aer[test_idx])
-                continue
-            cv_resid.append(fn_tr(sat[test_idx]) - aer[test_idx])
-        if cv_resid:
-            resid = np.concatenate(cv_resid)
-            self.rmse_after_cv = float(np.sqrt(np.mean(resid ** 2)))
-        else:
-            self.rmse_after_cv = self.rmse_after
-
-    # ── Main fit ───────────────────────────────────────────────────────────────
-
-    def fit(
-        self,
-        sat_aod: np.ndarray,
-        aer_aod: np.ndarray,
-        full_aer_aod: Optional[np.ndarray] = None,
-    ) -> 'CDFCorrection':
-        """Fit the transfer function using the decision tree from the thesis plan.
-
-        Parameters
-        ----------
-        sat_aod, aer_aod  : matched satellite / AERONET pair arrays
-        full_aer_aod      : all AERONET observations at the site/season in the
-                            training period (not just those with satellite matches);
-                            used to compute KS and range_ratio.  Pass None to skip
-                            those diagnostics (decision tree defaults to 'cdf').
-        """
-        from scipy.stats import pearsonr
-
-        mask = (np.isfinite(sat_aod) & np.isfinite(aer_aod)
-                & (sat_aod.astype(float) >= 0) & (aer_aod.astype(float) >= 0))
-        sat, aer     = sat_aod[mask], aer_aod[mask]
-        self.n_pairs = len(sat)
-
-        if self.n_pairs < 5:
-            self.correction_type = 'none'
-            self.reject_reason   = f'N={self.n_pairs} < 5'
-            return self
-
-        self.rmse_before = float(np.sqrt(np.mean((sat - aer) ** 2)))
-
-        # ── Preliminary R and slope (required by every branch gate) ───────────
-        try:
-            r, _ = pearsonr(sat, aer)
-        except Exception:
-            r = float('nan')
-        self.pearson_r = float(r) if np.isfinite(r) else np.nan
-
-        try:
-            slope_val, intercept_val = np.polyfit(sat, aer, 1)
-            slope_val     = float(slope_val)
-            intercept_val = float(intercept_val)
-        except Exception:
-            slope_val     = float('nan')
-            intercept_val = 0.0
-
-        # ── Distribution diagnostics (KS, range_ratio, decile_coverage) ───────
-        self._compute_diagnostics(aer, full_aer_aod)
-
-        # ── Branch 1: hard reject ─────────────────────────────────────────────
-        reasons: list[str] = []
-        if not np.isfinite(r) or r < _FIT_MIN_PEARSON:
-            reasons.append(f'R={r:.3f}<{_FIT_MIN_PEARSON}')
-        if (not np.isfinite(slope_val)
-                or not (_FIT_MIN_SLOPE <= slope_val <= _FIT_MAX_SLOPE)):
-            reasons.append(f'slope={slope_val:.3f}∉[{_FIT_MIN_SLOPE},{_FIT_MAX_SLOPE}]')
-        if self.n_pairs < CDF_MIN_PAIRS_NONE:
-            reasons.append(f'N={self.n_pairs}<{CDF_MIN_PAIRS_NONE}')
-        if reasons:
-            self.correction_type = 'none'
-            self.reject_reason   = '; '.join(reasons)
-            return self
-
-        # ── Branch 2: linear (N too small or decile coverage too sparse) ──────
-        if self.n_pairs < CDF_MIN_PAIRS or self.decile_coverage < 7:
-            # Slope already validated in Branch 1 gate above.
-            self.correction_type  = 'linear'
-            self._lin_slope       = slope_val
-            self._lin_intercept   = intercept_val
-            self.n_quantiles_used = 0
-
-            rr = self.range_ratio
-            if not np.isnan(rr) and rr < 0.70:
-                self.clip_above = float(np.percentile(sat, 90))
-                self.notes = (f'linear+clip@p90={self.clip_above:.3f} '
-                              f'(range_ratio={rr:.3f})')
-            else:
-                self.clip_above = None
-                self.notes = (f'linear (N={self.n_pairs}, '
-                              f'decile_cov={self.decile_coverage})')
-
-            corrected = np.clip(slope_val * sat + intercept_val, 0, None)
-            self.rmse_after = float(np.sqrt(np.mean((corrected - aer) ** 2)))
-            self._compute_cv_rmse(sat, aer)
-            return self
-
-        # ── Branches 3–5: CDF (N ≥ 100 and decile_coverage ≥ 7) ─────────────
-        ks = self.ks_stat
-        rr = self.range_ratio
-
-        if not np.isnan(ks) and ks > 0.20:
-            self.clip_above = float(np.percentile(sat, 90))
-            ctype      = 'cdf_clipped'
-            self.notes = (f'cdf_clipped@p90={self.clip_above:.3f} '
-                          f'(KS={ks:.3f}>0.20)')
-        elif (not np.isnan(ks) and ks > 0.10) or (not np.isnan(rr) and rr < 0.85):
-            self.clip_above = float(np.percentile(sat, 95))
-            ctype      = 'cdf_clipped'
-            self.notes = (f'cdf_clipped@p95={self.clip_above:.3f} '
-                          f'(KS={ks:.3f}, range_ratio={rr:.3f})')
-        else:
-            self.clip_above = None
-            ctype      = 'cdf'
-            ks_s  = f'KS={ks:.3f}'  if not np.isnan(ks) else 'KS=n/a'
-            rr_s  = f'rr={rr:.3f}'  if not np.isnan(rr) else 'rr=n/a'
-            self.notes = f'full_cdf ({ks_s}, {rr_s})'
-
-        try:
-            fn, _, params = self._fit_pair(sat, aer, force_type='cdf')
-        except ValueError as exc:
-            self.correction_type = 'none'
-            self.reject_reason   = str(exc)
-            return self
-
-        self.correction_type  = ctype
-        self._interp          = params['interp']
-        self.n_quantiles_used = CDF_N_QUANTILES
-
-        corrected = fn(sat)
-        self.rmse_after = float(np.sqrt(np.mean((corrected - aer) ** 2)))
-        self._compute_cv_rmse(sat, aer)
-        return self
-
-    # ── Inference ─────────────────────────────────────────────────────────────
-
-    def apply(self, aod: np.ndarray) -> np.ndarray:
-        """Transform satellite AOD to bias-corrected AOD.
-
-        NaN inputs pass through as NaN; outputs are clipped to [0, ∞).
-        For 'cdf_clipped' and clipped 'linear': values above clip_above pass
-        through unchanged (the correction is unreliable in that tail).
-        Backward-compatible: old pickles without clip_above behave as before.
-        """
-        if self.correction_type == 'none':
-            return aod.copy()
-
-        out   = np.full_like(aod, np.nan, dtype=np.float32)
-        valid = np.isfinite(aod) & (aod >= 0)
-
-        if self.correction_type == 'linear':
-            out[valid] = self._lin_slope * aod[valid] + self._lin_intercept
-        else:
-            # 'cdf', 'cdf_clipped', or legacy 'quantile_map'
-            out[valid] = self._interp(aod[valid])
-
-        out = np.clip(out, 0, None)
-
-        # Pass-through above clip threshold (backward-compat via getattr)
-        clip_above = getattr(self, 'clip_above', None)
-        if clip_above is not None:
-            above = valid & (aod > clip_above)
-            if np.any(above):
-                out[above] = aod[above].astype(np.float32)
-
-        return out
-
-    # ── Persistence ───────────────────────────────────────────────────────────
-
-    def save(self, directory: Path | str) -> Path:
-        """Pickle to directory as {sensor}_{region}_{season}.pkl."""
-        directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        fpath = directory / f'{self.sensor}_{self.region}_{self.season}.pkl'
-        with open(fpath, 'wb') as f:
-            pickle.dump(self, f)
-        return fpath
-
-    @classmethod
-    def load(cls, sensor: str, region: str, season: str,
-             directory: Path | str) -> Optional['CDFCorrection']:
-        fpath = Path(directory) / f'{sensor}_{region}_{season}.pkl'
-        if not fpath.exists():
-            return None
-        with open(fpath, 'rb') as f:
-            return pickle.load(f)
-
-    def __repr__(self) -> str:
-        clip_s = (f' clip@{self.clip_above:.3f}'
-                  if getattr(self, 'clip_above', None) is not None else '')
-        ks_s   = (f' KS={self.ks_stat:.3f}'
-                  if not np.isnan(getattr(self, 'ks_stat', np.nan)) else '')
-        return (f'CDFCorrection({self.sensor}, {self.region}, {self.season}) '
-                f'type={self.correction_type}{clip_s}  N={self.n_pairs}  '
-                f'RMSE {self.rmse_before:.3f}→{self.rmse_after:.3f}{ks_s}')
-
-
-# ── Per-region spatial application ───────────────────────────────────────────
-
-def apply_correction_grid(
-    aod_grid: np.ndarray,
-    sensor: str,
-    month: int,
-    lat_2d: np.ndarray,
-    lon_2d: np.ndarray,
-    corrections: dict[tuple[str, str, str], CDFCorrection],
-) -> np.ndarray:
-    """Apply per-region bias correction to a 2-D AOD grid.
-
-    North cells (lat ≥ NORTH_CENTRAL_LAT) → Nghia-Do CDF.
-    South cells (lat <  CENTRAL_SOUTH_LAT) → Bac-Lieu CDF.
-    Central cells → pass through (no AERONET anchor; handled by §7.4.2 offset).
-    correction_type='none' strata are treated as missing (pass-through).
-    """
-    del lon_2d  # unused
-
-    season = 'dry' if month in DRY_MONTHS else 'wet'
-    corr_N = corrections.get((sensor, 'north', season))
-    corr_S = corrections.get((sensor, 'south', season))
-    if corr_N is not None and corr_N.correction_type == 'none':
-        corr_N = None
-    if corr_S is not None and corr_S.correction_type == 'none':
-        corr_S = None
-
-    out = aod_grid.astype(np.float32, copy=True)
-    if corr_N is None and corr_S is None:
-        return out
-
-    region_code = np.where(
-        lat_2d >= NORTH_CENTRAL_LAT, 2,
-        np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1)
-    )
-    valid = np.isfinite(aod_grid)
-
-    if corr_N is not None:
-        mask_n = valid & (region_code == 2)
-        if np.any(mask_n):
-            out[mask_n] = corr_N.apply(aod_grid[mask_n]).astype(np.float32)
-
-    if corr_S is not None:
-        mask_s = valid & (region_code == 0)
-        if np.any(mask_s):
-            out[mask_s] = corr_S.apply(aod_grid[mask_s]).astype(np.float32)
-
+# ── Stratum identification ──────────────────────────────────────────────────
+
+def _season_of(month: int) -> str:
+    return 'dry' if month in DRY_MONTHS else 'wet'
+
+
+def _region_codes_2d() -> np.ndarray:
+    """(NLAT, NLON) int8 region codes: 0=south, 1=central, 2=north."""
+    lat_col = LATS[:, None]
+    return np.where(lat_col >= NORTH_CENTRAL_LAT, 2,
+                    np.where(lat_col < CENTRAL_SOUTH_LAT, 0, 1)).astype(np.int8)
+
+
+_REGION_CODE_NAME = {0: 'south', 1: 'central', 2: 'north'}
+
+
+# ── Dataclass for one stratum's fit ────────────────────────────────────────
+
+@dataclass
+class SoftCal:
+    sensor:   str
+    region:   str
+    season:   str
+    # Winning (production) fit — α, β that apply_soft_calibration_grid uses.
+    alpha:    float
+    beta:     float
+    # MERRA-2 anchor diagnostics (the primary attempt; always populated).
+    alpha_cv: float
+    beta_cv:  float
+    n_pairs:  int           # MERRA-2 pairs
+    rmse_before: float      # MERRA-2 − sat (training)
+    rmse_after:  float      # MERRA-2 − (α · sat + β) (training)
+    rmse_after_cv: float    # 5-fold CV; what fusion downstream uses for diagnostics
+    route:    str           # 'apply' | 'none'
+    anchor:   str = 'merra2'  # 'merra2' | 'aeronet' | 'none'
+    # AERONET fallback diagnostics — NaN/0 when fallback never ran (central
+    # regions or MERRA-2 anchor already passed).  Schema mirrors the MERRA-2
+    # anchor's `(alpha, beta, alpha_cv, beta_cv, rmse_before, rmse_after,
+    # rmse_after_cv)` quartet so the two anchors can be compared field-by-field.
+    n_aeronet:           int   = 0
+    alpha_aer:           float = float('nan')   # in-sample fit on all pairs
+    beta_aer:            float = float('nan')
+    alpha_aer_cv:        float = float('nan')   # mean across k folds (the gate)
+    beta_aer_cv:         float = float('nan')
+    rmse_aer_before:     float = float('nan')   # uncorrected, all pairs
+    rmse_aer_after:      float = float('nan')   # in-sample fit, all pairs
+    rmse_aer_after_cv:   float = float('nan')   # mean fold-out RMSE (the gate)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ── Training-pair collection from gridded slots ──────────────────────────────
+
+def _enumerate_train_slots(train_start: date, train_end: date) -> list[datetime]:
+    """All 30-min UTC slot centres in [train_start, train_end] inclusive."""
+    out: list[datetime] = []
+    d = train_start
+    end = train_end
+    while d <= end:
+        base = datetime(d.year, d.month, d.day)
+        for i in range(48):
+            out.append(base + timedelta(minutes=i * SLOT_MINUTES))
+        d += timedelta(days=1)
     return out
 
 
-# ── Convenience: load all corrections for a sensor set ───────────────────────
+def collect_sat_merra2_pairs(
+    sensor: str,
+    train_start: date = TRAIN_START,
+    train_end:   date = TRAIN_END,
+    sample_every_n_slots: int = 1,
+) -> dict[tuple[str, str], dict[str, np.ndarray]]:
+    """Walk Stage A2 gridded slots; collect (sat, merra2) per (region, season).
 
-def load_all_corrections(
-    sensors: list[str],
-    directory: Path | str = BIASC_DIR,
-) -> dict[tuple[str, str, str], CDFCorrection]:
-    """Load all saved CDFCorrection objects for the given sensor list."""
-    directory   = Path(directory)
-    corrections = {}
-    for sensor in sensors:
-        for region in ('north', 'south'):
-            for season in ('dry', 'wet'):
-                c = CDFCorrection.load(sensor, region, season, directory)
-                if c is not None:
-                    corrections[(sensor, region, season)] = c
-    return corrections
+    Each slot:
+      1. Reads the Stage A2 gridded NetCDF for `sensor`; skip if absent.
+      2. Reads the MERRA-2 hourly slice resampled to the 0.05° grid for the
+         slot's nearest hour; skip if absent.
+      3. For every cell with both values valid, appends (sat, merra2) to the
+         stratum identified by (region, season).
 
+    Returns a dict keyed by (region, season) with arrays {'sat': ..., 'merra2': ...}.
+    Strata that the satellite never observed in this window are omitted.
 
-# ── Training driver (called from run_collocate.py) ────────────────────────────
-
-def train_all_corrections(
-    collocated_csv_dir: Path | str,
-    sensors: list[str],
-    output_dir: Path | str = BIASC_DIR,
-) -> dict[tuple[str, str, str], CDFCorrection]:
-    """Train and save CDF corrections from collocated CSV files.
-
-    Expects one CSV per (sensor, site) in collocated_csv_dir named
-    {sensor}_{site}.csv with columns:
-        satellite_aod, aeronet_aod, sensor, region, season, month
+    `sample_every_n_slots` lets a caller subsample for a faster training pass
+    (the full 48 × ~850-day grid is ~40 000 slots; every cell is independent
+    so a stride of 2–4 is harmless and saves I/O).
     """
-    import pandas as pd
+    rc2d = _region_codes_2d()
+    slots = _enumerate_train_slots(train_start, train_end)
+    if sample_every_n_slots > 1:
+        slots = slots[::sample_every_n_slots]
 
-    collocated_csv_dir = Path(collocated_csv_dir)
-    output_dir         = Path(output_dir)
+    pairs: dict[tuple[str, str], dict[str, list]] = {}
+    iter_obj = _tqdm(slots, desc=f'  collect {sensor}', unit='slot',
+                     ncols=80, leave=False) if _HAS_TQDM else slots
 
-    # ── Load collocated CSVs ──────────────────────────────────────────────────
-    csv_files = sorted(collocated_csv_dir.glob('*.csv'))
-    print(f'[bias_correction] Loading {len(csv_files)} collocated CSV file(s) …')
+    for slot_utc in iter_obj:
+        g = read_gridded_slot(slot_utc, sensors=(sensor,))
+        if g is None or sensor not in g:
+            continue
+        sat = g[sensor]['aod_mean']
+        m = merra2.get_slot_grid(slot_utc)
+        if m is None:
+            continue
 
-    all_frames: list = []
-    csv_bar = _make_bar(csv_files, desc='  Loading CSVs', unit='file',
-                        ncols=72, leave=False)
-    for fpath in (csv_bar if csv_bar is not None else csv_files):
-        try:
-            all_frames.append(pd.read_csv(fpath))
-        except Exception as exc:
-            print(f'[bias_correction] warning: skipping {fpath.name}: {exc}')
-    if csv_bar is not None:
-        csv_bar.close()
+        valid = np.isfinite(sat) & np.isfinite(m)
+        if not np.any(valid):
+            continue
 
-    if not all_frames:
-        print('[bias_correction] No collocated CSVs found; skipping training.')
+        season = _season_of(slot_utc.month)
+        for code, region in _REGION_CODE_NAME.items():
+            mask = valid & (rc2d == code)
+            if not np.any(mask):
+                continue
+            key = (region, season)
+            d = pairs.setdefault(key, {'sat': [], 'merra2': []})
+            d['sat'].append(sat[mask].astype(np.float32))
+            d['merra2'].append(m[mask].astype(np.float32))
+
+    # Concatenate per stratum.
+    result: dict[tuple[str, str], dict[str, np.ndarray]] = {}
+    for key, d in pairs.items():
+        result[key] = {
+            'sat':    np.concatenate(d['sat'])    if d['sat']    else np.empty(0, np.float32),
+            'merra2': np.concatenate(d['merra2']) if d['merra2'] else np.empty(0, np.float32),
+        }
+    return result
+
+
+# ── AERONET pair collection (fallback only; §7.4.1.1) ───────────────────────
+
+def _aeronet_region_for_sensor() -> set[str]:
+    """Regions that have at least one AERONET station configured in this build.
+
+    Central currently has none → it can never receive the AERONET fallback.
+    """
+    return {meta['region'] for meta in AERONET_SITES.values()}
+
+
+def collect_aeronet_pairs(
+    sensor: str,
+    train_start: date = TRAIN_START,
+    train_end:   date = TRAIN_END,
+) -> dict[tuple[str, str], dict[str, np.ndarray]]:
+    """Read sat↔AERONET collocations for `sensor`; bucket by (region, season).
+
+    Reads every `COLLOCATE_DIR/{sensor}_{site}.csv` produced by `match_site`,
+    filters to [train_start, train_end], and returns all pairs per stratum::
+
+        { (region, season): {'sat': ..., 'aer': ...}, ... }
+
+    The train/val split is no longer here — `_try_aeronet_fallback` does its
+    own k-fold CV.  Strata with no rows in the window are omitted.  Returns
+    {} if no collocate CSVs exist for the sensor (e.g. AERONET match step
+    never ran).
+    """
+    lo = pd.Timestamp(train_start)
+    hi = pd.Timestamp(train_end)
+
+    frames: list[pd.DataFrame] = []
+    for site in AERONET_SITES:
+        path = Path(COLLOCATE_DIR) / f'{sensor}_{site}.csv'
+        if not path.exists():
+            continue
+        df = pd.read_csv(path)
+        if df.empty:
+            continue
+        frames.append(df)
+    if not frames:
         return {}
 
-    df_all = pd.concat(all_frames, ignore_index=True)
-    print(f'  Total pairs: {len(df_all):,}  '
-          f'(sensors: {sorted(df_all["sensor"].unique())})')
+    df = pd.concat(frames, ignore_index=True)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.dropna(subset=['satellite_aod', 'aeronet_aod'])
+    df = df[(df['date'] >= lo) & (df['date'] <= hi)]
 
-    # ── Load full AERONET distributions (for KS / range_ratio / decile_coverage)
-    train_start = df_all['date'].min()
-    train_end   = df_all['date'].max()
-    full_aer_distributions = _load_full_aeronet_distributions(train_start, train_end)
-    print(f'[bias_correction] Full AERONET distributions loaded for '
-          f'{len(full_aer_distributions)} (region, season) strata.')
-
-    # ── Fit one CDFCorrection per (sensor, region, season) ───────────────────
-    strata = [
-        (sensor, region, season)
-        for sensor in sensors
-        for region in ('north', 'south')
-        for season in ('dry', 'wet')
-    ]
-
-    corrections: dict[tuple[str, str, str], CDFCorrection] = {}
-    fit_bar = _make_bar(strata, desc='Training strata', unit='stratum', ncols=72)
-
-    for sensor, region, season in (fit_bar if fit_bar is not None else strata):
-        if fit_bar is not None:
-            fit_bar.set_description(f'  {sensor[:12]}/{region[:5]}/{season[:3]}')
-
-        mask  = ((df_all['sensor'] == sensor)
-                 & (df_all['region'] == region)
-                 & (df_all['season'] == season))
-        df_st = df_all[mask]
-
-        full_aer_dist = full_aer_distributions.get((region, season))
-
-        c = CDFCorrection(sensor, region, season)
-        c.fit(df_st['satellite_aod'].values, df_st['aeronet_aod'].values,
-              full_aer_aod=full_aer_dist)
-        c.save(output_dir)
-        corrections[(sensor, region, season)] = c
-
-        msg = f'  trained: {c}'
-        if fit_bar is not None:
-            fit_bar.write(msg)
-        else:
-            print(msg)
-
-    if fit_bar is not None:
-        fit_bar.close()
-
-    # ── Summary table ─────────────────────────────────────────────────────────
-    if corrections:
-        _print_training_summary(corrections)
-
-    return corrections
+    out: dict[tuple[str, str], dict[str, np.ndarray]] = {}
+    for (region, season), grp in df.groupby(['region', 'season']):
+        sat = grp['satellite_aod'].astype(np.float32).to_numpy()
+        aer = grp['aeronet_aod'].astype(np.float32).to_numpy()
+        if sat.size == 0:
+            continue
+        out[(str(region), str(season))] = {'sat': sat, 'aer': aer}
+    return out
 
 
-def _print_training_summary(
-    corrections: dict[tuple[str, str, str], CDFCorrection],
-) -> None:
-    """Print a formatted summary of all trained strata."""
-    def _f(x: float, w: int = 6) -> str:
-        return f'{x:.4f}' if np.isfinite(x) else ' ' * (w - 3) + 'N/A'
+# ── Fitting ──────────────────────────────────────────────────────────────────
 
-    col_w = 15
-    print(f'\n[bias_correction] Summary — {len(corrections)} strata trained:')
-    hdr = (f"  {'Sensor':<{col_w}} {'Reg':<8} {'Sea':<4} "
-           f"{'Type':<13} {'N':>6}  {'R':>5}  "
-           f"{'KS':>5}  {'RR':>5}  {'DC':>2}  {'Clip':>6}  "
-           f"{'RMSE_b':>7}  {'RMSE_a':>7}  {'RMSE_cv':>7}  Note")
-    print(hdr)
-    print('  ' + '─' * (len(hdr) - 2))
-
-    for (s, reg, sea), c in sorted(corrections.items()):
-        r_s    = f'{c.pearson_r:.2f}' if np.isfinite(c.pearson_r) else '  N/A'
-        ks_s   = f'{c.ks_stat:.3f}'   if np.isfinite(getattr(c, 'ks_stat', np.nan)) else '  N/A'
-        rr_s   = f'{c.range_ratio:.3f}' if np.isfinite(getattr(c, 'range_ratio', np.nan)) else '  N/A'
-        dc_s   = str(getattr(c, 'decile_coverage', '-'))
-        clip_s = (f'{c.clip_above:.3f}' if getattr(c, 'clip_above', None) is not None
-                  else '  none')
-        note   = (c.reject_reason if c.correction_type == 'none'
-                  else getattr(c, 'notes', ''))
-        print(f'  {s:<{col_w}} {reg:<8} {sea:<4} '
-              f'{c.correction_type:<13} {c.n_pairs:>6}  {r_s:>5}  '
-              f'{ks_s:>5}  {rr_s:>5}  {dc_s:>2}  {clip_s:>6}  '
-              f'{_f(c.rmse_before)}  {_f(c.rmse_after)}  {_f(c.rmse_after_cv)}  {note}')
+def _linear_fit(sat: np.ndarray, ref: np.ndarray) -> tuple[float, float]:
+    """OLS fit ref ≈ α · sat + β.  Returns (α, β); NaN, NaN if degenerate."""
+    if sat.size < 2:
+        return float('nan'), float('nan')
+    x = sat.astype(np.float64)
+    y = ref.astype(np.float64)
+    sx, sy = x.mean(), y.mean()
+    sxx = float(np.sum((x - sx) * (x - sx)))
+    if sxx < 1e-12:
+        return float('nan'), float('nan')
+    sxy = float(np.sum((x - sx) * (y - sy)))
+    alpha = sxy / sxx
+    beta = sy - alpha * sx
+    return alpha, beta
 
 
-# ── Step A4b: LEO–Himawari spatial-offset correction (thesis §7.4.2) ─────────
-
-def _scan_merged_files_for_offset(start_d, end_d):
-    """Yield (Path, date) for merged NetCDFs in [start_d, end_d]."""
-    import glob
-    from datetime import timedelta
-    d = start_d
-    while d <= end_d:
-        pattern = str(
-            MERGED_DIR / d.strftime('%Y') / d.strftime('%m') /
-            d.strftime('%d') / 'merged_*.nc'
-        )
-        for fpath in sorted(glob.glob(pattern)):
-            yield Path(fpath), d
-        d += timedelta(days=1)
+def _rmse(pred: np.ndarray, ref: np.ndarray) -> float:
+    if pred.size == 0:
+        return float('nan')
+    diff = pred.astype(np.float64) - ref.astype(np.float64)
+    return float(np.sqrt(np.mean(diff * diff)))
 
 
-def build_leo_himawari_offset(
-    start_d,
-    end_d,
-    output_path: Path | str = LEO_HIMAWARI_OFFSET_FILE,
-    min_pairs: int = LEO_HIMAWARI_MIN_PAIRS,
-    smooth_sigma: float = LEO_HIMAWARI_SMOOTH_SIGMA,
-) -> None:
-    """Compute and persist the Himawari↔LEO spatial offset map (thesis §7.4.2).
+def _kfold_cv(
+    sat: np.ndarray, ref: np.ndarray, n_folds: int,
+) -> tuple[float, float, float]:
+    """K-fold CV.  Returns (mean α_CV, mean β_CV, mean RMSE_after_CV)."""
+    n = sat.size
+    if n < n_folds * 2:
+        return float('nan'), float('nan'), float('nan')
 
-    For each grid cell, accumulates the mean residual:
+    rng = np.random.default_rng(42)
+    idx = rng.permutation(n)
+    folds = np.array_split(idx, n_folds)
 
-        offset[lat, lon, season] = mean( Himawari_corrected
-                                         − ICW_mean(LEO_sensors_corrected) )
+    alphas, betas, rmses = [], [], []
+    for f in range(n_folds):
+        val_idx = folds[f]
+        tr_idx  = np.concatenate([folds[g] for g in range(n_folds) if g != f])
+        a, b = _linear_fit(sat[tr_idx], ref[tr_idx])
+        if not (np.isfinite(a) and np.isfinite(b)):
+            continue
+        pred = a * sat[val_idx] + b
+        alphas.append(a)
+        betas.append(b)
+        rmses.append(_rmse(pred, ref[val_idx]))
 
-    over the training period, then Gaussian-smooths and writes to NetCDF.
+    if not alphas:
+        return float('nan'), float('nan'), float('nan')
+    return (float(np.mean(alphas)),
+            float(np.mean(betas)),
+            float(np.mean(rmses)))
 
-    Prerequisite: a Stage A run exists for [start_d, end_d] so MERGED_DIR
-    contains AOD_himawari and at least one LEO sensor per slot.
+
+def _classify_route(
+    alpha_cv:      float,
+    beta_cv:       float,
+    n_pairs:       int,
+    rmse_before:   float,
+    rmse_after_cv: float,
+) -> str:
+    """Decide 'apply' vs 'none' for one MERRA-2-anchored stratum.
+
+    Two gates in sequence:
+      1. §7.4.1 guard rail — N, α_cv, β_cv must be in range.
+      2. §8.1.2 gate A     — CV RMSE drop must clear GATE_A_RMSE_DROP_MIN.
+
+    NaN rmse_after_cv (e.g. _kfold_cv bailed) is treated as a gate-A failure,
+    matching the conservative reading of §7.4.1 step 3.
     """
-    import netCDF4 as nc
-    from scipy.ndimage import gaussian_filter
-    from config import SENSOR_RMSE_FLOOR, MODIS_SOUTH_WEIGHT_FACTOR
-    from fusion import load_rmse
+    if n_pairs < SOFT_CAL_MIN_PAIRS:
+        return 'none'
+    if not (np.isfinite(alpha_cv) and np.isfinite(beta_cv)):
+        return 'none'
+    if alpha_cv < SOFT_CAL_ALPHA_MIN or alpha_cv > SOFT_CAL_ALPHA_MAX:
+        return 'none'
+    if abs(beta_cv) > SOFT_CAL_BETA_ABSMAX:
+        return 'none'
+    if not (np.isfinite(rmse_before) and np.isfinite(rmse_after_cv)):
+        return 'none'
+    if rmse_after_cv > rmse_before - GATE_A_RMSE_DROP_MIN:
+        return 'none'
+    return 'apply'
 
-    levels   = ('himawari',)
-    seasons  = ('dry', 'wet')
-    leo_vars = ('AOD_modis_maiac', 'AOD_viirs_snpp', 'AOD_viirs_noaa20')
 
-    rmse_dict   = load_rmse()
-    lat_2d, _   = np.meshgrid(LATS, LONS, indexing='ij')
-    region_code = np.where(lat_2d >= NORTH_CENTRAL_LAT, 2,
-                           np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1)).astype(np.int8)
-    _reg_codes  = ((0, 'south'), (1, 'central'), (2, 'north'))
+def _try_aeronet_fallback(
+    sat: np.ndarray,
+    aer: np.ndarray,
+    n_folds: int = SOFT_CAL_CV_FOLDS,
+) -> dict:
+    """Fit `AERONET = α · sat + β` on all pairs; gate on k-fold CV mean drop.
 
-    def _weight_grid(sensor: str, season: str) -> np.ndarray:
-        w = np.zeros((NLAT, NLON), dtype=np.float64)
-        for code, reg in _reg_codes:
-            rmse_val = rmse_dict.get(
-                (sensor, reg, season),
-                rmse_dict.get((sensor, reg),
-                              rmse_dict.get((sensor, 'north'), np.nan)),
-            )
-            if not np.isfinite(rmse_val):
-                continue
-            rmse_val = max(float(rmse_val), SENSOR_RMSE_FLOOR)
-            w[region_code == code] = 1.0 / rmse_val ** 2
-        if sensor == 'modis_maiac':
-            w[region_code == 0] *= MODIS_SOUTH_WEIGHT_FACTOR
-        return w
-
-    weight_grids: dict[tuple[str, str], np.ndarray] = {
-        (v, sea): _weight_grid(v.replace('AOD_', ''), sea)
-        for v in leo_vars for sea in seasons
+    Returns a dict with the in-sample α/β (what apply-time uses if the gate
+    passes), the CV-mean α/β (what the gate evaluates), uncorrected and
+    corrected RMSEs (in-sample and CV-mean), the pair count, and a `passed`
+    flag.  Widened α/β bounds and stricter RMSE-drop gate vs the MERRA-2
+    anchor — see config for the why.
+    """
+    result = {
+        'n':                int(sat.size),
+        'alpha':            float('nan'),
+        'beta':             float('nan'),
+        'alpha_cv':         float('nan'),
+        'beta_cv':          float('nan'),
+        'rmse_before':      float('nan'),
+        'rmse_after':       float('nan'),
+        'rmse_after_cv':    float('nan'),
+        'passed':           False,
     }
 
-    shape  = (NLAT, NLON)
-    sums   = {(lv, sea): np.zeros(shape, dtype=np.float64) for lv in levels for sea in seasons}
-    counts = {(lv, sea): np.zeros(shape, dtype=np.int32)   for lv in levels for sea in seasons}
+    if sat.size < AERONET_FALLBACK_MIN_PAIRS:
+        return result
 
-    files = list(_scan_merged_files_for_offset(start_d, end_d))
-    print(f'[leo_himawari_offset] scanning {len(files)} merged files '
-          f'in {start_d} → {end_d}')
+    # In-sample fit — α/β that production will apply if the CV gate passes.
+    alpha, beta = _linear_fit(sat, aer)
+    if not (np.isfinite(alpha) and np.isfinite(beta)):
+        return result
+    pred_in = alpha * sat + beta
+    result.update(
+        alpha=float(alpha), beta=float(beta),
+        rmse_before=_rmse(sat, aer),
+        rmse_after =_rmse(pred_in, aer),
+    )
 
-    bar = _make_bar(files, desc='LEO–Himawari scan', unit='slot', ncols=80)
-    for fpath, day in (bar if bar is not None else files):
-        season = 'dry' if day.month in DRY_MONTHS else 'wet'
-        try:
-            with nc.Dataset(str(fpath)) as ds:
-                num     = np.zeros(shape, dtype=np.float64)
-                denom   = np.zeros(shape, dtype=np.float64)
-                any_leo = False
-                for v in leo_vars:
-                    if v not in ds.variables:
-                        continue
-                    any_leo = True
-                    a = np.ma.filled(ds.variables[v][:].astype(np.float32), np.nan)
-                    finite = np.isfinite(a)
-                    if not np.any(finite):
-                        continue
-                    wv = np.where(finite, weight_grids[(v, season)], 0.0)
-                    num   += wv * np.where(finite, a, 0.0)
-                    denom += wv
-                if not any_leo:
-                    continue
-                with np.errstate(invalid='ignore', divide='ignore'):
-                    leo_mean = np.where(denom > 0, num / denom, np.nan)
+    # K-fold CV — α/β and out-of-fold RMSE used for the gate.
+    alpha_cv, beta_cv, rmse_after_cv = _kfold_cv(sat, aer, n_folds)
+    result.update(
+        alpha_cv=alpha_cv, beta_cv=beta_cv,
+        rmse_after_cv=rmse_after_cv,
+    )
 
-                for lv in levels:
-                    var = 'AOD_himawari' if lv == 'himawari' else f'AOD_himawari_{lv}'
-                    if var not in ds.variables:
-                        continue
-                    hi    = np.ma.filled(ds.variables[var][:].astype(np.float32), np.nan)
-                    valid = np.isfinite(hi) & np.isfinite(leo_mean)
-                    if not np.any(valid):
-                        continue
-                    key = (lv, season)
-                    sums[key][valid]   += (hi[valid] - leo_mean[valid]).astype(np.float64)
-                    counts[key][valid] += 1
-        except Exception as exc:
-            print(f'  skip {fpath.name}: {exc}')
-    if bar is not None:
-        bar.close()
+    if not (np.isfinite(alpha_cv) and np.isfinite(beta_cv)):
+        return result
+    # Widened α/β bounds (AERONET-specific).
+    if alpha_cv < AERONET_FALLBACK_ALPHA_MIN or alpha_cv > AERONET_FALLBACK_ALPHA_MAX:
+        return result
+    if abs(beta_cv) > AERONET_FALLBACK_BETA_ABSMAX:
+        return result
 
-    # ── Mean, mask-weighted smoothing, NaN → 0 outside coverage ─────────────
-    offsets:     dict[tuple, np.ndarray] = {}
-    pair_counts: dict[tuple, np.ndarray] = {}
-    for key in sums:
-        cnt = counts[key]
-        ok  = cnt >= min_pairs
-        with np.errstate(invalid='ignore', divide='ignore'):
-            raw = np.where(ok, sums[key] / np.maximum(cnt, 1), 0.0)
-        if smooth_sigma > 0 and np.any(ok):
-            num_s   = gaussian_filter(raw * ok, sigma=smooth_sigma)
-            denom_s = gaussian_filter(ok.astype(np.float64), sigma=smooth_sigma)
-            with np.errstate(invalid='ignore', divide='ignore'):
-                smooth = np.where(denom_s > 0.01, num_s / denom_s, 0.0)
-            offsets[key] = smooth.astype(np.float32)
-        else:
-            offsets[key] = raw.astype(np.float32)
-        pair_counts[key] = cnt.astype(np.int32)
+    rb = result['rmse_before']
+    ra = result['rmse_after_cv']
+    if not (np.isfinite(rb) and np.isfinite(ra)):
+        return result
+    # Stricter drop than MERRA-2 anchor — couples to widened bounds.
+    if ra > rb - AERONET_FALLBACK_RMSE_DROP_MIN:
+        return result
 
-    # ── Write NetCDF ──────────────────────────────────────────────────────────
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with nc.Dataset(str(output_path), 'w', format='NETCDF4') as ds:
-        ds.title        = 'Himawari↔LEO spatial offset map (thesis §7.4.2)'
-        ds.train_start  = start_d.isoformat()
-        ds.train_end    = end_d.isoformat()
-        ds.min_pairs    = int(min_pairs)
-        ds.smooth_sigma = float(smooth_sigma)
-        ds.createDimension('lat', NLAT)
-        ds.createDimension('lon', NLON)
-        v_lat     = ds.createVariable('lat', 'f4', ('lat',))
-        v_lat[:]  = LATS.astype(np.float32)
-        v_lon     = ds.createVariable('lon', 'f4', ('lon',))
-        v_lon[:]  = LONS.astype(np.float32)
-
-        for (lv, sea), arr in offsets.items():
-            name = f'offset_{lv}_{sea}'
-            v = ds.createVariable(name, 'f4', ('lat', 'lon'), zlib=True, complevel=4)
-            v.long_name = f'Mean Himawari ({lv}) minus LEO_mean, {sea} season'
-            v.units     = '1'
-            v[:] = arr
-        for (lv, sea), arr in pair_counts.items():
-            name = f'n_pairs_{lv}_{sea}'
-            v = ds.createVariable(name, 'i4', ('lat', 'lon'), zlib=True, complevel=4)
-            v.long_name = f'N co-located slots, Himawari {lv} / LEO, {sea}'
-            v[:] = arr
-
-    print(f'[leo_himawari_offset] saved → {output_path}')
-    for (lv, sea), arr in offsets.items():
-        cnt = pair_counts[(lv, sea)]
-        ok  = cnt >= min_pairs
-        if np.any(ok):
-            print(f'  {lv}/{sea}: n_cells_ok={int(ok.sum()):5d}  '
-                  f'mean_offset={float(arr[ok].mean()):+.4f}  '
-                  f'min={float(arr[ok].min()):+.4f}  '
-                  f'max={float(arr[ok].max()):+.4f}')
-        else:
-            print(f'  {lv}/{sea}: no cells met min_pairs={min_pairs}')
+    result['passed'] = True
+    return result
 
 
-def load_leo_himawari_offset(
-    fpath: Path | str = LEO_HIMAWARI_OFFSET_FILE,
-) -> Optional[dict[tuple[str, str], np.ndarray]]:
-    """Return offsets dict keyed by (level, season).
+def fit_stratum(
+    sensor: str, region: str, season: str,
+    sat: np.ndarray, merra2_aod: np.ndarray,
+    aeronet_pairs: Optional[dict[str, np.ndarray]] = None,
+    n_folds: int = SOFT_CAL_CV_FOLDS,
+) -> SoftCal:
+    """Fit one (sensor, region, season) stratum (MERRA-2 + AERONET fallback).
 
-    Legacy v3.1 files with 'l2'/'l3' levels are still readable.
+    `aeronet_pairs`, when supplied, is the dict returned by
+    `collect_aeronet_pairs()` for this (region, season); the fallback fits
+    `AERONET = α · sat + β` on all pairs in [TRAIN_START, TRAIN_END] and
+    gates on k-fold CV mean RMSE drop.  If the MERRA-2 anchor passes, the
+    fallback is skipped (and its diagnostic fields stay at their defaults).
     """
-    import netCDF4 as nc
-    fpath = Path(fpath)
-    if not fpath.exists():
-        return None
-    out: dict[tuple[str, str], np.ndarray] = {}
-    try:
-        with nc.Dataset(str(fpath)) as ds:
-            for lv in ('himawari', 'l2', 'l3'):
-                for sea in ('dry', 'wet'):
-                    name = f'offset_{lv}_{sea}'
-                    if name in ds.variables:
-                        out[(lv, sea)] = np.ma.filled(
-                            ds.variables[name][:].astype(np.float32), 0.0)
-    except Exception:
-        return None
-    return out if out else None
+    n = sat.size
+    rmse_before = _rmse(sat, merra2_aod)
+
+    if n < SOFT_CAL_MIN_PAIRS:
+        fit = SoftCal(
+            sensor=sensor, region=region, season=season,
+            alpha=float('nan'), beta=float('nan'),
+            alpha_cv=float('nan'), beta_cv=float('nan'),
+            n_pairs=int(n),
+            rmse_before=rmse_before, rmse_after=float('nan'),
+            rmse_after_cv=float('nan'),
+            route='none', anchor='none',
+        )
+    else:
+        alpha, beta = _linear_fit(sat, merra2_aod)
+        pred_full = alpha * sat + beta
+        rmse_after = _rmse(pred_full, merra2_aod)
+
+        alpha_cv, beta_cv, rmse_cv = _kfold_cv(sat, merra2_aod, n_folds)
+        route = _classify_route(alpha_cv, beta_cv, int(n), rmse_before, rmse_cv)
+
+        fit = SoftCal(
+            sensor=sensor, region=region, season=season,
+            alpha=float(alpha), beta=float(beta),
+            alpha_cv=float(alpha_cv), beta_cv=float(beta_cv),
+            n_pairs=int(n),
+            rmse_before=rmse_before, rmse_after=rmse_after,
+            rmse_after_cv=rmse_cv,
+            route=route,
+            anchor=('merra2' if route == 'apply' else 'none'),
+        )
+
+    if fit.route == 'apply':
+        return fit
+    if aeronet_pairs is None:
+        return fit
+
+    aer = _try_aeronet_fallback(
+        aeronet_pairs.get('sat', np.empty(0, np.float32)),
+        aeronet_pairs.get('aer', np.empty(0, np.float32)),
+    )
+    fit.n_aeronet         = aer['n']
+    fit.alpha_aer         = aer['alpha']
+    fit.beta_aer          = aer['beta']
+    fit.alpha_aer_cv      = aer['alpha_cv']
+    fit.beta_aer_cv       = aer['beta_cv']
+    fit.rmse_aer_before   = aer['rmse_before']
+    fit.rmse_aer_after    = aer['rmse_after']
+    fit.rmse_aer_after_cv = aer['rmse_after_cv']
+
+    if aer['passed']:
+        # Swap winning fit to the AERONET anchor; route flips to 'apply'.
+        fit.alpha  = aer['alpha']
+        fit.beta   = aer['beta']
+        fit.route  = 'apply'
+        fit.anchor = 'aeronet'
+    # else: route stays 'none', anchor stays 'none'.  The diagnostic fields
+    # above let you tell 'AERONET never tried' (n_aeronet=0) from
+    # 'AERONET tried and failed' (n_aeronet > 0).
+
+    return fit
 
 
-def apply_leo_himawari_offset(
-    aod_grid: np.ndarray,
+# ── Driver: train all sensors / all strata ──────────────────────────────────
+
+def train_all_sensors(
+    sensors: Iterable[str] = _SENSORS_TO_CALIBRATE,
+    train_start: date = TRAIN_START,
+    train_end:   date = TRAIN_END,
+    sample_every_n_slots: int = 1,
+    output_file: Path = SOFT_CAL_FILE,
+) -> dict[str, dict[str, SoftCal]]:
+    """Collect pairs + fit + persist for every (sensor, region, season).
+
+    Returns a nested dict::
+
+        { sensor: { 'region|season': SoftCal, ... }, ... }
+
+    The same structure is JSON-serialised to `output_file`.  Existing entries
+    in the file are overwritten only for the sensors we actually trained on
+    this run, so a partial re-train doesn't wipe other sensors' fits.
+    """
+    out: dict[str, dict[str, SoftCal]] = {}
+
+    for sensor in sensors:
+        print(f'\n[soft_cal] {sensor}: collecting (sat, MERRA-2) pairs '
+              f'{train_start} → {train_end}'
+              + (f' (stride {sample_every_n_slots})' if sample_every_n_slots > 1 else ''))
+        pairs = collect_sat_merra2_pairs(
+            sensor=sensor,
+            train_start=train_start, train_end=train_end,
+            sample_every_n_slots=sample_every_n_slots,
+        )
+        if not pairs:
+            print(f'  [soft_cal] {sensor}: no (sat, MERRA-2) pairs collected '
+                  '— is run_collocate.py grid up to date?')
+            continue
+
+        # AERONET fallback pairs are collected once per sensor.  Missing CSVs
+        # (e.g. before `run_collocate.py match` has run) → empty dict → no
+        # fallback attempted; that's fine, MERRA-2 anchor decisions stand.
+        aer_pairs = collect_aeronet_pairs(sensor)
+        if aer_pairs:
+            print(f'  [soft_cal] {sensor}: AERONET fallback pairs available '
+                  f'for {len(aer_pairs)} (region, season) stratum/strata')
+
+        sensor_out: dict[str, SoftCal] = {}
+        for region in REGIONS:
+            for season in SEASONS:
+                key = (region, season)
+                d = pairs.get(key)
+                if d is None or d['sat'].size == 0:
+                    continue
+                fit = fit_stratum(
+                    sensor, region, season, d['sat'], d['merra2'],
+                    aeronet_pairs=aer_pairs.get(key),
+                )
+                sensor_out[f'{region}|{season}'] = fit
+                tag = (f'[{fit.route}/{fit.anchor}]' if fit.anchor != 'merra2'
+                       else f'[{fit.route}]')
+                print(f'  {sensor:>14}  {region:>7} {season:>3}  '
+                      f'N={fit.n_pairs:>7d}  '
+                      f'α={fit.alpha:6.3f} β={fit.beta:+6.3f}  '
+                      f'α_CV={fit.alpha_cv:6.3f} β_CV={fit.beta_cv:+6.3f}  '
+                      f'rmse {fit.rmse_before:.3f} → {fit.rmse_after_cv:.3f}  '
+                      f'{tag}')
+        out[sensor] = sensor_out
+
+    _persist_soft_calibrations(out, output_file)
+    return out
+
+
+def _persist_soft_calibrations(
+    fits: dict[str, dict[str, SoftCal]],
+    output_file: Path,
+) -> None:
+    """Write or overlay the per-sensor SoftCal entries to JSON."""
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if output_file.exists():
+        try:
+            existing = json.loads(output_file.read_text())
+        except Exception:
+            existing = {}
+
+    for sensor, sensor_fits in fits.items():
+        existing[sensor] = {k: fit.to_dict() for k, fit in sensor_fits.items()}
+
+    output_file.write_text(json.dumps(existing, indent=2, sort_keys=True))
+    print(f'\n[soft_cal] {len(fits)} sensor(s) persisted to {output_file}')
+
+
+# ── Loading / applying at runtime ───────────────────────────────────────────
+
+def load_soft_calibrations(
+    path: Path = SOFT_CAL_FILE,
+) -> dict[str, dict[tuple[str, str], dict]]:
+    """Load `soft_calibration.json` into the lookup shape run_stage_a.py wants.
+
+    Returns::
+
+        { sensor: { (region, season): {'alpha': ..., 'beta': ..., 'route': ...},
+                    ... },
+          ... }
+
+    Missing file → empty dict.  Strata routed to 'none' are kept in the dict
+    so the caller can apply the §7.5 NONE_PENALTY_FACTOR.
+    """
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text())
+    out: dict[str, dict[tuple[str, str], dict]] = {}
+    for sensor, sensor_entries in raw.items():
+        out[sensor] = {}
+        for stratum_key, fit_dict in sensor_entries.items():
+            region, season = stratum_key.split('|')
+            out[sensor][(region, season)] = fit_dict
+    return out
+
+
+# ── Cosine-tapered (α, β) across region boundaries ─────────────────────────
+#
+# Hard region masks at lat=16 and lat=11.5 stamp a step discontinuity into the
+# merged AOD wherever the two adjacent strata's (α, β) differ.  We replace the
+# step with a Hann-half cosine taper in calibration space over
+# ±SOFTCAL_BLEND_HALF_WIDTH around each boundary.
+#
+# Blending happens on (α, β) directly, not on the corrected AOD.  Linearly
+# interpolating the *parameters* of an affine map is the well-defined
+# operation in calibration space; interpolating the *outputs*
+# (w·(α_N·sat+β_N) + (1−w)·(α_C·sat+β_C)) is algebraically equivalent here,
+# but the parameter form keeps a single (α(lat), β(lat)) field that
+# downstream diagnostics can introspect.
+#
+# 'none'/missing strata contribute identity (α=1, β=0) to the blend, so a
+# correction tapers smoothly to no-op across a route mismatch rather than
+# extending a CV-rejected fit into a region whose data didn't validate it.
+
+_REGION_BOUNDARIES_NS: tuple[tuple[float, str, str], ...] = (
+    # (boundary_lat, upper_region, lower_region) — walked south → north
+    (CENTRAL_SOUTH_LAT, 'central', 'south'),
+    (NORTH_CENTRAL_LAT, 'north',   'central'),
+)
+
+
+def _upper_region_weight(
+    lat: np.ndarray,
+    boundary: float,
+    half_width: float = SOFTCAL_BLEND_HALF_WIDTH,
+) -> np.ndarray:
+    """Cosine-taper weight for the region *above* `boundary`.
+
+    Returns 1 for lat ≥ boundary+half_width, 0 for lat ≤ boundary−half_width,
+    and ½(1 − cos(π·t)) in between — C¹ at both edges of the band.
+    """
+    t = np.clip((lat - (boundary - half_width)) / (2.0 * half_width), 0.0, 1.0)
+    return 0.5 * (1.0 - np.cos(np.pi * t))
+
+
+def _ab_for_region(
+    sensor_fits: dict[tuple[str, str], dict],
+    region: str,
+    season: str,
+) -> tuple[float, float]:
+    """(α, β) for one (region, season), with identity fallback for 'none'/missing."""
+    fit = sensor_fits.get((region, season))
+    if fit is None or fit.get('route') != 'apply':
+        return 1.0, 0.0
+    return float(fit['alpha']), float(fit['beta'])
+
+
+def apply_soft_calibration_grid(
+    sat: np.ndarray,
     sensor: str,
     month: int,
-    offsets: dict[tuple[str, str], np.ndarray],
+    soft_cals: dict[str, dict[tuple[str, str], dict]],
 ) -> np.ndarray:
-    """Subtract the LEO-anchored spatial offset from the merged Himawari grid.
+    """Apply `sat_corrected = α(lat)·sat + β(lat)` with cosine-tapered
+    (α, β) across the region boundaries.
 
-    Returns aod_grid unchanged if sensor is not 'himawari', if the offset
-    entry is missing, or for NaN input pixels.
+    Within ±SOFTCAL_BLEND_HALF_WIDTH of each boundary, (α, β) are blended in
+    calibration space between the two adjacent strata's fits.  Strata routed
+    to 'none' (or absent) contribute identity, so corrections taper to no-op
+    across route mismatches.  Sensors absent from the JSON pass through raw.
+
+    Output is clipped to [SOFT_CAL_OUTPUT_MIN, SOFT_CAL_OUTPUT_MAX] to bound
+    extrapolation when α·sat+β projects below 0 or far above MERRA-2 cap.
     """
-    if sensor != 'himawari':
-        return aod_grid
-    sea = 'dry' if month in DRY_MONTHS else 'wet'
-    off = offsets.get(('himawari', sea))
-    if off is None:
-        return aod_grid
-    out   = aod_grid.astype(np.float32, copy=True)
+    if sat is None:
+        return None
+    sensor_fits = soft_cals.get(sensor)
+    if not sensor_fits:
+        return sat.astype(np.float32, copy=True)
+
+    season = _season_of(month)
+    ab = {r: _ab_for_region(sensor_fits, r, season) for r in REGIONS}
+
+    # Sequential blend south → north.  The two bands ([11, 12] and [15.5, 16.5])
+    # are non-overlapping, so each boundary's blend acts independently on the
+    # already-resolved (α, β) below it.
+    alpha_1d = np.full(NLAT, ab['south'][0], dtype=np.float64)
+    beta_1d  = np.full(NLAT, ab['south'][1], dtype=np.float64)
+    for boundary, upper, _lower in _REGION_BOUNDARIES_NS:
+        w = _upper_region_weight(LATS, boundary)
+        a_u, b_u = ab[upper]
+        alpha_1d = (1.0 - w) * alpha_1d + w * a_u
+        beta_1d  = (1.0 - w) * beta_1d  + w * b_u
+
+    alpha_2d = alpha_1d[:, None]
+    beta_2d  = beta_1d[:, None]
+
+    # NaN propagates through the affine map, so invalid cells stay NaN.
+    out = (alpha_2d * sat + beta_2d).astype(np.float32)
     valid = np.isfinite(out)
-    out[valid] = np.clip(out[valid] - off[valid], 0.0, None)
+    np.clip(out, SOFT_CAL_OUTPUT_MIN, SOFT_CAL_OUTPUT_MAX, out=out, where=valid)
     return out

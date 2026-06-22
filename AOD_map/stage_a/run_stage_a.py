@@ -1,21 +1,28 @@
-"""Main Stage A pipeline driver: A3 → A4 → A5 per 30-min slot.
+"""Main Stage A pipeline driver (v3.4): A2-read → A4 → A5 → A3 per 30-min slot.
 
-A1 (read + QA) and A2 (bin to 0.05°) are now produced once by
-`run_collocate.py grid` and persisted to GRIDDED_DIR — this driver reads
-that intermediate instead of re-gridding from raw files, so binning runs
-exactly once per slot regardless of how many times the rest of the
-pipeline is re-run (e.g. before vs. after the LEO offset is built).
+A1 (QA) + A2 (bin to 0.05°) are produced once by `run_collocate.py grid` and
+persisted to GRIDDED_DIR — this driver reads that intermediate instead of
+re-gridding from raw files.
 
 For each calendar day the pipeline:
   1. Iterates over 48 UTC half-hour slots (00:00, 00:30, …, 23:30).
   2. Reads the pre-gridded per-sensor AOD from GRIDDED_DIR.
-  3. Applies physics normalization: AOD × (1−RH/100)^0.6 / PBLH (A3).
-  4. Applies pre-trained CDF bias corrections per (sensor, region, season) (A4).
-  5. Fuses the corrected grids with ICW weights (A5).
-  6. Writes one NetCDF file per slot to MERGED_DIR / YYYY / MM / DD.
+  3. Applies the §7.4.1 linear MERRA-2 soft calibration per (sensor, region,
+     season) stratum.
+  4. Merges Himawari L2 + L3 into a single Himawari channel using the stratum-
+     aware per-pixel preference (§7.5: the level with the lower σ²_TC supplies
+     the primary pixel value; the other fills its gaps).
+  5. TC-weighted fusion (§7.5) of the soft-calibrated sensors into AOD_merged.
+  6. Step A3 physics normalization on the fused field (§7.3, AFTER fusion).
+  7. Writes one NetCDF per slot to MERGED_DIR / YYYY / MM / DD.
 
-Prerequisite: `run_collocate.py grid --start … --end …` must have run
-for the same date range, populating GRIDDED_DIR.
+Prerequisites:
+  * `run_collocate.py grid` for the same date range (GRIDDED_DIR populated).
+  * `run_collocate.py soft_cal` → SOFT_CAL_FILE present (otherwise corrections
+    are skipped and sensors pass through uncorrected — fusion still works).
+  * `run_collocate.py tc_variance` → TC_VARIANCE_FILE present (otherwise every
+    sensor's σ² falls back to the Sayer/Levy EE floor — fusion still works
+    but weights become uniform).
 
 Usage
 -----
@@ -29,8 +36,7 @@ python run_stage_a.py --start 2023-01-01 --end 2023-01-31 --no-physics
 from __future__ import annotations
 import os
 # Must be set before xarray / netCDF4 / HDF5 are imported anywhere — disables
-# HDF5 read locks so 8-way concurrent open of the 44 ERA5 monthly files
-# doesn't race and kill workers (BrokenProcessPool).  Read-only access.
+# HDF5 read locks so concurrent open of the 44 ERA5 monthly files doesn't race.
 os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
 
 import argparse
@@ -54,25 +60,23 @@ except ImportError:
 
 from config import (
     LATS, LONS, NLAT, NLON,
-    MERGED_DIR, BIASC_DIR,
+    MERGED_DIR,
     SLOT_MINUTES,
     DRY_MONTHS,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
 )
 from grid            import read_gridded_slot
 from physics         import apply_physics_correction, close_era5
-from bias_correction import (
-    apply_correction_grid, load_all_corrections,
-    load_leo_himawari_offset, apply_leo_himawari_offset,
-)
-from fusion          import fuse, load_rmse
+from bias_correction import apply_soft_calibration_grid, load_soft_calibrations
+from fusion          import fuse, load_tc_variance, load_routes, ee_floor_sigma2
+
 
 _ALL_SENSOR_GROUPS = ('himawari', 'viirs', 'modis')
-# Training keys (bias-correction CDFs).  Himawari L2 and L3 each train their
-# own CDF from their own AERONET collocation CSVs.  Fusion sees only the
-# merged 'himawari' grid; for each (region, season) we use whichever level
-# has the lower post-correction RMSE as the per-pixel primary, with the
-# other level filling its gaps (see _himawari_prefer_l2_mask below).
+# Each Himawari level is soft-calibrated independently against MERRA-2; the
+# corrected per-level grids are then merged into one 'himawari' grid using the
+# σ²_TC table (the level with the lower σ²_TC per (region, season) is the
+# per-pixel primary; the other fills its gaps).  Fusion sees only the merged
+# 'himawari' grid (§7.5 'Himawari L2/L3 stratum-aware per-pixel merge').
 _SENSOR_KEYS = {
     'himawari': ['himawari_l2', 'himawari_l3'],
     'viirs':    ['viirs_snpp', 'viirs_noaa20'],
@@ -85,21 +89,24 @@ SLOTS_PER_DAY = 48
 def _himawari_prefer_l2_mask(
     lat_2d: np.ndarray,
     month: int,
-    rmse_dict: dict,
+    sigma2_table: dict,
 ) -> np.ndarray:
-    """Per-pixel boolean mask: True where L2's post-correction RMSE beats L3's.
+    """Per-pixel boolean mask: True where L2's σ²_TC beats L3's for (region, season).
 
-    Looked up per (region, season) from rmse_dict (the same source fusion
-    uses for ICW weights).  Ties and missing entries default to False
-    (L3-first), preserving legacy behaviour when only one level is trained.
+    §7.5: for each stratum the level with the lower σ²_TC supplies the primary
+    pixel value; the other fills its gaps.  Ties and missing entries default to
+    False (L3-first); when only one level has a TC entry the mask is irrelevant
+    because the fallback path is the only available source.
     """
     season = 'dry' if month in DRY_MONTHS else 'wet'
-    region_code = np.where(lat_2d >= NORTH_CENTRAL_LAT, 2,
-                           np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1))
+    region_code = np.where(
+        lat_2d >= NORTH_CENTRAL_LAT, 2,
+        np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1),
+    )
     mask = np.zeros(lat_2d.shape, dtype=bool)
     for code, reg in ((0, 'south'), (1, 'central'), (2, 'north')):
-        l2 = rmse_dict.get(('himawari_l2', reg, season))
-        l3 = rmse_dict.get(('himawari_l3', reg, season))
+        l2 = sigma2_table.get(('himawari_l2', reg, season))
+        l3 = sigma2_table.get(('himawari_l3', reg, season))
         if l2 is not None and l3 is not None and l2 < l3:
             mask[region_code == code] = True
     return mask
@@ -108,40 +115,31 @@ def _himawari_prefer_l2_mask(
 # ── Environment banner ────────────────────────────────────────────────────────
 
 def _print_env_banner() -> None:
-    """Print library versions and active compute backend to stdout."""
     W = 64
     print("=" * W)
-    print("Stage A Pipeline — Runtime Environment")
+    print("Stage A Pipeline (v3.4) — Runtime Environment")
     print("-" * W)
-
-    # Python
     print(f"  {'Python':<12} {sys.version.split()[0]}")
-
-    # Key scientific libraries
-    _libs = [
+    for mod_name, label in [
         ("numpy",    "NumPy"),
         ("scipy",    "SciPy"),
         ("xarray",   "xarray"),
         ("netCDF4",  "netCDF4"),
         ("rasterio", "rasterio"),
         ("tqdm",     "tqdm"),
-    ]
-    for mod_name, label in _libs:
+    ]:
         try:
             mod = __import__(mod_name)
             print(f"  {label:<12} {getattr(mod, '__version__', '?')}")
         except ImportError:
             print(f"  {label:<12} not installed")
-
     print("=" * W)
 
 
 def _fmt_duration(seconds: float) -> str:
-    """Format elapsed seconds as 'Xm Ys' or 'Xs'."""
     if seconds >= 60:
         m = int(seconds // 60)
-        s = seconds - m * 60
-        return f"{m}m {s:.1f}s"
+        return f"{m}m {seconds - m * 60:.1f}s"
     return f"{seconds:.1f}s"
 
 
@@ -159,7 +157,7 @@ def _write_netcdf(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with nc.Dataset(str(out_path), 'w', format='NETCDF4') as ds:
-        ds.title       = 'Vietnam merged AOD — Stage A 30-min product'
+        ds.title       = 'Vietnam merged AOD — Stage A v3.4 30-min product'
         ds.institution = 'Hanoi University of Science and Technology'
         ds.slot_utc    = slot_utc.isoformat()
         ds.Conventions = 'CF-1.8'
@@ -184,24 +182,26 @@ def _write_netcdf(
             v[:] = arr
 
         _add_var('AOD_merged',      merged['aod_merged'],
-                 'ICW-merged AOD at 550 nm (bias-corrected, physics-normalized)')
+                 'TC-weighted merged AOD at 550 nm (MERRA-2-soft-calibrated)')
         _add_var('AOD_std',         merged['aod_std'],
                  'Cross-sensor AOD spread (weighted std dev)')
+        _add_var('weight_sum',      merged['weight_sum'],
+                 'Sum of TC weights (Σ 1/σ²_TC); provenance for Stage B aggregation')
         _add_var('n_sensors',       merged['n_sensors'],
                  'Number of sensors contributing', dtype='i1', fill=-1)
         _add_var('dominant_sensor', merged['dominant_sensor'],
-                 'Sensor with highest ICW weight (1=Himawari merged,3=MAIAC,4=SNPP,5=N20)',
+                 'Sensor with highest TC weight (1=Himawari merged,3=MAIAC,4=SNPP,5=N20)',
                  dtype='i1', fill=0)
         _add_var('confidence_flag', merged['confidence_flag'],
                  'Confidence: 0=none,1=H-only,2=LEO-only,3=H+LEO,4=multi-LEO+H',
                  dtype='i1', fill=0)
 
-        # ERA5 physics fields + physics-corrected AOD (Step A3)
+        # Step A3 physics fields + physics-corrected AOD.
         if physics_fields is not None:
             if physics_fields.get('aod_phys') is not None:
                 _add_var('AOD_phys_corrected', physics_fields['aod_phys'],
                          'Physics-normalized AOD: AOD_merged × (1−RH/100)^0.6 / PBLH '
-                         '(surface-concentration proxy for PM2.5 modelling)',
+                         '(PM2.5-coupling proxy; downstream-only)',
                          units='m-1')
             if physics_fields.get('RH') is not None:
                 _add_var('ERA5_RH',   physics_fields['RH'],
@@ -211,29 +211,27 @@ def _write_netcdf(
                          'ERA5 planetary boundary layer height (bilinear interp to 0.05°)',
                          units='m')
 
-        # Per-sensor bias-corrected grids for diagnostics
         for sensor, grid in sensor_grids_corrected.items():
             if grid is not None and np.any(np.isfinite(grid)):
-                _add_var(f'AOD_{sensor}', grid, f'Bias-corrected AOD from {sensor}')
+                _add_var(f'AOD_{sensor}', grid,
+                         f'Soft-calibrated AOD from {sensor}')
 
 
 # ── Per-slot processing ───────────────────────────────────────────────────────
 
 def _process_slot(
     slot_utc: datetime,
-    corrections: dict,
-    rmse_dict: dict,
+    soft_cals: dict,
+    sigma2_table: dict,
+    routes: dict,
     lat_2d: np.ndarray,
-    lon_2d: np.ndarray,
     sensor_groups: list[str],
     use_physics: bool,
     dry_run: bool,
-    leo_himawari_offset: Optional[dict] = None,
 ) -> Optional[Path]:
-    """Run Steps A3–A4–A5 for one slot using the pre-gridded A2 intermediate."""
+    """Run A2-read → A4 (soft-cal) → A5 (TC fuse) → A3 (physics) for one slot."""
     month = slot_utc.month
 
-    # ── Step A1+A2 result: load pre-gridded per-sensor AOD ─────────────────
     wanted_keys = tuple(k for grp in sensor_groups for k in _SENSOR_KEYS.get(grp, []))
     grids = read_gridded_slot(slot_utc, sensors=wanted_keys)
     if grids is None:
@@ -249,68 +247,47 @@ def _process_slot(
     if dry_run:
         return Path('dry_run')
 
-    # ── Step A4: bias correction ───────────────────────────────────────────
-    # Each Himawari level uses its own CDF (different retrieval quality);
-    # the corrected per-level grids are then merged into one 'himawari' grid.
-    # Per-pixel preference is stratum-aware: for each (region, season) the
-    # level with the lower post-correction RMSE wins; the other fills its
-    # gaps.  Post-correction RMSEs show L2 outperforms L3 in every healthy
-    # stratum (L3's hourly composite smears retrievals; L2's tighter QA chain
-    # produces lower residuals vs AERONET).
+    # ── Step A4: per-level Himawari soft calibration, then per-pixel merge ──
     corrected: dict[str, Optional[np.ndarray]] = {}
 
-    if himawari_l3_raw is not None:
-        himawari_l3_corrected = apply_correction_grid(
-            himawari_l3_raw, 'himawari_l3', month, lat_2d, lon_2d, corrections
-        )
-    else:
-        himawari_l3_corrected = None
-    if himawari_l2_raw is not None:
-        himawari_l2_corrected = apply_correction_grid(
-            himawari_l2_raw, 'himawari_l2', month, lat_2d, lon_2d, corrections
-        )
-    else:
-        himawari_l2_corrected = None
+    himawari_l2_corrected = (
+        apply_soft_calibration_grid(himawari_l2_raw, 'himawari_l2', month, soft_cals)
+        if himawari_l2_raw is not None else None
+    )
+    himawari_l3_corrected = (
+        apply_soft_calibration_grid(himawari_l3_raw, 'himawari_l3', month, soft_cals)
+        if himawari_l3_raw is not None else None
+    )
 
-    if himawari_l3_corrected is not None and himawari_l2_corrected is not None:
-        prefer_l2 = _himawari_prefer_l2_mask(lat_2d, month, rmse_dict)
+    # Per-pixel L2/L3 merge governed by σ²_TC per (region, season) — §7.5.
+    if himawari_l2_corrected is not None and himawari_l3_corrected is not None:
+        prefer_l2 = _himawari_prefer_l2_mask(lat_2d, month, sigma2_table)
         primary  = np.where(prefer_l2, himawari_l2_corrected, himawari_l3_corrected)
         fallback = np.where(prefer_l2, himawari_l3_corrected, himawari_l2_corrected)
         himawari_corrected = np.where(
             np.isfinite(primary), primary, fallback
         ).astype(np.float32)
-    elif himawari_l3_corrected is not None:
-        himawari_corrected = himawari_l3_corrected
     elif himawari_l2_corrected is not None:
         himawari_corrected = himawari_l2_corrected
+    elif himawari_l3_corrected is not None:
+        himawari_corrected = himawari_l3_corrected
     else:
         himawari_corrected = None
 
-    # Step A4b: LEO–Himawari spatial offset (thesis §7.4.2) applied to the
-    # merged Himawari grid (was per-level — one offset for the
-    # downstream sensor.)
-    if himawari_corrected is not None and leo_himawari_offset is not None:
-        himawari_corrected = apply_leo_himawari_offset(
-            himawari_corrected, 'himawari', month, leo_himawari_offset
-        )
     corrected['himawari'] = himawari_corrected
 
+    # LEO soft calibration.
     for sensor, aod in raw_grids.items():
-        if aod is None:
-            corrected[sensor] = None
-            continue
-        corrected[sensor] = apply_correction_grid(
-            aod, sensor, month, lat_2d, lon_2d, corrections
+        corrected[sensor] = (
+            apply_soft_calibration_grid(aod, sensor, month, soft_cals)
+            if aod is not None else None
         )
 
-    # ── Step A5: ICW fusion ────────────────────────────────────────────────
+    # ── Step A5: TC-weighted fusion ────────────────────────────────────────
     valid_corrected = {k: v for k, v in corrected.items() if v is not None}
-    merged = fuse(valid_corrected, month, lat_2d, rmse_dict)
+    merged = fuse(valid_corrected, month, lat_2d, sigma2_table, routes)
 
-    # ── Step A3: physics normalization — stored as a SEPARATE output field
-    # AOD_phys = AOD_merged × (1−RH/100)^0.6 / PBLH  (Nguyen 2025 Eq. 1)
-    # This produces a surface-concentration proxy (units m⁻¹) for downstream
-    # PM₂.₅ modelling — it is NOT fed back into A4/A5 which use raw AOD.
+    # ── Step A3: physics normalization — SEPARATE output, not fed back ─────
     physics_fields: Optional[dict] = None
     if use_physics:
         aod_phys, rh_grid, pblh_grid = apply_physics_correction(
@@ -318,9 +295,9 @@ def _process_slot(
         )
         if np.any(np.isfinite(rh_grid)):
             physics_fields = {
-                'RH':          rh_grid,
-                'PBLH':        pblh_grid,
-                'aod_phys':    aod_phys,
+                'RH':       rh_grid,
+                'PBLH':     pblh_grid,
+                'aod_phys': aod_phys,
             }
 
     out_path = (MERGED_DIR
@@ -333,7 +310,6 @@ def _process_slot(
 
 
 def _make_lat_lon_grids() -> tuple[np.ndarray, np.ndarray]:
-    from config import LATS, LONS
     return np.meshgrid(LATS, LONS, indexing='ij')
 
 
@@ -342,19 +318,15 @@ def _make_lat_lon_grids() -> tuple[np.ndarray, np.ndarray]:
 def run_day(
     day: date,
     sensor_groups: list[str],
-    corrections: dict,
-    rmse_dict: dict,
+    soft_cals: dict,
+    sigma2_table: dict,
+    routes: dict,
     lat_2d: np.ndarray,
-    lon_2d: np.ndarray,
     use_physics: bool = True,
     dry_run: bool = False,
     show_slot_bar: bool = False,
-    leo_himawari_offset: Optional[dict] = None,
 ) -> tuple[int, int]:
-    """Process all 48 slots for one calendar day.
-
-    Returns (n_written, n_errors).
-    """
+    """Process all 48 slots for one calendar day.  Returns (n_written, n_errors)."""
     written = 0
     errors  = 0
     skipped = 0
@@ -362,11 +334,7 @@ def run_day(
     slot_range = range(SLOTS_PER_DAY)
     if show_slot_bar and _HAS_TQDM:
         slot_iter = _tqdm(
-            slot_range,
-            desc=f"  {day}",
-            leave=False,
-            unit="slot",
-            ncols=80,
+            slot_range, desc=f"  {day}", leave=False, unit="slot", ncols=80,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}  [{elapsed}<{remaining}]  {postfix}",
         )
     else:
@@ -377,9 +345,8 @@ def run_day(
                     + timedelta(minutes=slot_idx * SLOT_MINUTES))
         try:
             out = _process_slot(
-                slot_utc, corrections, rmse_dict, lat_2d, lon_2d,
+                slot_utc, soft_cals, sigma2_table, routes, lat_2d,
                 sensor_groups, use_physics, dry_run,
-                leo_himawari_offset,
             )
             if out is not None:
                 written += 1
@@ -402,7 +369,7 @@ def run_day(
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Run Stage A pipeline')
+    p = argparse.ArgumentParser(description='Run Stage A pipeline (v3.4)')
     p.add_argument('--start',      required=True, help='Start date YYYY-MM-DD')
     p.add_argument('--end',        required=True, help='End date YYYY-MM-DD')
     p.add_argument('--sensors',    nargs='+',     default=list(_ALL_SENSOR_GROUPS),
@@ -434,19 +401,19 @@ def main():
     print(f'Dry-run          : {args.dry_run}')
     print(f'Output           : {MERGED_DIR}')
 
-    # Load pre-trained bias corrections (or empty dict if none exist yet)
-    all_sensor_keys = [k for grp in sensors for k in _SENSOR_KEYS.get(grp, [])]
-    corrections = load_all_corrections(all_sensor_keys, BIASC_DIR)
-    rmse_dict   = load_rmse()
-    leo_offset  = load_leo_himawari_offset() if 'himawari' in sensors else None
-    lat_2d, lon_2d = _make_lat_lon_grids()
+    # Load v3.4 calibration tables.
+    soft_cals    = load_soft_calibrations()
+    sigma2_table = load_tc_variance()
+    routes       = load_routes()
+    lat_2d, _    = _make_lat_lon_grids()
 
-    n_strata = len(corrections)
-    print(f'Bias strata      : {n_strata}'
-          + ('' if n_strata else '  (none found — using prior RMSE weights, no bias correction)'))
-    print(f'LEO–Himawari off : {"loaded" if leo_offset is not None else "not found (skipping §7.4.2 correction)"}')
+    n_strata_sc = sum(len(v) for v in soft_cals.values())
+    n_strata_tc = len(sigma2_table)
+    print(f'Soft cal strata  : {n_strata_sc}'
+          + ('' if n_strata_sc else '  (none — sensors will pass through uncorrected)'))
+    print(f'TC σ² strata     : {n_strata_tc}'
+          + ('' if n_strata_tc else f'  (none — falling back to EE floor σ²={ee_floor_sigma2():.4f})'))
 
-    # Enumerate calendar days
     days: list[date] = []
     d = start_d
     while d <= end_d:
@@ -465,25 +432,18 @@ def main():
 
     try:
         if args.workers > 1:
-            # Multi-process: slot-level bars won't render cleanly in subprocesses;
-            # show a per-day summary line as each future completes.
             _day_bar = (_tqdm(total=n_days, desc='Days', unit='day', ncols=80)
                         if _HAS_TQDM else None)
             try:
-                # 'spawn' (not the Linux default 'fork') so each worker starts
-                # with a clean HDF5/netCDF4 state — fork-after-import of these
-                # libraries corrupts HDF5 globals and kills the worker silently
-                # (BrokenProcessPool) when it opens the 44 ERA5 monthly files.
                 _mp_ctx = mp.get_context('spawn')
                 with concurrent.futures.ProcessPoolExecutor(
                     max_workers=args.workers, mp_context=_mp_ctx
                 ) as ex:
                     futures = {
                         ex.submit(
-                            run_day, day, sensors, corrections, rmse_dict,
-                            lat_2d, lon_2d, use_physics, args.dry_run,
+                            run_day, day, sensors, soft_cals, sigma2_table, routes,
+                            lat_2d, use_physics, args.dry_run,
                             False,   # show_slot_bar=False in subprocesses
-                            leo_offset,
                         ): day
                         for day in days
                     }
@@ -505,9 +465,7 @@ def main():
             finally:
                 if _day_bar is not None:
                     _day_bar.close()
-
         else:
-            # Single-process: nested tqdm bars (outer=days, inner=slots).
             _day_bar = (_tqdm(days, desc='Days', unit='day', ncols=80)
                         if _HAS_TQDM else None)
             day_iter = _day_bar if _day_bar is not None else days
@@ -515,10 +473,9 @@ def main():
             for day in day_iter:
                 t0 = time.perf_counter()
                 n_ok, n_err = run_day(
-                    day, sensors, corrections, rmse_dict,
-                    lat_2d, lon_2d, use_physics, args.dry_run,
+                    day, sensors, soft_cals, sigma2_table, routes, lat_2d,
+                    use_physics, args.dry_run,
                     show_slot_bar=True,
-                    leo_himawari_offset=leo_offset,
                 )
                 elapsed = time.perf_counter() - t0
                 total_written += n_ok
@@ -533,7 +490,7 @@ def main():
                     print(summary)
 
     finally:
-        close_era5()   # release ERA5 file handle
+        close_era5()
 
     wall_elapsed = time.perf_counter() - wall_t0
     print(f'\n{"─" * 64}')

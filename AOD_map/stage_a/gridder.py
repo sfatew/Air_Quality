@@ -24,6 +24,11 @@ from config import (
     LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
 )
 
+# Floor on the divisor when computing the coefficient of variation, so cells
+# with vanishing means don't blow cv up to infinity (clean-air cells with
+# small absolute spread should report low cv, not large).
+CV_MEAN_FLOOR = 0.02
+
 
 def _lat_to_row(lat: np.ndarray) -> np.ndarray:
     """Map latitude → 0-based row index (0 = northernmost row)."""
@@ -59,44 +64,62 @@ def bin_to_grid(
     vza, sza : optional 1-D arrays of viewing / solar zenith angles (degrees).
     ae       : optional 1-D Ångström exponent array.
 
-    Returns a dict with 2-D (NLAT × NLON) float32 arrays:
-        aod_mean   – cell mean AOD (NaN where n_pixels == 0)
-        aod_std    – within-cell std dev (NaN where n_pixels < 2)
-        n_pixels   – number of valid pixels contributing to each cell (int16)
-        vza_mean   – mean VZA (NaN where n_pixels == 0, or if vza not provided)
+    Returns a dict with 2-D (NLAT × NLON) arrays:
+        aod_mean   – cell mean AOD (NaN where n_valid == 0); NEVER masked by
+                     a heterogeneity gate — cv carries the quality signal.
+        aod_std    – within-cell std dev (NaN where n_valid < 2)
+        n_valid    – pixels with finite, in-range AOD binned into the cell (int16)
+        n_total    – sensor-QA-passing pixels arriving at the gridder whose
+                     centres fall in the cell, regardless of AOD validity (int16).
+                     Counted empirically per slot so it reflects actual swath
+                     coverage; NOT a theoretical maximum.
+        cv         – aod_std / max(aod_mean, CV_MEAN_FLOOR); NaN where n_valid<2.
+                     Downstream consumers gate on `cv <= CV_MAX` to drop
+                     heterogeneous cells; choose CV_MAX per use-case.
+        vza_mean   – mean VZA (NaN where n_valid == 0, or if vza not provided)
         sza_mean   – mean SZA (similarly)
         ae_mean    – mean Ångström exponent (similarly)
     """
-    shape = (NLAT, NLON)
+    shape  = (NLAT, NLON)
+    minlen = NLAT * NLON
 
-    # In-domain pixel mask
-    in_dom = (
+    # Geometric mask: pixel centre inside the spatial domain.  Used as the
+    # denominator (n_total) — every pixel reaching the gridder for this slot
+    # gets counted regardless of AOD finiteness.
+    in_geom = (
         (lat >= LAT_MIN) & (lat < LAT_MAX)
         & (lon >= LON_MIN) & (lon < LON_MAX)
-        & np.isfinite(aod) & (aod >= 0) & (aod <= 5.0)
     )
-    lat  = lat[in_dom]
-    lon  = lon[in_dom]
-    aod  = aod[in_dom]
-    vza  = vza[in_dom]  if vza is not None else None
-    sza  = sza[in_dom]  if sza is not None else None
-    ae   = ae[in_dom]   if ae  is not None else None
 
-    # Pixel → grid cell indices
+    # Count n_total empirically from the pixels that arrived this slot, so the
+    # denominator reflects real swath coverage (including edge geometry,
+    # missing scans, etc.) rather than a hard-coded sensor-pixel-size formula.
+    rows_g = _lat_to_row(lat[in_geom])
+    cols_g = _lon_to_col(lon[in_geom])
+    safe_g = (rows_g >= 0) & (rows_g < NLAT) & (cols_g >= 0) & (cols_g < NLON)
+    linear_g = (rows_g[safe_g] * NLON + cols_g[safe_g]).astype(np.int64)
+    n_total = np.bincount(linear_g, minlength=minlen).reshape(shape).astype(np.int16)
+
+    # Validity mask for the actual binning — adds AOD finiteness / range.
+    is_valid = in_geom & np.isfinite(aod) & (aod >= 0) & (aod <= 5.0)
+    lat = lat[is_valid]
+    lon = lon[is_valid]
+    aod = aod[is_valid]
+    vza = vza[is_valid] if vza is not None else None
+    sza = sza[is_valid] if sza is not None else None
+    ae  = ae[is_valid]  if ae  is not None else None
+
     rows = _lat_to_row(lat)
     cols = _lon_to_col(lon)
+    safe = (rows >= 0) & (rows < NLAT) & (cols >= 0) & (cols < NLON)
+    rows = rows[safe];  cols = cols[safe];  aod = aod[safe]
+    if vza is not None: vza = vza[safe]
+    if sza is not None: sza = sza[safe]
+    if ae  is not None: ae  = ae[safe]
 
-    # Clamp to valid range (should be in-domain already, but guard against FP edge)
-    valid = (rows >= 0) & (rows < NLAT) & (cols >= 0) & (cols < NLON)
-    rows = rows[valid];  cols = cols[valid];  aod = aod[valid]
-    if vza is not None: vza = vza[valid]
-    if sza is not None: sza = sza[valid]
-    if ae  is not None: ae  = ae[valid]
-
-    # Linearised bincount over flat cell indices — O(N) over pixels, replaces np.add.at.
+    # Linearised bincount over flat cell indices — O(N) over pixels.
     aod64  = aod.astype(np.float64)
     linear = (rows * NLON + cols).astype(np.int64)
-    minlen = NLAT * NLON
 
     n_pix   = np.bincount(linear, minlength=minlen).reshape(shape)
     aod_sum = np.bincount(linear, weights=aod64,      minlength=minlen).reshape(shape)
@@ -122,31 +145,47 @@ def bin_to_grid(
             return np.full(shape, np.nan, dtype=np.float32)
         return np.where(flag, arr_sum / n_safe, np.nan).astype(np.float32)
 
+    vza_mean = _mean_optional(vza_sum, has_data)
+    sza_mean = _mean_optional(sza_sum, has_data)
+    ae_mean  = _mean_optional(ae_sum,  has_data)
+
+    # Coefficient of variation — within-cell heterogeneity normalized by the
+    # mean. NaN where std is undefined (n_valid < 2); downstream consumers
+    # gate on `cv <= CV_MAX`.
+    cv = (aod_std / np.maximum(aod_mean, CV_MEAN_FLOOR)).astype(np.float32)
+
     return {
-        'aod_mean': aod_mean,
-        'aod_std':  aod_std,
-        'n_pixels': n_pix.astype(np.int16),
-        'vza_mean': _mean_optional(vza_sum, has_data),
-        'sza_mean': _mean_optional(sza_sum, has_data),
-        'ae_mean':  _mean_optional(ae_sum,  has_data),
+        'aod_mean':    aod_mean,
+        'aod_std':     aod_std,
+        'n_valid':     n_pix.astype(np.int16),
+        'n_total':     n_total,
+        'cv':          cv,
+        'vza_mean':    vza_mean,
+        'sza_mean':    sza_mean,
+        'ae_mean':     ae_mean,
     }
 
 
-def grid_from_himawari(himawari_result: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def grid_from_himawari(himawari_result: dict[str, np.ndarray]) -> dict[str, 'np.ndarray | int']:
     """Repackage himawari.read_himawari_slot output into gridder-compatible format.
 
     Himawari is already on the 0.05° grid, so no binning is needed.
-    This just renames keys to match the unified schema used by fusion.py.
+    cv and aod_std are not defined for a pre-gridded source — there is no
+    sub-cell native pixel to compute variance over.  n_total is 1 because
+    each 0.05° cell corresponds to exactly one Himawari grid value.
     """
     r = himawari_result
+    shape = (NLAT, NLON)
     return {
-        'aod_mean': r.get('aot',         np.full((NLAT, NLON), np.nan, dtype=np.float32)),
-        'aod_std':  np.full((NLAT, NLON), np.nan, dtype=np.float32),  # single TIF → no std
-        'n_pixels': r.get('n_obs',       np.zeros((NLAT, NLON), dtype=np.int16)),
-        'vza_mean': r.get('vza',         np.full((NLAT, NLON), np.nan, dtype=np.float32)),
-        'sza_mean': r.get('sza',         np.full((NLAT, NLON), np.nan, dtype=np.float32)),
-        'ae_mean':  r.get('ae',          np.full((NLAT, NLON), np.nan, dtype=np.float32)),
-        'vza_flag': r.get('vza_flag',    np.zeros((NLAT, NLON), dtype=np.int8)),
+        'aod_mean':   r.get('aot',         np.full(shape, np.nan, dtype=np.float32)),
+        'aod_std':    np.full(shape, np.nan, dtype=np.float32),  # pre-gridded → no within-cell std
+        'n_valid':    r.get('n_obs',       np.zeros(shape, dtype=np.int16)),
+        'n_total':    np.ones(shape, dtype=np.int16),            # one delivered value per cell
+        'cv':         np.full(shape, np.nan, dtype=np.float32),  # undefined without sub-cell pixels
+        'vza_mean':   r.get('vza',         np.full(shape, np.nan, dtype=np.float32)),
+        'sza_mean':   r.get('sza',         np.full(shape, np.nan, dtype=np.float32)),
+        'ae_mean':    r.get('ae',          np.full(shape, np.nan, dtype=np.float32)),
+        'vza_flag':   r.get('vza_flag',    np.zeros(shape, dtype=np.int8)),
     }
 
 

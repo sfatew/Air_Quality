@@ -23,7 +23,7 @@ import netCDF4 as nc
 
 from config import (
     VIIRS_SNPP_DIR, VIIRS_N20_DIR,
-    VIIRS_QA_MIN_LAND, VIIRS_QA_MIN_OCEAN,
+    VIIRS_QA_MIN,
     LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
     LEO_WINDOW_MIN,
 )
@@ -133,16 +133,14 @@ def _read_viirs_file(fpath: Path) -> Optional[dict[str, np.ndarray]]:
     # Combined QA: take the higher of land or ocean flag
     qa_combined = np.maximum(qa_land, qa_ocean)
 
-    # Step A1 QA filter
+    # Step A1 QA filter — single threshold for land and ocean (matches the
+    # VIIRS/crawl.py default of qa_threshold=2).
     valid = (
         (aod != _FILL)
         & ~np.isnan(aod)
         & (aod >= 0.0)
         & (aod <= 5.0)
-        & (
-            (qa_land  >= VIIRS_QA_MIN_LAND)
-            | (qa_ocean >= VIIRS_QA_MIN_OCEAN)
-        )
+        & ((qa_land >= VIIRS_QA_MIN) | (qa_ocean >= VIIRS_QA_MIN))
         & (~np.isnan(lat)) & (~np.isnan(lon))
         & (lat >= -90) & (lat <= 90)
         & (lon >= -180) & (lon <= 180)

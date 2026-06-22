@@ -1,41 +1,39 @@
-"""CLI driver: produce Stage A2 gridded slots, extract pairs, train corrections.
+"""CLI driver — Stage A gridding, AERONET extraction, and v3.4 calibration.
 
-Stage A2 (`grid`) writes one NetCDF per 30-min slot containing the raw
-0.05° gridded AOD for every sensor, before any bias correction.  Both
-`extract_satellite.py` (training pair extraction) and `run_stage_a.py`
-(production) consume this intermediate instead of re-gridding from raw
-files, so binning runs exactly once per slot per dataset.
+Two distinct workflows live here:
+
+  1. **Stage A2 gridding + AERONET validation extraction.**  These are the
+     pre-requisite I/O steps that produce the per-slot gridded NetCDFs and
+     (separately) the AERONET-cell extracts used for §8 held-out validation.
+     Neither workflow consumes AERONET as training data — see §7.0.
+
+  2. **v3.4 calibration.**  Two linearly-chained verbs:
+
+         soft_cal     — fit `MERRA-2 = α · sat + β` per stratum (§7.4.1)
+         tc_variance  — triple-collocation σ² per stratum (§7.4.2)
+
+     The v3.3 `train` (CDF) and `leo_offset` verbs are gone.
 
 Usage
 -----
-# Stage A2 — grid raw satellite slots (required before extract / run_stage_a)
-python run_collocate.py grid --start 2022-09-01 --end 2024-12-31
+# Stage A2 grid (required first; everything else reads from GRIDDED_DIR).
 python run_collocate.py grid --start 2022-09-01 --end 2024-12-31 --workers 4
 
-# Extract satellite time series at stations from the gridded slots
-python run_collocate.py extract --start 2022-09-01 --end 2024-12-31
-
-# Match existing raw CSVs with AERONET (no satellite file I/O)
+# AERONET validation extraction (for §8 held-out validation only).
+python run_collocate.py extract --start 2022-09-01 --end 2026-04-30
 python run_collocate.py match
+python run_collocate.py collocate --start 2022-09-01 --end 2026-04-30
 
-# Extract + match (equivalent to old 'collocate' command)
-python run_collocate.py collocate --start 2022-09-01 --end 2024-12-31
+# v3.4 calibration chain.
+python run_collocate.py soft_cal    --train-start 2022-09-01 --train-end 2024-12-31
+python run_collocate.py tc_variance --train-start 2022-09-01 --train-end 2024-12-31
 
-# Train CDF corrections from existing matched CSVs
-python run_collocate.py train
-
-# Build the LEO–Himawari spatial offset map (thesis §7.4.2)
-# Requires a prior Stage A run for [start, end] with Bug 1 fixed.
-python run_collocate.py leo_offset --start 2022-09-01 --end 2024-12-31
-
-# Full pipeline: grid + extract + match + train
+# Everything: grid + extract + match + soft_cal + tc_variance.
 python run_collocate.py all --start 2022-09-01 --end 2024-12-31
-
-# Single site (for debugging)
-python run_collocate.py collocate --site NGHIA_DO --start 2023-01-01 --end 2023-03-31
 """
 
 from __future__ import annotations
+
 import argparse
 import concurrent.futures
 import multiprocessing as mp
@@ -63,14 +61,15 @@ import numpy as np
 
 from config import (
     AERONET_SITES, EXTRACT_DIR, COLLOCATE_DIR, BIASC_DIR, GRIDDED_DIR,
-    LEO_HIMAWARI_OFFSET_FILE, LEO_HIMAWARI_MIN_PAIRS, LEO_HIMAWARI_SMOOTH_SIGMA,
+    REGIONS, SEASONS,
     SENSOR_RMSE_EE_OFFSET, SENSOR_RMSE_EE_SLOPE, SENSOR_RMSE_EE_REFAOD,
-    SENSOR_RMSE_PRIOR, NONE_PENALTY_FACTOR,
+    SENSOR_EE_SLOPE,
+    TC_MIN_TRIPLETS, TC_MIN_COLLOCATIONS,
+    TRAIN_START, TRAIN_END,
+    SOFT_CAL_FILE, TC_VARIANCE_FILE,
 )
 from extract_satellite import extract_site
 from collocate import match_site, collocate_site
-from bias_correction import train_all_corrections, build_leo_himawari_offset
-from fusion import save_rmse
 from grid import grid_day, ALL_SENSORS as _ALL_GRID_SENSORS
 
 _ALL_SENSORS = ('himawari_l2', 'himawari_l3', 'viirs_snpp', 'viirs_noaa20', 'modis_maiac')
@@ -83,13 +82,13 @@ _GRID_SLOTS_PER_DAY = 48
 def _print_env_banner() -> None:
     W = 64
     print("=" * W)
-    print("Stage A — Collocate/Train — Runtime Environment")
+    print("Stage A — run_collocate (v3.4)")
     print("-" * W)
     print(f"  {'Python':<12} {sys.version.split()[0]}")
     for mod_name, label in [
         ("numpy",    "NumPy"),
         ("pandas",   "pandas"),
-        ("rasterio", "rasterio"),
+        ("netCDF4",  "netCDF4"),
         ("tqdm",     "tqdm"),
     ]:
         try:
@@ -107,8 +106,6 @@ def _fmt_duration(seconds: float) -> str:
     return f"{seconds:.1f}s"
 
 
-# ── Sub-commands ──────────────────────────────────────────────────────────────
-
 def _enumerate_days(start: date, end: date) -> list[date]:
     days: list[date] = []
     d = start
@@ -118,8 +115,9 @@ def _enumerate_days(start: date, end: date) -> list[date]:
     return days
 
 
+# ── Sub-commands: Stage A2 grid ─────────────────────────────────────────────
+
 def cmd_grid(args: argparse.Namespace) -> None:
-    """Stage A2 — write raw per-sensor 0.05° gridded NetCDFs to GRIDDED_DIR."""
     start   = date.fromisoformat(args.start)
     end     = date.fromisoformat(args.end)
     sensors = tuple(args.sensors) if args.sensors else _ALL_GRID_SENSORS
@@ -137,9 +135,6 @@ def cmd_grid(args: argparse.Namespace) -> None:
     total_errors  = 0
 
     if args.workers > 1:
-        # 'spawn' (not the Linux default 'fork') so each worker starts with a
-        # clean HDF5/netCDF4 state — fork-after-import of these libraries
-        # corrupts HDF5 globals and silently kills workers on heavy IO.
         _mp_ctx = mp.get_context('spawn')
         day_bar = _make_bar(range(len(days)), desc='Days', unit='day', ncols=80)
         with concurrent.futures.ProcessPoolExecutor(
@@ -156,7 +151,8 @@ def cmd_grid(args: argparse.Namespace) -> None:
                     n_ok, n_err = fut.result()
                     total_written += n_ok
                     total_errors  += n_err
-                    msg = f'  {day}: {n_ok} new slot(s)' + (f', {n_err} error(s)' if n_err else '')
+                    msg = (f'  {day}: {n_ok} new slot(s)'
+                           + (f', {n_err} error(s)' if n_err else ''))
                 except Exception:
                     msg = f'  {day}: FAILED\n{traceback.format_exc()}'
                 if day_bar is not None:
@@ -192,8 +188,9 @@ def cmd_grid(args: argparse.Namespace) -> None:
           + f'  [total: {_fmt_duration(time.perf_counter() - wall_t0)}]')
 
 
+# ── Sub-commands: AERONET-cell extraction (validation only) ─────────────────
+
 def cmd_extract(args: argparse.Namespace) -> None:
-    """Read satellite files and write raw time-series CSVs to EXTRACT_DIR."""
     sites   = [args.site] if args.site else _ALL_SITES
     sensors = tuple(args.sensors) if args.sensors else _ALL_SENSORS
     start   = date.fromisoformat(args.start)
@@ -217,7 +214,6 @@ def cmd_extract(args: argparse.Namespace) -> None:
 
 
 def cmd_match(args: argparse.Namespace) -> None:
-    """Match existing raw CSVs with AERONET and write matched-pair CSVs."""
     sites   = [args.site] if args.site else _ALL_SITES
     sensors = tuple(args.sensors) if args.sensors else _ALL_SENSORS
 
@@ -240,7 +236,6 @@ def cmd_match(args: argparse.Namespace) -> None:
 
 
 def cmd_collocate(args: argparse.Namespace) -> None:
-    """Extract then match (equivalent to the old collocate command)."""
     sites   = [args.site] if args.site else _ALL_SITES
     sensors = tuple(args.sensors) if args.sensors else _ALL_SENSORS
     start   = date.fromisoformat(args.start)
@@ -266,128 +261,153 @@ def cmd_collocate(args: argparse.Namespace) -> None:
         )
     if bar is not None:
         bar.close()
-    print(f'\nColocation complete.  [total: {_fmt_duration(time.perf_counter() - wall_t0)}]')
+    print(f'\nCollocation complete.  [total: {_fmt_duration(time.perf_counter() - wall_t0)}]')
 
 
-def cmd_leo_offset(args: argparse.Namespace) -> None:
-    """Build the LEO–Himawari spatial offset map (thesis §7.4.2).
+# ── Sub-commands: v3.4 soft calibration (§7.4.1) ────────────────────────────
 
-    Requires that Stage A has already been run for [start, end] with the
-    Bug 1 fix in place (so AOD_himawari_l2 and AOD_himawari_l3 in MERGED_DIR
-    are distinct sources, not duplicates).
-    """
-    start = date.fromisoformat(args.start)
-    end   = date.fromisoformat(args.end)
-    out   = Path(args.out) if args.out else LEO_HIMAWARI_OFFSET_FILE
-    min_pairs    = args.min_pairs    if args.min_pairs    is not None else LEO_HIMAWARI_MIN_PAIRS
-    smooth_sigma = args.smooth_sigma if args.smooth_sigma is not None else LEO_HIMAWARI_SMOOTH_SIGMA
+def cmd_soft_cal(args: argparse.Namespace) -> None:
+    """Fit the per-stratum linear `MERRA-2 = α · sat + β` soft calibrations."""
+    from bias_correction import train_all_sensors
 
-    print(f'\nBuilding LEO–Himawari offset map')
-    print(f'  Period       : {start} → {end}')
-    print(f'  Output       : {out}')
-    print(f'  Min pairs    : {min_pairs}')
-    print(f'  Smooth sigma : {smooth_sigma}')
+    sensors = list(args.sensors) if args.sensors else None
+    ts = getattr(args, 'train_start', None)
+    te = getattr(args, 'train_end',   None)
+    train_start = date.fromisoformat(ts) if ts else TRAIN_START
+    train_end   = date.fromisoformat(te) if te else TRAIN_END
+    stride      = int(getattr(args, 'sample_stride', 1) or 1)
+
+    print(f'\n[soft_cal] linear (α, β) vs MERRA-2 per (sensor, region, season)')
+    print(f'  Window  : {train_start} → {train_end} (inclusive)')
+    print(f'  Sensors : {sensors or "all"}')
+    print(f'  Output  : {SOFT_CAL_FILE}')
+    if stride > 1:
+        print(f'  Stride  : every {stride}th 30-min slot (training-window subsample)')
 
     t0 = time.perf_counter()
-    build_leo_himawari_offset(
-        start_d=start, end_d=end,
-        output_path=out,
-        min_pairs=min_pairs,
-        smooth_sigma=smooth_sigma,
+    fits = train_all_sensors(
+        sensors=sensors or (
+            'himawari_l2', 'himawari_l3',
+            'modis_maiac', 'viirs_snpp', 'viirs_noaa20',
+        ),
+        train_start=train_start, train_end=train_end,
+        sample_every_n_slots=stride,
+        output_file=SOFT_CAL_FILE,
     )
-    print(f'\nDone.  [{_fmt_duration(time.perf_counter() - t0)}]')
-
-
-def cmd_train(args: argparse.Namespace) -> None:
-    sensors = list(args.sensors) if args.sensors else list(_ALL_SENSORS)
-    print(f'\nTraining CDF corrections')
-    print(f'  Input  : {COLLOCATE_DIR}')
-    print(f'  Output : {BIASC_DIR}')
-    print(f'  Sensors: {sensors}')
-    t0 = time.perf_counter()
-    corrections = train_all_corrections(
-        collocated_csv_dir=COLLOCATE_DIR,
-        sensors=sensors,
-        output_dir=BIASC_DIR,
-    )
-    print(f'\nTrained {len(corrections)} correction(s) saved to {BIASC_DIR}'
+    n_strata = sum(len(s) for s in fits.values())
+    print(f'\n[soft_cal] done.  {n_strata} strata fit across {len(fits)} sensor(s)'
           f'  [{_fmt_duration(time.perf_counter() - t0)}]')
 
-    # Persist season-stratified post-correction RMSE so fusion.py uses real
-    # weights instead of the SENSOR_RMSE_PRIOR fallback.
-    #
-    # Three concerns combined here:
-    #   1. Prefer cross-validated rmse_after_cv; floor by the Sayer/Levy EE
-    #      envelope at a representative AOD so fusion never trusts an
-    #      unrealistically small in-sample RMSE on low-N strata.
-    #   2. 'none' strata: write an explicit penalty (NONE_PENALTY_FACTOR ×
-    #      prior) instead of silently dropping the entry — otherwise fusion
-    #      falls back to the unpenalised prior and the failed correction is
-    #      effectively unweighted.
-    #   3. Himawari L2/L3 are per-pixel-merged into a single 'himawari' input
-    #      *before* fusion (run_stage_a.py: L3 wins, L2 fills gaps).  Fusion
-    #      therefore looks up ('himawari', reg, sea), which the per-level
-    #      training never writes.  Derive it from L3-with-L2-fallback to
-    #      mirror the merge logic.
-    ee_floor = SENSOR_RMSE_EE_OFFSET + SENSOR_RMSE_EE_SLOPE * SENSOR_RMSE_EE_REFAOD
 
-    def _prior_for(sensor: str, region: str):
-        # himawari_l2/l3 share the merged 'himawari' prior in config.
-        if sensor in ('himawari_l2', 'himawari_l3'):
-            sensor = 'himawari'
-        return SENSOR_RMSE_PRIOR.get((sensor, region))
+# ── Sub-commands: v3.4 triple-collocation σ² (§7.4.2) ──────────────────────
 
-    rmse_post: dict[tuple[str, str, str], float] = {}
-    n_penalised = 0
-    for (s, reg, sea), c in corrections.items():
-        if c.correction_type == 'none':
-            prior = _prior_for(s, reg)
-            if prior is None:
+def cmd_tc_variance(args: argparse.Namespace) -> None:
+    """Estimate σ²_TC per (sensor, region, season) from inter-sensor triplets."""
+    from bias_correction import load_soft_calibrations
+    from triple_collocation import (
+        collect_stratum_triplets,
+        triple_collocation_variance,
+        aggregate_sigma2_per_sensor,
+        ee_floor_sigma2 as _tc_ee_floor,
+    )
+    from fusion import save_tc_variance
+
+    ts = getattr(args, 'train_start', None)
+    te = getattr(args, 'train_end',   None)
+    train_start = date.fromisoformat(ts) if ts else TRAIN_START
+    train_end   = date.fromisoformat(te) if te else TRAIN_END
+    strict      = bool(getattr(args, 'strict', False))
+    stride      = int(getattr(args, 'sample_stride', 1) or 1)
+
+    print(f'\n[tc_variance] σ²_TC per (sensor, region, season)'
+          + ('  [strict independence]' if strict else '  [permissive independence]'))
+    print(f'  Window  : {train_start} → {train_end} (inclusive)')
+    print(f'  Output  : {TC_VARIANCE_FILE}')
+    if stride > 1:
+        print(f'  Stride  : every {stride}th 30-min slot')
+
+    soft_cals = load_soft_calibrations()
+    if not soft_cals:
+        print('  [tc_variance] WARNING: no soft_calibration.json found — '
+              'σ²_TC will be computed on uncorrected satellite values.  '
+              'Run `soft_cal` first per §7.4.4 bootstrap ordering.')
+
+    t0 = time.perf_counter()
+    print('  Collecting triplets ...')
+    stratum_triplets = collect_stratum_triplets(
+        train_start=train_start, train_end=train_end,
+        soft_cals=soft_cals, strict=strict,
+        sample_every_n_slots=stride,
+    )
+
+    # Compute σ²_TC per triplet × stratum.
+    print('  Computing σ²_TC per triplet × stratum ...')
+    sensor_table: dict[str, dict[str, dict]] = {}
+
+    for stratum, triplet_dict in stratum_triplets.items():
+        region, season = stratum
+        triplet_results: list[dict] = []
+        for triple, member_arrs in triplet_dict.items():
+            x, y, z = (member_arrs[m] for m in triple)
+            res = triple_collocation_variance(x, y, z)
+            if not (np.isfinite(res['sigma2_x']) or np.isfinite(res['sigma2_y'])
+                    or np.isfinite(res['sigma2_z'])):
                 continue
-            rmse_post[(s, reg, sea)] = float(max(prior * NONE_PENALTY_FACTOR, ee_floor))
-            n_penalised += 1
-            continue
-        rmse_cv  = float(getattr(c, 'rmse_after_cv', float('nan')))
-        rmse_in  = float(getattr(c, 'rmse_after',     float('nan')))
-        candidate = rmse_cv if np.isfinite(rmse_cv) else rmse_in
-        if not np.isfinite(candidate):
-            continue
-        rmse_post[(s, reg, sea)] = float(max(candidate, ee_floor))
+            triplet_results.append({
+                'members': triple,
+                'sigma2':  {
+                    triple[0]: res['sigma2_x'],
+                    triple[1]: res['sigma2_y'],
+                    triple[2]: res['sigma2_z'],
+                },
+                'n': res['n'],
+            })
 
-    # Roll L2/L3 RMSE up to a merged 'himawari' entry per (region, season).
-    # run_stage_a's per-pixel merge picks whichever level has the lower
-    # post-correction RMSE as the primary (the other fills gaps), so the
-    # merged-grid RMSE that fusion should weight by is min(L2, L3) where
-    # both exist; fall back to the single level otherwise.
-    n_himawari_rollup = 0
-    for reg in ('north', 'south', 'central'):
-        for sea in ('dry', 'wet'):
-            l3 = rmse_post.get(('himawari_l3', reg, sea))
-            l2 = rmse_post.get(('himawari_l2', reg, sea))
-            if l2 is not None and l3 is not None:
-                merged = min(l2, l3)
-            elif l2 is not None:
-                merged = l2
+        # Per-sensor aggregation (median across triplets, §7.4.2).
+        # NOTE: aggregate_sigma2_per_sensor is the user-implemented spot in
+        # triple_collocation.py; it raises NotImplementedError until filled.
+        agg = aggregate_sigma2_per_sensor(
+            triplet_results,
+            min_triplets=TC_MIN_TRIPLETS,
+            min_collocations=TC_MIN_COLLOCATIONS,
+        )
+        for sensor, entry in agg.items():
+            sigma2 = entry.get('sigma2', float('nan'))
+            slope = SENSOR_EE_SLOPE.get(sensor, SENSOR_RMSE_EE_SLOPE)
+            ee = _tc_ee_floor(SENSOR_RMSE_EE_OFFSET, slope,
+                              SENSOR_RMSE_EE_REFAOD)
+            if not np.isfinite(sigma2):
+                sigma2 = ee
             else:
-                merged = l3
-            if merged is not None:
-                rmse_post[('himawari', reg, sea)] = merged
-                n_himawari_rollup += 1
+                sigma2 = float(sigma2)
+            sensor_table.setdefault(sensor, {})[f'{region}|{season}'] = {
+                'sigma2':          float(sigma2),
+                'n_triplets':      int(entry.get('n_triplets', 0)),
+                'n_collocations':  int(entry.get('n_collocations', 0)),
+            }
 
-    if rmse_post:
-        save_rmse(rmse_post)
-        print(f'  Post-correction RMSE saved ({len(rmse_post)} strata, '
-              f'EE-floor={ee_floor:.3f}, '
-              f'{n_penalised} penalised "none" @ ×{NONE_PENALTY_FACTOR}, '
-              f'{n_himawari_rollup} himawari roll-ups) '
-              f'→ {BIASC_DIR / "post_correction_rmse.json"}')
+    save_tc_variance(sensor_table, TC_VARIANCE_FILE)
+    print(f'  σ²_TC table saved → {TC_VARIANCE_FILE}'
+          f'  [{_fmt_duration(time.perf_counter() - t0)}]')
+
+
+# ── 'all' meta-verb: end-to-end calibration chain ───────────────────────────
+
+def cmd_all(args: argparse.Namespace) -> None:
+    cmd_grid(args)
+    cmd_collocate(args)   # AERONET-cell extracts for §8 validation
+    # Soft cal + TC re-use the args' --start / --end as the training window.
+    args.train_start = args.start
+    args.train_end   = args.end
+    cmd_soft_cal(args)
+    cmd_tc_variance(args)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _add_date_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument('--start',   required=True, help='Start date YYYY-MM-DD')
-    p.add_argument('--end',     required=True, help='End date YYYY-MM-DD')
+    p.add_argument('--start', required=True, help='Start date YYYY-MM-DD')
+    p.add_argument('--end',   required=True, help='End date YYYY-MM-DD')
 
 
 def _add_site_sensor_args(p: argparse.ArgumentParser) -> None:
@@ -395,88 +415,79 @@ def _add_site_sensor_args(p: argparse.ArgumentParser) -> None:
     p.add_argument('--sensors', nargs='+',    help='Sensor(s) to process (default: all)')
 
 
+def _add_train_window_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument('--train-start', dest='train_start', default=None,
+                   help=f'Inclusive training-window start (default: {TRAIN_START})')
+    p.add_argument('--train-end',   dest='train_end',   default=None,
+                   help=f'Inclusive training-window end   (default: {TRAIN_END})')
+    p.add_argument('--sample-stride', dest='sample_stride', type=int, default=1,
+                   help='Subsample every N-th 30-min slot during pair collection '
+                        '(default: 1 — every slot)')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Stage A: satellite extraction, AERONET matching, bias-correction training',
+        description='Stage A v3.4 — Stage A2 gridding, AERONET extraction, '
+                    'soft calibration, and triple-collocation σ²',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     sub = parser.add_subparsers(dest='command')
 
     # grid (Stage A2)
-    p_grid = sub.add_parser(
-        'grid',
-        help='Stage A2 — produce raw per-sensor gridded NetCDFs in GRIDDED_DIR',
-    )
+    p_grid = sub.add_parser('grid', help='Stage A2 — write per-sensor gridded NetCDFs')
     _add_date_args(p_grid)
-    p_grid.add_argument('--sensors',   nargs='+',
-                        help='Sensor(s) to grid (default: all)')
-    p_grid.add_argument('--workers',   type=int, default=1,
-                        help='Parallel worker processes (default: 1)')
-    p_grid.add_argument('--overwrite', action='store_true',
-                        help='Re-grid slots whose NetCDF already exists')
+    p_grid.add_argument('--sensors',   nargs='+')
+    p_grid.add_argument('--workers',   type=int, default=1)
+    p_grid.add_argument('--overwrite', action='store_true')
 
-    # extract
-    p_ext = sub.add_parser('extract', help='Extract satellite AOD time series at stations')
-    _add_date_args(p_ext)
-    _add_site_sensor_args(p_ext)
+    # extract / match / collocate (AERONET validation only)
+    p_ext = sub.add_parser('extract', help='Extract satellite AOD time series at AERONET sites')
+    _add_date_args(p_ext); _add_site_sensor_args(p_ext)
 
-    # match
     p_match = sub.add_parser('match', help='Match raw CSVs with AERONET (no satellite I/O)')
     _add_site_sensor_args(p_match)
 
-    # collocate (extract + match, backward-compatible)
-    p_col = sub.add_parser('collocate', help='Extract then match (= extract + match)')
-    _add_date_args(p_col)
-    _add_site_sensor_args(p_col)
+    p_col = sub.add_parser('collocate', help='Extract + match (one CLI verb)')
+    _add_date_args(p_col); _add_site_sensor_args(p_col)
 
-    # train
-    p_tr = sub.add_parser('train', help='Train CDF corrections from matched CSVs')
-    p_tr.add_argument('--sensors', nargs='+')
+    # v3.4 calibration verbs
+    p_sc = sub.add_parser('soft_cal',
+                          help='Fit `MERRA-2 = α · sat + β` per (sensor, region, season)')
+    _add_train_window_args(p_sc)
+    p_sc.add_argument('--sensors', nargs='+')
 
-    # leo_offset (thesis §7.4.2)
-    p_leo = sub.add_parser(
-        'leo_offset',
-        help='Build the LEO–Himawari spatial offset map (requires prior Stage A run)',
-    )
-    _add_date_args(p_leo)
-    p_leo.add_argument('--out',           default=None,
-                       help=f'Output NetCDF path (default: {LEO_HIMAWARI_OFFSET_FILE})')
-    p_leo.add_argument('--min-pairs',     type=int,   default=None,
-                       dest='min_pairs',
-                       help=f'Mask cells with fewer pairs (default: {LEO_HIMAWARI_MIN_PAIRS})')
-    p_leo.add_argument('--smooth-sigma',  type=float, default=None,
-                       dest='smooth_sigma',
-                       help=f'Gaussian sigma in grid-cells (default: {LEO_HIMAWARI_SMOOTH_SIGMA})')
+    p_tc = sub.add_parser('tc_variance',
+                          help='Estimate σ²_TC per (sensor, region, season) from triplets')
+    _add_train_window_args(p_tc)
+    p_tc.add_argument('--strict', action='store_true',
+                      help='Reject pairs sharing the underlying instrument '
+                           '(MERRA-2+MAIAC, Himawari L2+L3); '
+                           'permissive otherwise (§7.4.2 sensitivity check)')
 
-    # all (grid + extract + match + train)
-    p_all = sub.add_parser('all', help='Full pipeline: grid + extract + match + train')
-    _add_date_args(p_all)
-    _add_site_sensor_args(p_all)
-    p_all.add_argument('--workers',   type=int, default=1,
-                       help='Parallel workers for the grid step (default: 1)')
-    p_all.add_argument('--overwrite', action='store_true',
-                       help='Re-grid slots whose NetCDF already exists')
+    # all (grid + collocate + soft_cal + tc_variance)
+    p_all = sub.add_parser('all',
+                           help='Full pipeline: grid + collocate + soft_cal + tc_variance')
+    _add_date_args(p_all); _add_site_sensor_args(p_all)
+    p_all.add_argument('--workers',   type=int, default=1)
+    p_all.add_argument('--overwrite', action='store_true')
+    p_all.add_argument('--strict',    action='store_true')
+    p_all.add_argument('--sample-stride', dest='sample_stride', type=int, default=1)
 
     args = parser.parse_args()
     _print_env_banner()
 
-    if args.command == 'grid':
-        cmd_grid(args)
-    elif args.command == 'extract':
-        cmd_extract(args)
-    elif args.command == 'match':
-        cmd_match(args)
-    elif args.command == 'collocate':
-        cmd_collocate(args)
-    elif args.command == 'train':
-        cmd_train(args)
-    elif args.command == 'leo_offset':
-        cmd_leo_offset(args)
-    elif args.command == 'all':
-        cmd_grid(args)
-        cmd_collocate(args)
-        cmd_train(args)
+    dispatch = {
+        'grid':        cmd_grid,
+        'extract':     cmd_extract,
+        'match':       cmd_match,
+        'collocate':   cmd_collocate,
+        'soft_cal':    cmd_soft_cal,
+        'tc_variance': cmd_tc_variance,
+        'all':         cmd_all,
+    }
+    if args.command in dispatch:
+        dispatch[args.command](args)
     else:
         parser.print_help()
 

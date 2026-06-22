@@ -37,10 +37,8 @@ import rasterio
 
 from config import (
     HIMAWARI_L2_DIR, HIMAWARI_L3_DIR,
-    HIMAWARI_RF_MIN, HIMAWARI_UNC_MAX,
-    HIMAWARI_SZA_MAX, HIMAWARI_VZA_MAX, HIMAWARI_VZA_SOFT,
-    HIMAWARI_SAT_LON, EARTH_RADIUS_KM, GEO_ORBIT_KM,
-    LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
+    HIMAWARI_RF_MIN, HIMAWARI_UNC_MAX, HIMAWARI_AOT_MIN,
+    NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
 )
 
 # Ångström interpolation 500 nm (JAXA AHI native) → 550 nm (MODIS/VIIRS/AERONET).
@@ -91,45 +89,36 @@ def _get_tif_grid_offset(fpath: str) -> tuple[int, int, int, int]:
 # Fill sentinel values used in the GeoTIFF
 _FILL_VALUES = {-9999.0, -999.0, 9999.0}
 
-# ── Geometry helpers ──────────────────────────────────────────────────────────
+# ── JAXA strict QA bit-mask (Band 4 L2 / Band 8 L3 QA_flag_Merged) ───────────
 
-def compute_himawari_vza(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
-    """Viewing zenith angle (degrees) for Himawari pixels.
+def _qa_passes(qa: np.ndarray) -> np.ndarray:
+    """Vectorised strict JAXA quality screening (returns 2-D bool array).
 
-    Uses the exact geostationary projection formula.
-    Satellite at (0°N, HIMAWARI_SAT_LON°E), altitude GEO_ORBIT_KM from Earth centre.
+    Pixel passes iff ALL of:
+        bit 0   data_avail          = 0
+        bit 2   cloud               = 0
+        bit 3   retrieval ok        = 0
+        bit 4-5 AOT confidence      = 00  (very good)
+        bit 8   additional cloud    = 0
+        bit 10  Solz/Satz > 70°     = 0   (replaces the prior SZA+VZA filters)
+        bit 11  surface refl bad    = 0
+        bit 12  snow/ice            = 0   (L2-only; 0 on L3 by design)
+        bit 13  turbid water        = 0   (L2-only; 0 on L3 by design)
+
+    Source: Himawari/extract_aod/extract_stations_aod.py::qa_passes_array.
     """
-    Re = EARTH_RADIUS_KM
-    H  = GEO_ORBIT_KM
-    lat_r  = np.radians(lat)
-    dlon_r = np.radians(lon - HIMAWARI_SAT_LON)
-    # Central angle between sub-satellite point and pixel
-    gamma = np.arccos(np.clip(np.cos(lat_r) * np.cos(dlon_r), -1.0, 1.0))
-    # Slant range from satellite to pixel
-    slant = np.sqrt(Re**2 + H**2 - 2 * Re * H * np.cos(gamma))
-    sin_vza = H * np.sin(gamma) / slant
-    return np.degrees(np.arcsin(np.clip(sin_vza, -1.0, 1.0)))
-
-
-def compute_sza(lat: np.ndarray, lon: np.ndarray, utc_dt: datetime) -> np.ndarray:
-    """Approximate solar zenith angle (degrees) using the Iqbal (1983) formula."""
-    doy = utc_dt.timetuple().tm_yday
-    B   = 2 * np.pi * (doy - 1) / 365.0
-    # Solar declination
-    delta = np.radians(
-        23.45 * np.sin(np.radians(360.0 * (284 + doy) / 365.0))
+    qa_i = qa.astype(np.int32)
+    return (
+        (((qa_i >> 0)  & 1)    == 0)
+        & (((qa_i >> 2)  & 1)    == 0)
+        & (((qa_i >> 3)  & 1)    == 0)
+        & (((qa_i >> 4)  & 0b11) == 0)
+        & (((qa_i >> 8)  & 1)    == 0)
+        & (((qa_i >> 10) & 1)    == 0)
+        & (((qa_i >> 11) & 1)    == 0)
+        & (((qa_i >> 12) & 1)    == 0)
+        & (((qa_i >> 13) & 1)    == 0)
     )
-    # Equation of time (minutes)
-    eot = 229.18 * (
-        0.000075 + 0.001868 * np.cos(B) - 0.032077 * np.sin(B)
-        - 0.014615 * np.cos(2 * B) - 0.04089 * np.sin(2 * B)
-    )
-    utc_h  = utc_dt.hour + utc_dt.minute / 60.0
-    solar_h = utc_h + lon / 15.0 + eot / 60.0
-    omega   = np.radians(15.0 * (solar_h - 12.0))
-    lat_r   = np.radians(lat)
-    cos_sza = np.sin(lat_r) * np.sin(delta) + np.cos(lat_r) * np.cos(delta) * np.cos(omega)
-    return np.degrees(np.arccos(np.clip(cos_sza, -1.0, 1.0)))
 
 
 # ── Filename helpers ──────────────────────────────────────────────────────────
@@ -203,32 +192,26 @@ def _read_band(src: rasterio.DatasetReader, band_idx: int) -> np.ndarray:
 def read_l2_slot(
     slot_utc: datetime,
     window_min: int = 15,
-    apply_vza_filter: bool = True,
 ) -> dict[str, np.ndarray] | None:
     """Read and QA-filter all L2 TIF files within the ±window_min slot.
 
     Step A1 filters applied:
-        • AOT not NaN (implicit retrieval-valid check)
-        • RF  ≥ HIMAWARI_RF_MIN  (fine-mode fraction; tightened in wet months)
-        • |Uncertainty| ≤ HIMAWARI_UNC_MAX  (tightened in wet months)
-        • SZA < HIMAWARI_SZA_MAX
-        • VZA < HIMAWARI_VZA_MAX  (hard cut; VZA > HIMAWARI_VZA_SOFT flagged)
-
-    During wet months (May–Sep) RF_MIN and UNC_MAX are replaced by the
-    stricter HIMAWARI_WET_* constants to suppress cloud-edge contamination.
+        • JAXA strict QA bit-mask on Band 4 (QA_flag) — see _qa_passes.
+          Bit 10 already gates Solz/Satz > 70°, so VZA and SZA are no
+          longer computed per pixel.
+        • AOT > HIMAWARI_AOT_MIN  (strict-zero gate)
+        • RF  ≥ HIMAWARI_RF_MIN  (fine-mode fraction, Band 6)
+        • |Uncertainty| ≤ HIMAWARI_UNC_MAX  (Band 2)
 
     Step A2: Multiple 10-min files within the slot are averaged.
 
     Returns a dict with 2-D arrays (NLAT × NLON) aligned to config grid:
-        aot        – mean AOD 500 nm (NaN = no valid retrieval in slot)
-        ae         – mean Ångström exponent
+        aot         – mean AOD 550 nm (NaN = no valid retrieval in slot)
+        ae          – mean Ångström exponent
         uncertainty – mean signed uncertainty
-        ssa        – mean SSA
-        rf         – mean fine-mode fraction
-        vza        – mean VZA (degrees)
-        sza        – mean SZA (degrees)
-        n_obs      – number of valid 10-min observations contributing to each cell
-        vza_flag   – 1 where VZA > HIMAWARI_VZA_SOFT (lower confidence), else 0
+        ssa         – mean SSA
+        rf          – mean fine-mode fraction
+        n_obs       – number of valid 10-min observations per cell
 
     Returns None if no files are found for the slot.
     """
@@ -236,57 +219,39 @@ def read_l2_slot(
     if not files:
         return None
 
-    rf_min, unc_max = HIMAWARI_RF_MIN, HIMAWARI_UNC_MAX
-
     # Determine TIF subdomain position within the full config grid
     r0, c0, TH, TW = _get_tif_grid_offset(str(files[0]))
     tif_shape = (TH, TW)
-
-    # Build VZA/SZA grids at TIF resolution (pixel centres in TIF subdomain)
-    tif_lats = LATS[r0:r0 + TH]
-    tif_lons = LONS[c0:c0 + TW]
-    tif_lat_2d, tif_lon_2d = np.meshgrid(tif_lats, tif_lons, indexing='ij')
-    vza_tif = compute_himawari_vza(tif_lat_2d, tif_lon_2d)
 
     # Accumulators at TIF resolution.  AE and SSA have their own counters because
     # NaN values for those bands occur independently of the AOT-valid mask; using
     # the AOT count would dilute their means toward zero.
     acc: dict[str, np.ndarray] = {
         k: np.zeros(tif_shape, dtype=np.float64)
-        for k in ('aot', 'ae', 'unc', 'ssa', 'rf', 'vza', 'sza')
+        for k in ('aot', 'ae', 'unc', 'ssa', 'rf')
     }
     cnt    = np.zeros(tif_shape, dtype=np.int32)
     cnt_ae = np.zeros(tif_shape, dtype=np.int32)
     cnt_ss = np.zeros(tif_shape, dtype=np.int32)
 
     for fpath in files:
-        fdt = _parse_l2_utc(fpath.name)
         with rasterio.open(str(fpath)) as src:
             aot = _read_band(src, 1)
             unc = _read_band(src, 2)
             ae  = _read_band(src, 3)
+            qa  = src.read(4).astype(np.int32)  # raw bitmask — no fill substitution
             ssa = _read_band(src, 5)
             rf  = _read_band(src, 6)
 
         # Step A1 QA filters on TIF-shaped arrays
-        valid = ~np.isnan(aot)
-        valid &= ~np.isnan(rf)  & (rf  >= rf_min)
-        valid &= ~np.isnan(unc) & (np.abs(unc) <= unc_max)
-
-        if apply_vza_filter:
-            valid &= vza_tif < HIMAWARI_VZA_MAX
-
-        if fdt is not None:
-            sza_tif = compute_sza(tif_lat_2d, tif_lon_2d, fdt)
-            valid &= sza_tif < HIMAWARI_SZA_MAX
-        else:
-            sza_tif = np.full(tif_shape, np.nan, dtype=np.float32)
+        valid = ~np.isnan(aot) & (aot > HIMAWARI_AOT_MIN)
+        valid &= _qa_passes(qa)
+        valid &= ~np.isnan(rf)  & (rf  >= HIMAWARI_RF_MIN)
+        valid &= ~np.isnan(unc) & (np.abs(unc) <= HIMAWARI_UNC_MAX)
 
         acc['aot'][valid] += aot[valid]
         acc['unc'][valid] += unc[valid]
         acc['rf'][valid]  += rf[valid]
-        acc['vza'][valid] += vza_tif[valid]
-        acc['sza'][valid] += sza_tif[valid]
         cnt[valid] += 1
 
         # AE/SSA tracked separately so a NaN AE on an otherwise-valid pixel
@@ -299,17 +264,13 @@ def read_l2_slot(
         acc['ssa'][ssa_ok] += ssa[ssa_ok]
         cnt_ss[ssa_ok]     += 1
 
-    has_tif = cnt > 0
-
     # Embed TIF-resolution results into the full (NLAT, NLON) config grid
     full_shape = (NLAT, NLON)
     result: dict[str, np.ndarray] = {}
 
-    # Per-channel divisor: AE and SSA have their own counters (see accumulation)
-    cnt_for = {'aot': cnt, 'unc': cnt, 'rf': cnt, 'vza': cnt, 'sza': cnt,
-               'ae': cnt_ae, 'ssa': cnt_ss}
+    cnt_for = {'aot': cnt, 'unc': cnt, 'rf': cnt, 'ae': cnt_ae, 'ssa': cnt_ss}
     key_map = {'aot': 'aot', 'ae': 'ae', 'unc': 'uncertainty',
-               'ssa': 'ssa', 'rf': 'rf', 'vza': 'vza', 'sza': 'sza'}
+               'ssa': 'ssa', 'rf': 'rf'}
 
     for k_acc, k_out in key_map.items():
         c    = cnt_for[k_acc]
@@ -328,11 +289,6 @@ def read_l2_slot(
     cnt_full[r0:r0 + TH, c0:c0 + TW] = cnt.astype(np.int16)
     result['n_obs'] = cnt_full
 
-    vza_flag_full = np.zeros(full_shape, dtype=np.int8)
-    vza_tif_flag = ((vza_tif > HIMAWARI_VZA_SOFT) & has_tif).astype(np.int8)
-    vza_flag_full[r0:r0 + TH, c0:c0 + TW] = vza_tif_flag
-    result['vza_flag'] = vza_flag_full
-
     return result
 
 
@@ -341,8 +297,17 @@ def read_l2_slot(
 def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarray] | None:
     """Read and QA-filter the nearest L3 hourly composite within ±window_min.
 
-    Returns the same grid layout as read_l2_slot, but sourced from L3 AOT_Merged.
-    Uses AOT_Merged (Band 2); falls back to AOT_L2_Mean (Band 10) if all-fill.
+    Returns the same grid layout as read_l2_slot, sourced from L3 AOT_Merged
+    (Band 2) and screened with QA_flag_Merged (Band 8) using the JAXA strict
+    bit-mask.  No fallback to AOT_L2_Mean: mixing the two would mean blending
+    JAXA's merged retrieval with a raw 10-min average, which are different
+    products with different quality characteristics.
+
+    Step A1 filters:
+        • JAXA strict QA bit-mask on QA_flag_Merged — see _qa_passes
+          (subsumes the prior SZA/VZA gates via bit 10)
+        • AOT > HIMAWARI_AOT_MIN  (strict-zero gate)
+        • |AOT_Merged_uncertainty| ≤ HIMAWARI_UNC_MAX
 
     Returns None if no files are found.
     """
@@ -351,36 +316,18 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
         return None
 
     fpath = files[0]
-    fdt   = _parse_l3_utc(fpath.name)
-
-    unc_max = HIMAWARI_UNC_MAX
-
     r0, c0, TH, TW = _get_tif_grid_offset(str(fpath))
-    tif_lats = LATS[r0:r0 + TH]
-    tif_lons = LONS[c0:c0 + TW]
-    tif_lat_2d, tif_lon_2d = np.meshgrid(tif_lats, tif_lons, indexing='ij')
-    vza_tif = compute_himawari_vza(tif_lat_2d, tif_lon_2d)
 
     with rasterio.open(str(fpath)) as src:
-        aot_merged = _read_band(src, 2)   # AOT_Merged
-        unc_merged = _read_band(src, 4)   # AOT_Merged_uncertainty
-        ae_merged  = _read_band(src, 6)   # AE_Merged
-        aot_l2mean = _read_band(src, 10)  # AOT_L2_Mean (fallback)
-        ae_l2mean  = _read_band(src, 13)  # AE_L2_Mean (fallback for AE)
+        aot        = _read_band(src, 2)              # AOT_Merged
+        unc_merged = _read_band(src, 4)              # AOT_Merged_uncertainty
+        ae         = _read_band(src, 6)              # AE_Merged
+        qa         = src.read(8).astype(np.int32)    # QA_flag_Merged (raw bitmask)
 
-    aot = np.where(~np.isnan(aot_merged), aot_merged, aot_l2mean)
-    ae  = np.where(~np.isnan(ae_merged),  ae_merged,  ae_l2mean)
-
-    valid = ~np.isnan(aot)
+    valid = ~np.isnan(aot) & (aot > HIMAWARI_AOT_MIN)
+    valid &= _qa_passes(qa)
     if not np.all(np.isnan(unc_merged)):
-        valid &= ~np.isnan(unc_merged) & (np.abs(unc_merged) <= unc_max)
-    valid &= vza_tif < HIMAWARI_VZA_MAX
-
-    if fdt is not None:
-        sza_tif = compute_sza(tif_lat_2d, tif_lon_2d, fdt)
-        valid &= sza_tif < HIMAWARI_SZA_MAX
-    else:
-        sza_tif = np.full((TH, TW), np.nan, dtype=np.float32)
+        valid &= ~np.isnan(unc_merged) & (np.abs(unc_merged) <= HIMAWARI_UNC_MAX)
 
     full_shape = (NLAT, NLON)
     nan_full   = np.full(full_shape, np.nan, dtype=np.float32)
@@ -390,11 +337,8 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
         out[r0:r0 + TH, c0:c0 + TW] = np.where(valid, tif_arr, np.nan).astype(np.float32)
         return out
 
-    n_obs_full    = np.zeros(full_shape, dtype=np.int16)
+    n_obs_full = np.zeros(full_shape, dtype=np.int16)
     n_obs_full[r0:r0 + TH, c0:c0 + TW] = valid.astype(np.int16)
-
-    vza_flag_full = np.zeros(full_shape, dtype=np.int8)
-    vza_flag_full[r0:r0 + TH, c0:c0 + TW] = ((vza_tif > HIMAWARI_VZA_SOFT) & valid).astype(np.int8)
 
     aot_full = _embed(aot)
     ae_full  = _embed(ae)
@@ -407,10 +351,7 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
         'uncertainty': _embed(unc_merged),
         'ssa':         nan_full.copy(),
         'rf':          nan_full.copy(),
-        'vza':         _embed(vza_tif),
-        'sza':         _embed(sza_tif),
         'n_obs':       n_obs_full,
-        'vza_flag':    vza_flag_full,
     }
 
 

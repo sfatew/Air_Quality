@@ -14,10 +14,15 @@ File schema (one file per slot: gridded_YYYYMMDD_HHMM.nc):
     Coordinates  : lat, lon (cell centres)
     Per sensor s ∈ {himawari_l2, himawari_l3, viirs_snpp,
                     viirs_noaa20, modis_maiac}:
-        AOD_{s}        float32  (NaN where no retrieval in cell)
-        vza_{s}        float32  (mean viewing zenith angle, where available)
-        sza_{s}        float32  (mean solar zenith angle, where available)
-        n_pixels_{s}   int16    (native pixels contributing to cell)
+        AOD_{s}        float32  cell mean AOD (NaN where no retrieval).
+                                NOT pre-filtered for heterogeneity — apply
+                                `cv_{s} <= CV_MAX` downstream if desired.
+        aod_std_{s}    float32  within-cell std (NaN where n_valid_{s} < 2)
+        cv_{s}         float32  std / max(mean, 0.02) — heterogeneity proxy
+        n_valid_{s}    int16    native pixels actually binned into the cell
+        n_total_{s}    int16    theoretical max pixels per cell at this lat
+        vza_{s}        float32  mean viewing zenith angle, where available
+        sza_{s}        float32  mean solar zenith angle, where available
 
 Sensors with no valid pixel anywhere in the slot are omitted (not written
 as all-NaN), so ``read_gridded_slot`` returning ``sensor not in result``
@@ -180,16 +185,27 @@ def write_gridded_slot(
 
         for sensor, g in per_sensor.items():
             _add(f'AOD_{sensor}', g['aod_mean'],
-                 f'Pre-correction gridded AOD from {sensor}')
+                 f'Pre-correction gridded AOD from {sensor} '
+                 '(NOT heterogeneity-filtered; apply cv threshold downstream)')
+            if g.get('aod_std') is not None:
+                _add(f'aod_std_{sensor}', g['aod_std'],
+                     f'Within-cell AOD std dev for {sensor}')
+            if g.get('cv') is not None:
+                _add(f'cv_{sensor}', g['cv'],
+                     f'Coefficient of variation (std / max(mean, 0.02)) for {sensor}')
             if g.get('vza_mean') is not None:
                 _add(f'vza_{sensor}', g['vza_mean'],
                      f'Mean viewing zenith angle for {sensor}', units='degrees')
             if g.get('sza_mean') is not None:
                 _add(f'sza_{sensor}', g['sza_mean'],
                      f'Mean solar zenith angle for {sensor}', units='degrees')
-            if g.get('n_pixels') is not None:
-                _add(f'n_pixels_{sensor}', g['n_pixels'],
-                     f'Number of valid native pixels in cell from {sensor}',
+            if g.get('n_valid') is not None:
+                _add(f'n_valid_{sensor}', g['n_valid'],
+                     f'Number of valid native pixels binned into cell for {sensor}',
+                     dtype='i2', fill=-1)
+            if g.get('n_total') is not None:
+                _add(f'n_total_{sensor}', g['n_total'],
+                     f'Theoretical max native pixels per cell at this latitude for {sensor}',
                      dtype='i2', fill=-1)
 
     return out_path
@@ -221,15 +237,21 @@ def read_gridded_slot(
             if not np.any(np.isfinite(aod)):
                 continue
             g: dict[str, np.ndarray] = {'aod_mean': aod}
-            for sfx, key in (('vza', 'vza_mean'), ('sza', 'sza_mean')):
+            for sfx, key in (
+                ('aod_std', 'aod_std'),
+                ('cv',      'cv'),
+                ('vza',     'vza_mean'),
+                ('sza',     'sza_mean'),
+            ):
                 vname = f'{sfx}_{sensor}'
                 if vname in ds.variables:
                     g[key] = np.ma.filled(
                         ds.variables[vname][:].astype(np.float32), np.nan)
-            npx = f'n_pixels_{sensor}'
-            if npx in ds.variables:
-                arr = ds.variables[npx][:].astype(np.int16)
-                g['n_pixels'] = np.ma.filled(arr, 0).astype(np.int16)
+            for sfx, key in (('n_valid', 'n_valid'), ('n_total', 'n_total')):
+                vname = f'{sfx}_{sensor}'
+                if vname in ds.variables:
+                    arr = ds.variables[vname][:].astype(np.int16)
+                    g[key] = np.ma.filled(arr, 0).astype(np.int16)
             out[sensor] = g
     return out if out else None
 
@@ -245,8 +267,10 @@ def grid_day(
 ) -> tuple[int, int]:
     """Produce 30-min gridded NetCDFs for one calendar day.
 
-    Returns ``(n_written, n_errors)``.  Slots whose target file already
-    exists are skipped unless ``overwrite=True``.
+    Returns ``(n_written, n_errors)``.  Slots whose target file already exists
+    are skipped unless ``overwrite=True``.  Cells are never masked at this
+    stage — quality metadata (cv, n_valid, n_total) is written to each NetCDF
+    so downstream consumers can apply their own thresholds.
     """
     try:
         from tqdm import tqdm as _tqdm

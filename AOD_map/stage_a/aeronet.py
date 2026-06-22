@@ -1,14 +1,30 @@
 """Load and preprocess AERONET V3 L2.0 data for the two Vietnam anchor sites."""
 
 from __future__ import annotations
+import importlib.util
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from config import (
-    AERONET_DIR, AERONET_SITES, DRY_MONTHS,
-    NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
-)
+# Load stage_a/config.py by absolute file path so this module works correctly
+# when imported from stage_b (where a sibling stage_b/config.py would otherwise
+# win on sys.path). Reuse the already-loaded module when present.
+if 'stage_a_config' in sys.modules:
+    _cfg = sys.modules['stage_a_config']
+else:
+    _spec = importlib.util.spec_from_file_location(
+        'stage_a_config', Path(__file__).resolve().parent / 'config.py'
+    )
+    _cfg = importlib.util.module_from_spec(_spec)
+    sys.modules['stage_a_config'] = _cfg
+    _spec.loader.exec_module(_cfg)
+
+AERONET_DIR        = _cfg.AERONET_DIR
+AERONET_SITES      = _cfg.AERONET_SITES
+DRY_MONTHS         = _cfg.DRY_MONTHS
+NORTH_CENTRAL_LAT  = _cfg.NORTH_CENTRAL_LAT
+CENTRAL_SOUTH_LAT  = _cfg.CENTRAL_SOUTH_LAT
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────

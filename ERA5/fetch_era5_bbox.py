@@ -53,8 +53,8 @@ import xarray as xr
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 BBOX         = [23.5, 102.0, 8.0, 110.0]   # [N, W, S, E] — CDS convention
-START        = (2022, 9)
-END          = (2026, 4)
+START        = (2020, 1)
+END          = (2022, 1)
 
 # How many months to download concurrently.
 # CDS fair-use limit is ~20 active jobs per user; 2 jobs per month → keep ≤8.

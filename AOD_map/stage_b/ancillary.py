@@ -8,7 +8,10 @@ Temporal handling (§3 of stage_b_fixes.md):
 - ERA5 hourly → 30-min slot via **linear interpolation** between flanking
   hourly fields.  Slot at HH:30 = 0.5 × ERA5(HH:00) + 0.5 × ERA5(HH+1:00).
 - CAMS 3-hourly → 30-min via linear interpolation in time between flanking
-  3-hour fields.
+  3-hour fields.  Both source products (EAC4 reanalysis and the
+  near-real-time forecast fallback) share the {00,03,06,09,12,15,18,21} UTC
+  grid; only the native spatial resolution differs (0.75° vs 0.4°), which
+  is handled transparently by `_interp_to_grid` reading lat/lon from the file.
 - IMERG native 30-min — no temporal resampling needed.
 - NDVI 16-day composite — nearest-on-or-before in time, cached per (year,DOY).
 - Land cover annual — nearest year ≤ slot year, cached per year.
@@ -24,6 +27,7 @@ import os
 import warnings
 import zipfile
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -36,8 +40,11 @@ from scipy.interpolate import RegularGridInterpolator
 from config import (
     LATS, LONS, NLAT, NLON,
     LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
+    NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
     ERA5_MONTHLY_DIR, CAMS_MONTHLY_DIR,
     NDVI_DIR, LANDCOVER_DIR, LANDSCAN_DIR, DEM_DIR, IMERG_DIR,
+    FIRMS_ZIP, FIRMS_RADIUS_KM, FIRMS_LOOKBACK_H,
+    EARTH_RADIUS_KM,
 )
 
 os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
@@ -49,7 +56,16 @@ LAT_2D, LON_2D = np.meshgrid(_TARGET_LAT, _TARGET_LON, indexing='ij')
 
 def _interp_to_grid(src_lat: np.ndarray, src_lon: np.ndarray,
                     field: np.ndarray) -> np.ndarray:
-    """Bilinearly interpolate a source field to the 0.05° Stage A grid."""
+    """Bilinearly interpolate a source field to the 0.05° Stage A grid.
+
+    Target cells that fall outside the source bbox are clipped to the source
+    edge → nearest-edge extrapolation.  This is needed because CAMS's native
+    bbox (8.25°-23.25° lat, 102°-109.5° lon) is narrower than Stage A's
+    (8.025°-23.475° lat, 102.025°-109.975° lon) by ~0.25° on each side, so
+    without this ~9% of CAMS slot cells would be NaN.  Linear extrapolation
+    would be wilder near strong gradients (e.g. dust plumes exiting the
+    domain); nearest-edge is the safer choice for a smooth reanalysis.
+    """
     if src_lat[0] > src_lat[-1]:
         src_lat = src_lat[::-1]
         field   = field[::-1, :]
@@ -63,7 +79,9 @@ def _interp_to_grid(src_lat: np.ndarray, src_lon: np.ndarray,
         bounds_error=False,
         fill_value=np.nan,
     )
-    pts = np.column_stack([LAT_2D.ravel(), LON_2D.ravel()])
+    pts_lat = np.clip(LAT_2D.ravel(), src_lat[0], src_lat[-1])
+    pts_lon = np.clip(LON_2D.ravel(), src_lon[0], src_lon[-1])
+    pts = np.column_stack([pts_lat, pts_lon])
     return interp(pts).reshape(NLAT, NLON).astype(np.float32)
 
 
@@ -197,6 +215,11 @@ def _cams_flanking_anchors(slot_utc: datetime) -> tuple[datetime, datetime, floa
     return t_before, t_after, frac
 
 
+# 144 entries ≈ 3 days at 30-min cadence — enough that `cams_aod_slot_lagged`
+# (3 h back) always hits when iteration is chronological, and ≥1 day of prior
+# slots stay warm for any nearby re-walks.  Each entry is one (NLAT, NLON)
+# float32 grid ≈ 200 kB, so 144 × 200 kB ≈ 30 MB total.
+@lru_cache(maxsize=144)
 def cams_aod_slot(slot_utc: datetime) -> Optional[np.ndarray]:
     t_b, t_a, w = _cams_flanking_anchors(slot_utc)
     ds_b = _open_cams_month(t_b.strftime('%Y%m'))
@@ -208,54 +231,169 @@ def cams_aod_slot(slot_utc: datetime) -> Optional[np.ndarray]:
         a_a = ds_a['AOD550'].sel(time=t_a.strftime('%Y-%m-%dT%H:00:00')).values
     except (KeyError, ValueError):
         return None
-    field = (1 - w) * a_b + w * a_a
-    lat = ds_b['latitude'].values.astype(np.float64)
-    lon = ds_b['longitude'].values.astype(np.float64)
-    return _interp_to_grid(lat, lon, field)
+    # Reproject each flanking field to the production grid BEFORE combining in
+    # time.  The opposite order breaks when the two anchors come from different
+    # CAMS sources (EAC4 0.75° → (21,11) vs forecast fallback 0.4° → (39,21))
+    # because the native arrays don't share a shape.  Reprojecting first puts
+    # both onto (NLAT, NLON) and the temporal interp is then unconditional.
+    g_b = _interp_to_grid(ds_b['latitude'].values.astype(np.float64),
+                          ds_b['longitude'].values.astype(np.float64), a_b)
+    g_a = _interp_to_grid(ds_a['latitude'].values.astype(np.float64),
+                          ds_a['longitude'].values.astype(np.float64), a_a)
+    return ((1 - w) * g_b + w * g_a).astype(np.float32)
 
 
-# ── IMERG (30-min GeoTIFFs zipped, native to our slot cadence) ───────────────
+# ── IMERG (30-min GeoTIFFs, native to our slot cadence) ──────────────────────
+# The IMERG V07B GIS product ships 9 layers per slot (total/liquid/ice × rate/
+# accum, plus liquidPercent and numValid/Precip counts).  We use the
+# **total.accum** layer: rainfall accumulation in mm over the 30-min window.
+# Pixel values are integer-scaled by 10 per the GES DISC GIS README — divide
+# by 10 to recover mm.
+#
+# Some slots are still zipped (*.zip), others have been pre-extracted into a
+# sibling *.V07B/ directory.  The locator below prefers the extracted form.
 
-def _imerg_slot_zip(slot_utc: datetime) -> Optional[Path]:
-    """Locate the IMERG zip for this slot. IMERG file names use the slot's
-    start minute (HHMM) as the half-hour anchor."""
+_IMERG_TARGET_SUFFIX = '.total.accum.tif'
+_IMERG_SCALE = 10.0  # pixel value / scale → mm in the 30-min slot
+
+
+def _imerg_slot_source(slot_utc: datetime) -> Optional[tuple[Path, str]]:
+    """Locate the IMERG source for this slot.  Returns (path, kind) where
+    kind is 'dir' (extracted *.V07B directory) or 'zip', or None if absent.
+    Extracted directories take priority — they're already on disk, no unzip
+    needed."""
     folder = IMERG_DIR / f'{slot_utc.year:04d}' / f'{slot_utc.month:02d}' / f'{slot_utc.day:02d}'
     if not folder.exists():
         return None
-    tag = slot_utc.strftime('%Y%m%d')
-    minute_of_day = slot_utc.hour * 60 + slot_utc.minute
     hh = slot_utc.strftime('%H%M')
-    candidates = sorted(folder.glob(f'*{tag}*{hh}*.zip'))
-    if not candidates:
-        # IMERG often labels by start minute-of-day "S{HHMMSS}-E…".  Fall back
-        # to a broader match on start-second.
-        ss = f'S{slot_utc.hour:02d}{slot_utc.minute:02d}00'
-        candidates = sorted(folder.glob(f'*{ss}*.zip'))
-    return candidates[0] if candidates else None
+    tag = slot_utc.strftime('%Y%m%d')
+    ss = f'S{slot_utc.hour:02d}{slot_utc.minute:02d}00'
+
+    dirs = sorted(p for p in folder.glob(f'*{tag}*{hh}*.V07B') if p.is_dir())
+    if not dirs:
+        dirs = sorted(p for p in folder.glob(f'*{ss}*.V07B') if p.is_dir())
+    if dirs:
+        return dirs[0], 'dir'
+
+    zips = sorted(folder.glob(f'*{tag}*{hh}*.zip'))
+    if not zips:
+        zips = sorted(folder.glob(f'*{ss}*.zip'))
+    if zips:
+        return zips[0], 'zip'
+    return None
+
+
+def _imerg_open_total_accum(path: Path, kind: str) -> Optional[bytes]:
+    """Return the raw bytes of the *.total.accum.tif layer from either an
+    extracted directory or a zip.  None if the layer is missing."""
+    if kind == 'dir':
+        tifs = sorted(path.glob(f'*{_IMERG_TARGET_SUFFIX}'))
+        if not tifs:
+            return None
+        return tifs[0].read_bytes()
+    # kind == 'zip'
+    with zipfile.ZipFile(path) as zf:
+        names = [n for n in zf.namelist() if n.lower().endswith(_IMERG_TARGET_SUFFIX)]
+        if not names:
+            return None
+        with zf.open(names[0]) as fh:
+            return fh.read()
 
 
 def imerg_slot(slot_utc: datetime) -> Optional[np.ndarray]:
-    """IMERG precipitation rate (mm/hr) at one 30-min slot, reprojected to the
-    Stage A grid.  Returns None if the file isn't on disk for that slot."""
-    z = _imerg_slot_zip(slot_utc)
-    if z is None:
+    """IMERG total precipitation accumulation (mm per 30-min slot) at one
+    slot, reprojected to the Stage A grid.  Returns None if the slot file
+    isn't on disk."""
+    src_path = _imerg_slot_source(slot_utc)
+    if src_path is None:
         return None
+    path, kind = src_path
     try:
-        with zipfile.ZipFile(z) as zf:
-            tifs = [n for n in zf.namelist() if n.lower().endswith('.tif')]
-            if not tifs:
-                return None
-            with zf.open(tifs[0]) as fh:
-                buf = fh.read()
+        buf = _imerg_open_total_accum(path, kind)
+        if buf is None:
+            return None
         with rasterio.MemoryFile(buf) as mem, mem.open() as src:
             arr = src.read(1).astype(np.float64)
             nod = src.nodata
             if nod is not None:
                 arr = np.where(arr == nod, np.nan, arr)
             arr = np.where(arr < 0, np.nan, arr)
+            arr = arr / _IMERG_SCALE  # integer-scaled → mm
             return _imerg_reproject(src, arr)
     except Exception:
         return None
+
+
+# ── Antecedent precipitation features (§7.8.1 RF-features refresh) ───────────
+# Each call to `imerg_slot` reads a TIF + reprojects, so an LRU is essential
+# for both the 6h/24h accumulation features and the hours-since-rain back-walk.
+# 320 entries × 30 min ≈ 160 h of history — covers a 72 h rain-search at the
+# current slot *plus* a comfortable look-back from the previous slot in a
+# sequential training walk (so consecutive slot feature-builds re-use almost
+# every IMERG read from the prior slot's back-walk).
+
+
+@lru_cache(maxsize=320)
+def _imerg_slot_cached(slot_utc: datetime) -> Optional[np.ndarray]:
+    return imerg_slot(slot_utc)
+
+
+def imerg_accum_hours(slot_utc: datetime, hours: float,
+                      step_min: int = 30) -> np.ndarray:
+    """Rolling precipitation accumulation (mm) over the previous `hours`
+    ending at (and including) `slot_utc`.  Missing IMERG slots inside the
+    window contribute 0 (not NaN) — the alternative would NaN out the whole
+    grid whenever a single slot is missing, which is harsher than skipping.
+    """
+    n_steps = int(round(hours * 60.0 / step_min))
+    acc = np.zeros((NLAT, NLON), dtype=np.float32)
+    any_finite = np.zeros((NLAT, NLON), dtype=bool)
+    for k in range(n_steps + 1):
+        t = slot_utc - timedelta(minutes=k * step_min)
+        arr = _imerg_slot_cached(t)
+        if arr is None:
+            continue
+        finite = np.isfinite(arr)
+        acc = acc + np.where(finite, arr.astype(np.float32), 0.0)
+        any_finite |= finite
+    return np.where(any_finite, acc, np.nan).astype(np.float32)
+
+
+def hours_since_rain(slot_utc: datetime,
+                     threshold_mm: float = 0.1,
+                     max_lookback_h: float = 72.0,
+                     step_min: int = 30) -> np.ndarray:
+    """Per-cell hours since the last 30-min IMERG slot whose rain was ≥
+    `threshold_mm`.  Capped at `max_lookback_h` — cells that haven't seen
+    rain in the lookback window get that value.
+
+    Stops the back-walk as soon as every cell has been resolved (typical
+    for monsoon season; long for the dry haze episodes).
+    """
+    out   = np.full((NLAT, NLON), np.float32(max_lookback_h), dtype=np.float32)
+    found = np.zeros((NLAT, NLON), dtype=bool)
+    n_steps = int(round(max_lookback_h * 60.0 / step_min))
+    for k in range(n_steps + 1):
+        t = slot_utc - timedelta(minutes=k * step_min)
+        arr = _imerg_slot_cached(t)
+        if arr is None:
+            continue
+        hits = (arr >= threshold_mm) & np.isfinite(arr) & ~found
+        if hits.any():
+            out = np.where(hits, np.float32(k * step_min / 60.0), out)
+            found |= hits
+            if found.all():
+                break
+    return out
+
+
+# ── CAMS lag accessor (§7.8.1 RF-features refresh) ──────────────────────────
+# CAMS native cadence is 3-hourly, so a 3 h lag picks up the previous CAMS
+# anchor cleanly without smearing through the linear interpolator.
+
+def cams_aod_slot_lagged(slot_utc: datetime, lag_hours: float = 3.0
+                          ) -> Optional[np.ndarray]:
+    return cams_aod_slot(slot_utc - timedelta(hours=lag_hours))
 
 
 def _imerg_reproject(src, arr_2d) -> np.ndarray:
@@ -519,3 +657,214 @@ def landcover_grid(local_day: date) -> Optional[np.ndarray]:
     out = dst.astype(np.float32)
     _LC_CACHE[year] = out
     return out
+
+
+# ── Static layer: coarse region (§8.2.4c follow-up) ─────────────────────────
+# 0 = north, 1 = central, 2 = south.  Lat-band boundaries match the rest of
+# the pipeline (Stage A validation strata, AERONET fallback strata).
+
+_REGION_CACHE: Optional[np.ndarray] = None
+
+
+def region_idx_grid() -> np.ndarray:
+    """Static (NLAT, NLON) grid encoding region as 0=north, 1=central, 2=south.
+
+    Trees can split this single column at any threshold, so we don't need
+    one-hot — `region_idx <= 0.5` isolates north, `>= 1.5` isolates south.
+    """
+    global _REGION_CACHE
+    if _REGION_CACHE is not None:
+        return _REGION_CACHE
+    lat_grid = LAT_2D.astype(np.float32)
+    out = np.where(lat_grid >= NORTH_CENTRAL_LAT, 0.0,
+          np.where(lat_grid <  CENTRAL_SOUTH_LAT, 2.0, 1.0)).astype(np.float32)
+    _REGION_CACHE = out
+    return out
+
+
+# ── FIRMS active-fire (§8.2.4c follow-up) ───────────────────────────────────
+# MODIS C6.1 FIRMS bundle ships fire_archive_* + fire_nrt_* shapefiles inside
+# a single ZIP.  check_ancillary_data.ipynb confirms zero date overlap
+# (archive ends 2026-02-28, nrt starts 2026-03-01), so concatenation is safe
+# without dedup.  We load once, build a timestamp-sorted DataFrame with
+# (lat, lon, acq_utc, frp), and re-use it across all slot queries via a
+# per-slot LRU.
+
+_FIRMS_TABLE: Optional[pd.DataFrame] = None  # type: ignore[name-defined]
+
+
+def _load_firms_table() -> 'pd.DataFrame':
+    """Lazy-load the archive+nrt FIRMS table.  Columns: lat, lon, acq_utc, frp.
+
+    `acq_utc` is the detection timestamp built from ACQ_DATE + ACQ_TIME (UTC).
+    `frp` is in MW; rows missing FRP get 0 so they still flag presence-of-fire
+    in the count-based fallback (we don't use the count path right now, but
+    keeping FRP non-NaN avoids selectively dropping detections).
+    """
+    global _FIRMS_TABLE
+    if _FIRMS_TABLE is not None:
+        return _FIRMS_TABLE
+
+    import geopandas as gpd  # heavy import — keep inside the loader
+    import pandas as pd
+
+    if not FIRMS_ZIP.exists():
+        warnings.warn(f'FIRMS zip not found at {FIRMS_ZIP} — fire feature will be 0')
+        _FIRMS_TABLE = pd.DataFrame({
+            'lat': np.array([], dtype=np.float32),
+            'lon': np.array([], dtype=np.float32),
+            'acq_utc': pd.to_datetime([]),
+            'frp': np.array([], dtype=np.float32),
+        })
+        return _FIRMS_TABLE
+
+    with zipfile.ZipFile(FIRMS_ZIP) as zf:
+        stems = sorted({n.rsplit('.', 1)[0] for n in zf.namelist()
+                        if n.lower().endswith('.shp')})
+
+    frames = []
+    for stem in stems:
+        gdf = gpd.read_file(f'zip://{FIRMS_ZIP}!{stem}.shp')
+        if 'ACQ_DATE' not in gdf.columns or 'ACQ_TIME' not in gdf.columns:
+            continue
+        acq_date = pd.to_datetime(gdf['ACQ_DATE'], errors='coerce')
+        # ACQ_TIME is 'HHMM' as a string/int in the MODIS C6.1 schema.
+        acq_time = gdf['ACQ_TIME'].astype(str).str.zfill(4)
+        hours   = pd.to_numeric(acq_time.str[:2], errors='coerce')
+        minutes = pd.to_numeric(acq_time.str[2:], errors='coerce')
+        acq_utc = (acq_date
+                   + pd.to_timedelta(hours,   unit='h')
+                   + pd.to_timedelta(minutes, unit='m'))
+        df = pd.DataFrame({
+            'lat':     gdf['LATITUDE'].to_numpy(np.float32),
+            'lon':     gdf['LONGITUDE'].to_numpy(np.float32),
+            'acq_utc': acq_utc,
+            'frp':     pd.to_numeric(gdf.get('FRP', 0.0),
+                                     errors='coerce').fillna(0.0)
+                         .astype(np.float32).to_numpy(),
+        })
+        df = df.dropna(subset=['acq_utc']).reset_index(drop=True)
+        frames.append(df)
+
+    if not frames:
+        table = pd.DataFrame({
+            'lat': np.array([], dtype=np.float32),
+            'lon': np.array([], dtype=np.float32),
+            'acq_utc': pd.to_datetime([]),
+            'frp': np.array([], dtype=np.float32),
+        })
+    else:
+        table = pd.concat(frames, ignore_index=True)
+        table = table.sort_values('acq_utc').reset_index(drop=True)
+    _FIRMS_TABLE = table
+    return table
+
+
+# Cell-centre lat/lon arrays, flattened — reused by the KD-tree query.
+_CELL_LAT_FLAT = LAT_2D.ravel().astype(np.float64)
+_CELL_LON_FLAT = LON_2D.ravel().astype(np.float64)
+
+# Mean-Earth approximation for the 25 km radius in degrees: at this latitude
+# range (8–24°N) the latitudinal degree is ~111 km and the longitudinal degree
+# is ~106 km, so a flat-Earth KD-tree in (lat, lon * cos(mean_lat)) is accurate
+# to <1 % over a 25 km radius — well within the plume-scale fuzziness.
+_MEAN_LAT_RAD = np.deg2rad(float((LAT_MIN + LAT_MAX) / 2.0))
+_LON_SCALE    = float(np.cos(_MEAN_LAT_RAD))    # multiply lon by this before KD-tree
+_DEG_PER_KM   = 1.0 / 111.0                     # rough lat-degree per km
+
+
+@lru_cache(maxsize=192)
+def firms_frp_grid(slot_utc: datetime) -> np.ndarray:
+    """Per-cell log(1 + Σ FRP) over fires within FIRMS_RADIUS_KM and the
+    past FIRMS_LOOKBACK_H ending at (and including) `slot_utc`.
+
+    Returns a finite (NLAT, NLON) float32 grid — cells with no nearby fire
+    in the window get 0.0 (not NaN), so the RF can use this as a "smoke
+    pressure" intensity without dragging NaNs into the imputer.
+
+    The expensive piece is the spatial join (sum FRP within radius for every
+    cell).  We use a cKDTree on (lat, lon*cos(mean_lat)) which is accurate to
+    <1 % over a 25 km radius at Vietnam latitudes.
+    """
+    table = _load_firms_table()
+    grid = np.zeros((NLAT, NLON), dtype=np.float32)
+    if table.empty:
+        return grid
+
+    t_end   = slot_utc
+    t_start = slot_utc - timedelta(hours=FIRMS_LOOKBACK_H)
+
+    # Slice the time window first — chops a 305k-row table down to typically
+    # a few hundred fires per 24 h window over Vietnam.
+    acq = table['acq_utc'].to_numpy()
+    mask = (acq > np.datetime64(t_start)) & (acq <= np.datetime64(t_end))
+    if not mask.any():
+        return grid
+    fires = table.loc[mask, ['lat', 'lon', 'frp']].to_numpy(dtype=np.float64)
+    fire_lat = fires[:, 0]
+    fire_lon = fires[:, 1]
+    fire_frp = fires[:, 2].astype(np.float32)
+
+    grid_flat = _firms_aggregate_frp(
+        fire_lat, fire_lon, fire_frp,
+        cell_lat=_CELL_LAT_FLAT, cell_lon=_CELL_LON_FLAT,
+        radius_km=FIRMS_RADIUS_KM,
+    )
+    grid = np.log1p(grid_flat).reshape(NLAT, NLON).astype(np.float32)
+    return grid
+
+
+def _firms_aggregate_frp(
+    fire_lat: np.ndarray, fire_lon: np.ndarray, fire_frp: np.ndarray,
+    cell_lat: np.ndarray, cell_lon: np.ndarray,
+    radius_km: float,
+) -> np.ndarray:
+    """For each cell, sum FRP of all fires within `radius_km`.
+
+    Inputs are float64 1D arrays of fire detections (already pre-filtered to
+    the time window) and 1D arrays of cell centres (NLAT*NLON entries).
+    Output is a 1D float32 array of length NCELL with the per-cell FRP sum
+    (0.0 where no fire is within radius).
+
+    Strategy: build the cKDTree on the (small) fire set, query from the
+    (large but static) cell array.  Per-fire neighbour-list extraction is
+    flattened into (cell_idx, fire_idx) pairs and summed via np.bincount —
+    O(total-pairs) with no Python-loop accumulation.
+    """
+    from scipy.spatial import cKDTree
+
+    n_cells = int(cell_lat.shape[0])
+    if fire_lat.size == 0:
+        return np.zeros(n_cells, dtype=np.float32)
+
+    fire_pts = np.column_stack([fire_lat, fire_lon * _LON_SCALE])
+    cell_pts = np.column_stack([cell_lat, cell_lon * _LON_SCALE])
+
+    tree = cKDTree(fire_pts)
+    radius_deg = float(radius_km) * _DEG_PER_KM
+
+    # query_ball_point with a vector of query points returns a list of length
+    # n_cells, each element a list of fire indices within radius_deg.
+    neighbour_lists = tree.query_ball_point(cell_pts, r=radius_deg)
+
+    # Flatten into parallel arrays (cell_idx repeated, fire_idx concatenated)
+    # so the accumulation is a single np.bincount call rather than a Python
+    # for-loop over cells.
+    counts = np.fromiter((len(lst) for lst in neighbour_lists),
+                         dtype=np.int64, count=n_cells)
+    total_pairs = int(counts.sum())
+    if total_pairs == 0:
+        return np.zeros(n_cells, dtype=np.float32)
+
+    cell_ids = np.repeat(np.arange(n_cells, dtype=np.int64), counts)
+    fire_ids = np.fromiter(
+        (fi for lst in neighbour_lists for fi in lst),
+        dtype=np.int64, count=total_pairs,
+    )
+
+    out = np.bincount(
+        cell_ids,
+        weights=fire_frp[fire_ids].astype(np.float64),
+        minlength=n_cells,
+    )
+    return out.astype(np.float32)

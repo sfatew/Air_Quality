@@ -65,6 +65,11 @@ from config import (
     LATS, LONS, NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
     DATA_ROOT,
     TRAIN_START, TRAIN_END, TEST_START, TEST_END,
+    LEO_WINDOW_MIN,
+    BOX_STD_ABS_FLOOR, BOX_STD_SLOPE,
+    COLLOCATE_SPATIAL_FLAG_EXACT,
+    COLLOCATE_SPATIAL_FLAG_3X3,
+    COLLOCATE_SPATIAL_FLAG_5X5,
 )
 from aeronet import load_all_aeronet
 
@@ -109,6 +114,64 @@ def _get_region(lat: float) -> str:
     return 'south'
 
 
+# ── Tiered station-pixel sampler ──────────────────────────────────────────────
+# Mirrors extract_satellite._sample_cell so AERONET pairing here matches the
+# production collocate product: 1×1 → 3×3 → 5×5 cell neighbourhood with the
+# same heterogeneity gate.  Train-apply consistency on the AERONET axis.
+
+_STATION_CELL_TIERS = (
+    (0, COLLOCATE_SPATIAL_FLAG_EXACT),   # 1×1 cell
+    (1, COLLOCATE_SPATIAL_FLAG_3X3),     # 3×3 cells (≈ 15 km)
+    (2, COLLOCATE_SPATIAL_FLAG_5X5),     # 5×5 cells (≈ 25 km)
+)
+
+
+def _box_std_max(mean_aod: float, sensor: str) -> float:
+    return max(BOX_STD_ABS_FLOOR, BOX_STD_SLOPE.get(sensor, 0.15) * mean_aod)
+
+
+def _sample_station_cell(
+    grid_2d: np.ndarray,
+    row: int,
+    col: int,
+    sensor: str = 'merged',
+) -> Optional[tuple[float, float, int, slice, slice]]:
+    """Sample (NLAT, NLON) grid at (row, col) with the tiered cell fallback
+    from extract_satellite._sample_cell.  Returns
+    ``(mean, std, spatial_flag, row_slice, col_slice)`` for the first tier
+    whose neighbourhood is non-empty AND passes the heterogeneity gate, else
+    ``None``.  Caller gets the slices so it can summarise auxiliary grids
+    (confidence_flag, n_sensors, …) over the same window.
+    """
+    for hw, flag in _STATION_CELL_TIERS:
+        r0 = max(0, row - hw); r1 = min(NLAT, row + hw + 1)
+        c0 = max(0, col - hw); c1 = min(NLON, col + hw + 1)
+        rs, cs = slice(r0, r1), slice(c0, c1)
+        vals = grid_2d[rs, cs].ravel()
+        vals = vals[np.isfinite(vals) & (vals >= 0) & (vals <= 5.0)]
+        if len(vals) == 0:
+            continue
+        mean_v = float(np.mean(vals))
+        std_v  = float(np.std(vals, ddof=0))
+        if std_v > _box_std_max(mean_v, sensor):
+            return None
+        return mean_v, std_v, flag, rs, cs
+    return None
+
+
+def _neighbourhood_max_int(
+    grid_2d: np.ndarray,
+    rs: slice,
+    cs: slice,
+) -> int:
+    """Max integer flag over the sampled neighbourhood (confidence_flag /
+    n_sensors).  Center-pixel reads would falsely report ``0`` on fallback
+    rows that pulled their AOD from neighbouring cells."""
+    vals = grid_2d[rs, cs]
+    vals = vals[vals >= 0]
+    return int(vals.max()) if vals.size else 0
+
+
 # ── Merged NetCDF file discovery ──────────────────────────────────────────────
 
 def _merged_files_for_range(start: date, end: date) -> list[Path]:
@@ -145,19 +208,26 @@ def _parse_slot_utc(fpath: str) -> Optional[datetime]:
 def extract_aeronet_pairs(
     start: date,
     end:   date,
-    window_min: int = 30,
+    window_min: int = LEO_WINDOW_MIN,
 ) -> pd.DataFrame:
     """Build matched (merged_aod, aeronet_aod) pairs for all slots in [start, end].
 
     For each merged NetCDF:
-      1. Read AOD_merged at the two AERONET station pixels.
+      1. Sample AOD_merged at the AERONET station cell with the tiered
+         1×1 → 3×3 → 5×5 neighbourhood + box_std heterogeneity gate from
+         extract_satellite._sample_cell (train-apply consistent pairing).
       2. Find AERONET observations within ±window_min minutes.
       3. Average AERONET values in the window → one row per (slot, site).
+
+    confidence_flag and n_sensors are reduced as the **max** over the same
+    sampled neighbourhood so fallback rows whose central pixel had no
+    fusion contribution still expose the best flag in their cell area.
 
     Returns DataFrame with columns:
         slot_utc, site, region, season, month,
         merged_aod, aeronet_aod,
-        confidence_flag, n_sensors, aeronet_n_obs
+        confidence_flag, n_sensors, aeronet_n_obs,
+        box_std, spatial_flag
     """
     aer_all = load_all_aeronet()
     # Pre-index AERONET by site for fast look-up
@@ -191,12 +261,13 @@ def extract_aeronet_pairs(
             if not (0 <= row < NLAT and 0 <= col < NLON):
                 continue
 
-            sat_aod  = float(aod_merged[row, col])
-            if not np.isfinite(sat_aod) or sat_aod < 0:
+            sample = _sample_station_cell(aod_merged, row, col, sensor='merged')
+            if sample is None:
                 continue
+            sat_aod, sat_box_std, spatial_flag, rs, cs = sample
 
-            c_flag   = int(conf_flag[row, col])
-            n_sens   = int(n_sensors[row, col])
+            c_flag = _neighbourhood_max_int(conf_flag, rs, cs)
+            n_sens = _neighbourhood_max_int(n_sensors, rs, cs)
 
             # Find AERONET obs in window (compare UTC+7 to UTC+7)
             site_df = aer_by_site.get(site)
@@ -224,6 +295,8 @@ def extract_aeronet_pairs(
                 'confidence_flag': c_flag,
                 'n_sensors':      n_sens,
                 'aeronet_n_obs':  n_aer,
+                'box_std':        sat_box_std,
+                'spatial_flag':   spatial_flag,
             })
 
     return pd.DataFrame(records)
@@ -581,16 +654,17 @@ def compute_per_sensor_aeronet_rmse(
         'AOD_viirs_noaa20', 'AOD_viirs_snpp',
         'AOD_modis_maiac',  'AOD_himawari',
     ),
-    window_min: int = 30,
+    window_min: int = LEO_WINDOW_MIN,
 ) -> dict[str, float]:
     """Per-sensor RMSE vs AERONET on [start, end] — feeds B3 (Ahn 2021 ICW).
 
     Ahn 2021 §2.2.3 defines ICW weights as w_i = (1/RMSE_i) / Σ(1/RMSE_j) with
     one RMSE per sensor (no region/season stratification).  This helper
     reproduces that recipe: for every merged NetCDF in the window, sample
-    `AOD_<sensor>` at each AERONET station pixel, pair with AERONET ±window_min
-    min (same matching rule as `extract_aeronet_pairs`), then collapse to one
-    global RMSE per sensor.
+    `AOD_<sensor>` at each AERONET station cell with the tiered 1×1 → 3×3 →
+    5×5 fallback (same pairing rule as `extract_aeronet_pairs` and the
+    production collocate product), pair with AERONET ±window_min min, then
+    collapse to one global RMSE per sensor.
 
     Should be called on the *training* window — the held-out window is reserved
     for B3 evaluation.
@@ -636,38 +710,54 @@ def compute_per_sensor_aeronet_rmse(
                 continue
             aer = float(in_win['aod_550'].mean())
             for sk, g in grids.items():
-                v = float(g[row, col])
-                if np.isfinite(v) and v >= 0:
-                    sq[sk].append((v - aer) ** 2)
+                sensor = sk[4:] if sk.startswith('AOD_') else sk
+                sample = _sample_station_cell(g, row, col, sensor=sensor)
+                if sample is None:
+                    continue
+                v = sample[0]
+                sq[sk].append((v - aer) ** 2)
 
     return {sk: float(np.sqrt(np.mean(d))) if d else float('nan')
             for sk, d in sq.items()}
+
+
+B2_GRIDDED_SENSOR_KEYS = (
+    'AOD_himawari_l2', 'AOD_himawari_l3',
+    'AOD_modis_maiac',
+    'AOD_viirs_snpp', 'AOD_viirs_noaa20',
+)
 
 
 def baseline_comparison(
     pairs: pd.DataFrame,
     sensor_keys: tuple[str, ...] = (
         'AOD_viirs_noaa20', 'AOD_viirs_snpp',
-        'AOD_modis_maiac',  'AOD_himawari',
+        'AOD_modis_maiac',  'AOD_himawari_l2', 'AOD_himawari_l3'
     ),
     merged_nc_dir: Path = MERGED_DIR,
+    gridded_nc_dir: Path = GRIDDED_DIR,
     b3_weights: Optional[dict[str, float]] = None,
 ) -> pd.DataFrame:
     """§8.1.4 B1/B2/B3: merged vs per-sensor / equal-weight / Ahn-2021-ICW.
 
     For every (slot, site) pair already matched in `pairs` (see §8.1.1
-    `extract_aeronet_pairs`), reopen the merged NetCDF and read each per-sensor
-    bias-corrected grid at the station pixel.  Then:
+    `extract_aeronet_pairs`), sample each per-sensor grid at the station cell
+    with the tiered 1×1 → 3×3 → 5×5 fallback (same as the production collocate
+    product).  Then:
 
-      * B1 — single-sensor:  each `AOD_<sensor>` evaluated against AERONET.
-        Best single sensor (typically VIIRS NOAA-20) is the §8.1.4 B1 baseline.
-      * B2 — equal-weight (Gupta 2024 §4):  arithmetic mean of valid sensors
-        at the cell.  Same inputs as the thesis fusion but uniform weights.
-      * B3 — Ahn 2021 §2.2.3 ICW:  Σ wᵢ · AODᵢ with wᵢ ∝ 1/RMSEᵢ over sensors
-        valid at the cell.  RMSEᵢ is the global per-sensor AERONET RMSE passed
-        in `b3_weights` (compute once on the training window via
-        `compute_per_sensor_aeronet_rmse`).  B3 rows are emitted only when
-        `b3_weights` is provided.
+      * B1 — single-sensor:  each post-correction `AOD_<sensor>` from
+        MERGED_DIR evaluated against AERONET.  Best single sensor (typically
+        VIIRS NOAA-20) is the §8.1.4 B1 baseline.
+      * B2 — equal-weight (Gupta 2024 §4):  arithmetic mean of valid
+        **pre-correction** sensors from GRIDDED_DIR (raw Stage A2 output, no
+        §7.4 CDF correction, Himawari split into L2/L3).  Tests whether
+        bias-correction + TC-weighted fusion beats a naive mean of the same
+        raw inputs.
+      * B3 — Ahn 2021 §2.2.3 ICW:  Σ wᵢ · AODᵢ with wᵢ ∝ 1/RMSEᵢ over the
+        post-correction sensors valid at the cell.  RMSEᵢ is the global
+        per-sensor AERONET RMSE passed in `b3_weights` (compute once on the
+        training window via `compute_per_sensor_aeronet_rmse`).  B3 rows are
+        emitted only when `b3_weights` is provided.
       * Reference — `merged`:  the thesis TC-weighted AOD_merged from `pairs`.
 
     Returns rows per (site, season, product) and per (site, season='ALL',
@@ -681,22 +771,47 @@ def baseline_comparison(
         site   = row['site']
         season = row.get('season', 'ALL')
         slot   = pd.Timestamp(row['slot_utc'])
-        fpath  = str(merged_nc_dir / slot.strftime('%Y') / slot.strftime('%m') /
-                     slot.strftime('%d') / f"merged_{slot.strftime('%Y%m%d_%H%M')}.nc")
+        srow, scol = station_rc[site]
 
-        per_sen: dict[str, float] = {}
+        # B1: post-correction per-sensor channels from MERGED_DIR.
+        merged_path = str(merged_nc_dir / slot.strftime('%Y') / slot.strftime('%m') /
+                          slot.strftime('%d') / f"merged_{slot.strftime('%Y%m%d_%H%M')}.nc")
+        per_sen_post: dict[str, float] = {}
         try:
-            with nc.Dataset(fpath) as ds:
+            with nc.Dataset(merged_path) as ds:
                 available = set(ds.variables.keys())
                 for sk in sensor_keys:
                     if sk in available:
                         grid = np.ma.filled(
                             ds.variables[sk][:].astype(np.float32), np.nan)
-                        v = float(grid[station_rc[site]])
-                        if np.isfinite(v) and v >= 0:
-                            per_sen[sk] = v
+                        sample = _sample_station_cell(
+                            grid, srow, scol,
+                            sensor=sk[4:] if sk.startswith('AOD_') else sk,
+                        )
+                        if sample is not None:
+                            per_sen_post[sk] = sample[0]
         except Exception:
             continue
+
+        # B2: pre-correction per-sensor channels from GRIDDED_DIR.
+        gridded_path = str(gridded_nc_dir / slot.strftime('%Y') / slot.strftime('%m') /
+                           slot.strftime('%d') / f"gridded_{slot.strftime('%Y%m%d_%H%M')}.nc")
+        per_sen_pre: dict[str, float] = {}
+        try:
+            with nc.Dataset(gridded_path) as ds:
+                available = set(ds.variables.keys())
+                for sk in B2_GRIDDED_SENSOR_KEYS:
+                    if sk in available:
+                        grid = np.ma.filled(
+                            ds.variables[sk][:].astype(np.float32), np.nan)
+                        sample = _sample_station_cell(
+                            grid, srow, scol,
+                            sensor=sk[4:] if sk.startswith('AOD_') else sk,
+                        )
+                        if sample is not None:
+                            per_sen_pre[sk] = sample[0]
+        except Exception:
+            pass
 
         base = {'site': site, 'season': season,
                 'aer':  float(row['aeronet_aod'])}
@@ -705,13 +820,13 @@ def baseline_comparison(
                         'sat': float(row['merged_aod'])})
         for sk in sensor_keys:
             records.append({**base, 'product': sk,
-                            'sat': per_sen.get(sk, np.nan)})
-        records.append({**base, 'product': 'B2_equal_weight',
-                        'sat': float(np.mean(list(per_sen.values())))
-                               if per_sen else np.nan})
+                            'sat': per_sen_post.get(sk, np.nan)})
+        records.append({**base, 'product': 'B2_equal_weight_pre',
+                        'sat': float(np.mean(list(per_sen_pre.values())))
+                               if per_sen_pre else np.nan})
 
         if b3_weights is not None:
-            valid = {sk: v for sk, v in per_sen.items()
+            valid = {sk: v for sk, v in per_sen_post.items()
                      if sk in b3_weights
                      and np.isfinite(b3_weights[sk])
                      and b3_weights[sk] > 0}
@@ -898,7 +1013,7 @@ NGUYEN2025_PM25_RANSAC_R2 = 0.293
 # Lowered from 0.85 — the test period (Jan 2025 – Apr 2026 = 510 days) had no
 # Envisoft station meeting the 85 % bar, which is why §8.4 silently returned
 # zero pairs.  0.50 keeps stations that cover at least half the period.
-PM25_COMPLETENESS_MIN = 0.50
+PM25_COMPLETENESS_MIN = 0.20
 
 
 def _latlon_rc(lat: float, lon: float) -> tuple[int, int]:

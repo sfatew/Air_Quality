@@ -270,13 +270,20 @@ def extract_aod_550(df: pd.DataFrame) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    results = download_all_vietnam(
-        start="2022-01-01",
-        end="2026-04-23",
-        level="15",
-        output_dir="/home/slow_data/Air_Quality/AERONET",
-    )
+    # Specify the exact site names you want to download (e.g., ["NGHIA_DO", "Son_La"])
+    # Set to None or an empty list [] to default to ALL sites in SITES_CSV.
+    TARGET_SITES = ["Bac_Lieu"] 
 
+    # Determine which stations to pass to the downloader
+    sites_to_download = TARGET_SITES if TARGET_SITES else list(AERONET_STATIONS.keys())
+
+    results = download_all_vietnam(
+        start="2025-08-22",
+        end="2026-05-01",
+        level="15",
+        output_dir="/home/slow_data/Air_Quality/AERONET/raw",
+        stations=sites_to_download,  # Pass the target sites here
+    )
     print("+++++++++ END +++++++++")
 
     with open("log.txt", "w") as f:

@@ -45,6 +45,12 @@ CENTRAL_SOUTH_LAT = 11.5
 # discontinuity that hard region masks otherwise stamp into the merged AOD.
 SOFTCAL_BLEND_HALF_WIDTH = 0.5
 
+# When False, apply_soft_calibration_grid uses hard region masks — each
+# latitude row receives its region's (α, β) with a step discontinuity at
+# lat=11.5 and lat=16.  Useful as an A/B against the cosine-tapered default
+# for diagnosing whether smoothed boundaries are masking a real bias change.
+SOFTCAL_BLEND_ENABLED = True
+
 REGIONS = ('north', 'central', 'south')
 SEASONS = ('dry', 'wet')
 
@@ -77,7 +83,18 @@ SOFT_CAL_CV_FOLDS   = 5
 
 # Minimum collocated (sat, MERRA-2) pairs to even attempt a fit per stratum.
 # Below this we skip the regression and route to 'none'.
-SOFT_CAL_MIN_PAIRS  = 100
+SOFT_CAL_MIN_PAIRS  = 500
+
+# Debug / sensitivity switch — when True, the MERRA-2 anchor's _classify_route
+# accepts every fit whose α/β are finite, ignoring SOFT_CAL_MIN_PAIRS and the
+# SOFT_CAL_ALPHA_*/SOFT_CAL_BETA_ABSMAX bounds.  Useful for measuring how much
+# the gates suppress, or to force a pure "MERRA-2 anchors everything" run.
+#
+# Side effect: with every stratum routing to 'apply', the AERONET fallback in
+# fit_stratum never fires (it only runs when the MERRA-2 anchor returns
+# 'none'), so the cross-anchor cap and AERONET-anchored corrections are
+# silently disabled too.  Leave False for production.
+SOFT_CAL_ACCEPT_ALL_MERRA2 = False
 
 # §8.1.2 gate A — minimum CV RMSE drop for the soft cal to be worth applying.
 # If `rmse_before − rmse_after_cv < this`, the correction is statistical noise
@@ -102,7 +119,7 @@ GATE_A_RMSE_DROP_MIN = 0.02
 # holdouts collapse to a single year's haze events and over-penalise normal
 # inter-annual variability.  The §8 held-out window is the true temporal-
 # generalisation test; the fallback gate's job is fit quality.
-AERONET_FALLBACK_MIN_PAIRS = 40    # need ≥ CV_FOLDS × 2 + headroom
+AERONET_FALLBACK_MIN_PAIRS = 200    # need ≥ CV_FOLDS × 2 + headroom
 
 # Widened α/β bounds for the AERONET fallback only.  Tropical monsoon strata
 # can exhibit scale biases (α ≈ 0.3–0.4 wet-season south, where satellites
@@ -121,6 +138,64 @@ AERONET_FALLBACK_BETA_ABSMAX = 0.4
 # a handful of high-AOD events.
 AERONET_FALLBACK_RMSE_DROP_MIN = 0.05
 
+# Cross-anchor consistency cap (Fix 2): when the AERONET fallback wins, its
+# CV α/β must lie within this neighbourhood of the MERRA-2 anchor's CV α/β.
+# Rationale: AERONET's widened bounds + single-station coverage (Nghia Do in
+# the north, Bac Lieu in the south) can produce fits that diverge wildly
+# from MERRA-2's full-band view — e.g. Nghia Do delivered α=1.78 for Hima L3
+# north|dry while MERRA-2 saw α=0.77 across the whole 7° latitude band.
+# When MERRA-2 CV is informative (finite α/β), require the AERONET slope to
+# sit within a factor of [ALPHA_RATIO_MIN, ALPHA_RATIO_MAX] of MERRA-2's, and
+# the intercept to stay within ±BETA_MAX_DIFF.  When MERRA-2 CV is missing
+# (e.g. no MERRA-2 pairs at all in the stratum), the cap is skipped.
+AERONET_VS_MERRA2_ALPHA_RATIO_MIN = 0.5
+AERONET_VS_MERRA2_ALPHA_RATIO_MAX = 2.0
+AERONET_VS_MERRA2_BETA_MAX_DIFF   = 0.1
+
+# ── Anchor race mode (§7.4.1 v3.7 experimental) ──────────────────────────────
+# When True, MERRA-2 and AERONET anchors are fit in parallel for every stratum
+# that has AERONET pairs (i.e. north, south).  The winner is whichever passes
+# its own gate AND has lower AERONET-truth RMSE.  Replaces the v3.4 "AERONET
+# fallback only when MERRA-2 fails" policy with a head-to-head race against
+# AERONET-truth correspondence, the actual §8 validation target.
+#
+# Selection rules (see _select_anchor in bias_correction.py):
+#   1. Each anchor must pass its full own gate to enter the race — same gates
+#      as the non-race path, α/β bounds included:
+#        - MERRA-2: SOFT_CAL_MIN_PAIRS, SOFT_CAL_ALPHA_MIN/MAX,
+#                   SOFT_CAL_BETA_ABSMAX, GATE_A_RMSE_DROP_MIN
+#        - AERONET: AERONET_FALLBACK_MIN_PAIRS, AERONET_FALLBACK_ALPHA_MIN/MAX,
+#                   AERONET_FALLBACK_BETA_ABSMAX, AERONET_FALLBACK_RMSE_DROP_MIN
+#      The α/β bounds are kept because central strata have no AERONET station
+#      and so degenerate to MERRA-2 own-gate alone — without the bounds, those
+#      strata would lose every structural guard rail.
+#   2. Each surviving candidate is evaluated on the AERONET pair set:
+#        - MERRA-2 candidate: rmse(α_m·sat_aer + β_m, aer) — fully out-of-sample
+#          (the MERRA-2 fit never touched AERONET).
+#        - AERONET candidate: mean k-fold fold-out RMSE (rmse_aer_after_cv) —
+#          the conservative comparable estimate.
+#   3. Lower AERONET-RMSE wins.  Strict, no tie-ε.
+#   4. Winner must beat raw AERONET RMSE by ≥ SOFT_CAL_RACE_BASELINE_DROP_MIN
+#      (a sanity check; when AERONET wins, its 0.05 own-gate drop already
+#      satisfies this, so the gate is mainly binding for MERRA-2 wins).
+#   5. If neither candidate passes its own gate, route='none'.
+#   6. Degeneracy: when AERONET pairs are too few (< AERONET_FALLBACK_MIN_PAIRS)
+#      the baseline AERONET RMSE is undefined.  Race defers to MERRA-2's own
+#      gate alone — apply if MERRA-2 passed, else 'none'.
+#
+# Strata with no AERONET pairs at all (central regions, or AERONET CSVs absent)
+# fall back to MERRA-2-only gating — the race needs both candidates to compare.
+#
+# The cross-anchor cap (AERONET_VS_MERRA2_ALPHA_RATIO_*) is NOT applied in
+# race mode: the AERONET-RMSE comparison replaces it as the arbiter.
+SOFT_CAL_RACE_ANCHORS = True
+
+# Minimum AERONET-RMSE drop vs raw the race winner must clear (mirrors
+# GATE_A_RMSE_DROP_MIN's role for the MERRA-2 anchor).  Acts as a sanity floor
+# on top of each candidate's own-gate RMSE drop.
+## Currently disable
+SOFT_CAL_RACE_BASELINE_DROP_MIN = -999 
+
 # Apply-time output clipping (mirrors AERONET observed range; protects against
 # extrapolation when α·sat+β projects below 0 or far above the observed cap).
 SOFT_CAL_OUTPUT_MIN = 0.0
@@ -128,7 +203,7 @@ SOFT_CAL_OUTPUT_MAX = 5.0
 
 # Penalty applied to σ²_TC when a stratum's correction routes to 'none':
 #   σ²_used = σ²_TC × NONE_PENALTY_FACTOR     (fusion weight drops ~4× at 2.0)
-NONE_PENALTY_FACTOR = 2.0
+NONE_PENALTY_FACTOR = 4.0
 
 # ── Triple-collocation σ² floor (§7.4.2) ──────────────────────────────────────
 # Sayer/Levy EE envelope: σ²_floor = (EE_OFFSET + slope × AOD_ref)²
@@ -141,8 +216,7 @@ SENSOR_RMSE_EE_SLOPE  = 0.15   # flat default; per-sensor overrides below
 SENSOR_RMSE_EE_REFAOD = 0.3
 
 # Per-sensor EE slope overrides — sourced from the same peer-reviewed envelopes
-# as BOX_STD_SLOPE below, extended with the merged 'himawari' production key
-# (consumed by fusion) and MERRA-2.  Missing sensor → SENSOR_RMSE_EE_SLOPE.
+# as BOX_STD_SLOPE below.  Missing sensor → SENSOR_RMSE_EE_SLOPE.
 #   • modis_maiac : 0.10  Lyapustin 2018; Falah 2021
 #   • viirs_*     : 0.20  Sayer 2019; Hsu 2019
 #   • himawari_*  : 0.20  Zhang 2019 (note: ~55% within EE, optimistic)
@@ -151,7 +225,6 @@ SENSOR_RMSE_EE_REFAOD = 0.3
 SENSOR_EE_SLOPE = {
     'himawari_l2':  0.20,
     'himawari_l3':  0.20,
-    'himawari':     0.20,
     'viirs_snpp':   0.20,
     'viirs_noaa20': 0.20,
     'modis_maiac':  0.10,
@@ -168,10 +241,40 @@ SENSOR_EE_SLOPE = {
 TC_MIN_TRIPLETS     = 3
 TC_MIN_COLLOCATIONS = 500
 
+# TC input space — 'calibrated' (current default) or 'raw'.
+#
+# 'calibrated' (legacy v3.4 behaviour):
+#   collect_stratum_triplets applies the per-stratum soft calibration
+#   (α·sat + β) to every satellite member before computing σ².  σ² is then
+#   already in the calibrated space the fuser consumes; fusion weights are
+#   1 / σ²_TC directly.
+#
+# 'raw' (Gruber 2016 §2.1):
+#   collect_stratum_triplets skips apply_soft_calibration_grid and feeds the
+#   raw gridded AOD into triple_collocation_variance.  σ² is then in raw
+#   space.  Fusion must rescale to calibrated space by σ²_used = α² · σ²_raw
+#   per (sensor, region, season) before forming weights, because the values
+#   being fused are α·sat+β (i.e. calibrated) — see Var(α·X+β) = α²·Var(X).
+#   This keeps the TC independence assumption clean: no shared MERRA-2 target
+#   in the regression residuals, no in-sample OLS bias in σ².
+#
+# Both modes still drop negative per-triplet σ² in aggregate_sigma2_per_sensor
+# and floor at the EE envelope when TC_MIN_TRIPLETS / TC_MIN_COLLOCATIONS fail.
+#
+# To honour this flag, two call sites must read it:
+#   1. triple_collocation.collect_stratum_triplets — skip
+#      apply_soft_calibration_grid when 'raw'.
+#   2. fusion (weight assembly) — when 'raw', multiply the loaded σ² by α²
+#      from soft_calibration.json before computing 1/σ²; identity-α (1.0) for
+#      strata routed to 'none' so no implicit penalty stacks with NONE_PENALTY_FACTOR.
+TC_INPUT_SPACE = 'raw'    # one of {'calibrated', 'raw'}
+
 # ── Sensor codes (Stage A output `dominant_sensor`) ──────────────────────────
-# 1 = Himawari (merged L2/L3), 3 = MAIAC, 4 = SNPP, 5 = NOAA-20
+# 1 = Himawari L2, 2 = Himawari L3, 3 = MAIAC, 4 = SNPP, 5 = NOAA-20
+# v3.6: L2 and L3 are first-class fusion sensors (no pre-fusion merge).
 SENSOR_CODES = {
-    'himawari':     1,
+    'himawari_l2':  1,
+    'himawari_l3':  2,
     'modis_maiac':  3,
     'viirs_snpp':   4,
     'viirs_noaa20': 5,

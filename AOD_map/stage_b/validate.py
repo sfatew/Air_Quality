@@ -441,17 +441,35 @@ def success_table(pairs: pd.DataFrame, coverage_df: pd.DataFrame) -> pd.DataFram
 
 # ── §8.2.1 internal consistency ──────────────────────────────────────────────
 
-def internal_consistency(metrics: dict, tol: float = RMSE_CONSISTENCY_TOLERANCE) -> dict:
-    cv = metrics['rmse_cv_mean']
-    lo, hi = cv * (1 - tol), cv * (1 + tol)
-    train = metrics.get('rmse_train', np.nan)
-    test  = metrics.get('rmse_internal_test', np.nan)
-    return {
-        'rmse_train':         train,
-        'rmse_cv_mean':       cv,
-        'rmse_internal_test': test,
-        'tolerance':          tol,
-        'train_in_band':      (lo <= train <= hi) if np.isfinite(train) else None,
-        'test_in_band':       (lo <= test  <= hi) if np.isfinite(test)  else None,
-        'overfit_check_pass': test <= cv * 1.3   if np.isfinite(test)  else None,
+def internal_consistency(metrics: dict,
+                          cv_fold_metrics: Optional[list[dict]] = None,
+                          tol: float = RMSE_CONSISTENCY_TOLERANCE) -> dict:
+    """One-sided consistency check (§8.2.1).
+
+    Train/test RMSE only fail when *worse* than CV by `tol`.  Train < CV is
+    expected (final fit uses every training day with no held-out block);
+    test < CV is also fine when the chronological test slice happens to be
+    a calmer period than the worst CV fold.  Reports `rmse_cv_std` and the
+    worst-fold pointer so a high `rmse_cv_mean` driven by one seasonal
+    hot-spot fold is visible to the reader.
+    """
+    cv     = metrics['rmse_cv_mean']
+    cv_std = metrics.get('rmse_cv_std', np.nan)
+    train  = metrics.get('rmse_train', np.nan)
+    test   = metrics.get('rmse_internal_test', np.nan)
+    upper_band        = cv * (1 + tol)
+    overfit_threshold = cv * 1.3
+    out = {
+        'rmse_train':           train,
+        'rmse_cv_mean':         cv,
+        'rmse_cv_std':          cv_std,
+        'rmse_internal_test':   test,
+        'tolerance':            tol,
+        'train_underfit_pass':  (train <= upper_band)        if np.isfinite(train) else None,
+        'test_overfit_pass':    (test  <= overfit_threshold) if np.isfinite(test)  else None,
     }
+    if cv_fold_metrics:
+        fold_rmses = [f['rmse'] for f in cv_fold_metrics]
+        out['rmse_cv_max']    = float(max(fold_rmses))
+        out['worst_fold_idx'] = int(np.argmax(fold_rmses))
+    return out

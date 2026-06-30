@@ -31,20 +31,22 @@ import numpy as np
 from config import (
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
     NLAT, NLON,
-    REGIONS, SEASONS,
     DRY_MONTHS,
     SENSOR_CODES, CONFIDENCE_FLAG,
     SENSOR_RMSE_EE_OFFSET, SENSOR_RMSE_EE_SLOPE, SENSOR_RMSE_EE_REFAOD,
     SENSOR_EE_SLOPE,
     NONE_PENALTY_FACTOR,
     TC_VARIANCE_FILE, SOFT_CAL_FILE,
+    TC_INPUT_SPACE,
 )
 
 
-# Production-merge sensor keys.  Himawari L2/L3 are merged per-pixel into a
-# single 'himawari' grid *before* fusion (run_stage_a.py), so fusion sees
-# only one Himawari row.
-_PRODUCTION_SENSORS = ('himawari', 'modis_maiac', 'viirs_snpp', 'viirs_noaa20')
+# Production-merge sensor keys.  v3.6: Himawari L2 and L3 are first-class
+# fusion inputs (5 sensors total).  The earlier pre-fusion L2/L3 merge step
+# is gone; TC weights now arbitrate between L2 and L3 per pixel via 1/σ²_TC
+# the same way they do between any two LEO sensors.
+_PRODUCTION_SENSORS = ('himawari_l2', 'himawari_l3',
+                       'modis_maiac', 'viirs_snpp', 'viirs_noaa20')
 
 
 # ── EE-envelope floor (Sayer/Levy 2013, 2020) ───────────────────────────────
@@ -69,10 +71,11 @@ def load_tc_variance(path: Path = TC_VARIANCE_FILE) -> dict:
     Expected schema produced by run_collocate.py tc_variance::
 
         {
-          "himawari": {
+          "himawari_l2": {
               "north|dry":   {"sigma2": 0.21, "n_triplets": 87, "n_collocations": 412345},
               ...
           },
+          "himawari_l3": { ... },
           "modis_maiac": { ... },
           ...
         }
@@ -99,33 +102,18 @@ def load_routes(path: Path = SOFT_CAL_FILE) -> dict[tuple[str, str, str], str]:
 
     Needed so fusion can apply the NONE_PENALTY_FACTOR to 'none' strata at
     weight-construction time.  Returns ``{}`` if the JSON is missing.
+
+    Himawari L2 and L3 are first-class fusion sensors (v3.6); each carries
+    its own route under its own key, no merged-Himawari derivation.
     """
     if not path.exists():
         return {}
     raw = json.loads(path.read_text())
     out: dict[tuple[str, str, str], str] = {}
     for sensor, sensor_entries in raw.items():
-        # Sensor-key folding: per-level Himawari L2/L3 soft cals are persisted
-        # under their own keys but the production-merge 'himawari' channel
-        # needs a single route lookup.  We propagate 'none' iff BOTH levels
-        # are routed to 'none' (i.e. the merged Himawari pixel is genuinely
-        # uncorrected; otherwise the merged grid carries at least one level
-        # with an applied correction).
         for stratum_key, fit_dict in sensor_entries.items():
             region, season = stratum_key.split('|')
             out[(sensor, region, season)] = fit_dict.get('route', 'apply')
-
-    # Derive merged-Himawari route per (region, season).
-    for region in REGIONS:
-        for season in SEASONS:
-            r2 = out.get(('himawari_l2', region, season))
-            r3 = out.get(('himawari_l3', region, season))
-            if r2 is None and r3 is None:
-                continue
-            if (r2 == 'apply') or (r3 == 'apply'):
-                out[('himawari', region, season)] = 'apply'
-            else:
-                out[('himawari', region, season)] = 'none'
     return out
 
 
@@ -137,6 +125,7 @@ def _sigma2_grid(
     sigma2_table: dict,
     routes:       dict,
     floor: float,
+    alpha_lat: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Per-cell σ² (NLAT, NLON) for one sensor at one slot.
 
@@ -144,6 +133,13 @@ def _sigma2_grid(
     TC values that passed the gate are NOT re-clamped here — the gate is the
     trust check.  Strata routed to 'none' have σ² multiplied by
     NONE_PENALTY_FACTOR (weight ↓ by ~factor²).
+
+    When `alpha_lat` is given (shape (NLAT,)) — set by `fuse()` only when
+    TC_INPUT_SPACE='raw' — the whole grid is multiplied by α(lat)².  This
+    rescales σ²_raw → α²·σ²_raw in calibrated space so inverse-variance
+    weights match the values the fuser is actually combining.  The EE floor
+    is rescaled the same way; identity α=1 over 'none'/missing strata leaves
+    that floor unchanged.
     """
     shape = region_code.shape
     out = np.full(shape, floor, dtype=np.float64)
@@ -155,18 +151,24 @@ def _sigma2_grid(
         if routes.get((sensor, region, season), 'apply') == 'none':
             sig2 *= NONE_PENALTY_FACTOR
         out[region_code == code] = sig2
+    if alpha_lat is not None:
+        out = out * (alpha_lat[:, None] ** 2)
     return out
 
 
 def _assign_confidence(
     sensor_has_data: dict[str, np.ndarray],
 ) -> np.ndarray:
-    """Per-cell confidence flag (0–4) using the §7.5 / config.CONFIDENCE_FLAG rules."""
+    """Per-cell confidence flag (0–4) using the §7.5 / config.CONFIDENCE_FLAG rules.
+
+    A pixel is considered "Himawari-covered" if either L2 or L3 is valid; the
+    LEO count is per-sensor (MAIAC, SNPP, NOAA-20), unchanged.
+    """
     shape = (NLAT, NLON)
     flag  = np.zeros(shape, dtype=np.int8)
 
     leo_keys = ('modis_maiac', 'viirs_snpp', 'viirs_noaa20')
-    hi_keys  = ('himawari',)
+    hi_keys  = ('himawari_l2', 'himawari_l3')
 
     has_hi  = np.zeros(shape, dtype=bool)
     has_leo = np.zeros(shape, dtype=bool)
@@ -195,6 +197,7 @@ def fuse(
     lat_2d: np.ndarray,
     sigma2_table: Optional[dict] = None,
     routes:       Optional[dict] = None,
+    soft_cals:    Optional[dict] = None,
 ) -> dict[str, np.ndarray]:
     """TC-weighted fusion of bias-corrected sensor grids → one merged AOD.
 
@@ -207,6 +210,10 @@ def fuse(
     lat_2d       : (NLAT, NLON) latitude array (cell centres).
     sigma2_table : (sensor, region, season) → σ²_TC; if None, loads from disk.
     routes       : (sensor, region, season) → 'apply'|'none'; if None, loads from disk.
+    soft_cals    : nested {sensor: {(region, season): fit_dict}} for the α(lat)
+                   rescale that turns σ²_raw into calibrated-space σ².  Only
+                   read when TC_INPUT_SPACE='raw'; loaded from disk if None
+                   and raw mode is in effect.  Ignored in 'calibrated' mode.
 
     Returns a dict with (NLAT, NLON) arrays:
         aod_merged      float32
@@ -223,6 +230,17 @@ def fuse(
 
     season = 'dry' if month in DRY_MONTHS else 'wet'
     shape  = (NLAT, NLON)
+
+    # In raw-σ² mode, build per-sensor α(lat) for the σ²_raw → σ²_calibrated
+    # rescale.  In calibrated mode the rescale is a no-op (α(lat) is left
+    # None and _sigma2_grid skips the multiplication).
+    alpha_lats: dict[str, np.ndarray] = {}
+    if TC_INPUT_SPACE == 'raw':
+        from bias_correction import load_soft_calibrations, build_alpha_lat
+        if soft_cals is None:
+            soft_cals = load_soft_calibrations()
+        for sensor in _PRODUCTION_SENSORS:
+            alpha_lats[sensor] = build_alpha_lat(soft_cals.get(sensor, {}), season)
 
     region_code = np.where(
         lat_2d >= NORTH_CENTRAL_LAT, 2,
@@ -247,7 +265,8 @@ def fuse(
 
         sigma2 = _sigma2_grid(sensor, season, region_code,
                               sigma2_table, routes,
-                              ee_floor_sigma2(sensor))
+                              ee_floor_sigma2(sensor),
+                              alpha_lat=alpha_lats.get(sensor))
         w = np.where((sigma2 > 0), 1.0 / sigma2, 0.0)
 
         valid_w = has & (w > 0)

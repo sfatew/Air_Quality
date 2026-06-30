@@ -32,7 +32,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
@@ -80,14 +80,25 @@ def _save_json(obj: dict, out_dir: Path, name: str) -> Path:
 
 # ── phases ──────────────────────────────────────────────────────────────────
 
-def run_b1(overwrite: bool, run_start, run_end) -> None:
-    print(f'\n=== B1: ST kriging  ({cfg.TRAIN_START} → {cfg.TRAIN_END} fit, '
-          f'{run_start} → {run_end} apply) ===')
-    vgm = kg.fit_and_save_variogram(start=cfg.TRAIN_START, end=cfg.TRAIN_END,
-                                    progress=tqdm)
-    print(f'  spatial  range_km   : {vgm.spatial.len_scale:.2f}')
-    print(f'  temporal range_h    : {vgm.temporal.len_scale:.2f}')
-    print(f'  joint    range_km   : {vgm.joint.len_scale:.2f}')
+def _parse_date(s: str) -> date:
+    return datetime.strptime(s, '%Y-%m-%d').date()
+
+
+def run_b1(overwrite: bool, run_start, run_end, infer_only: bool = False) -> None:
+    if infer_only:
+        print(f'\n=== B1: ST kriging  (reuse saved variogram, '
+              f'{run_start} → {run_end} apply) ===')
+        vgm = kg.load_variogram()
+        print(f'  loaded variogram from {kg._VGM_PATH}')
+    else:
+        print(f'\n=== B1: ST kriging  ({cfg.TRAIN_START} → {cfg.TRAIN_END} fit, '
+              f'{run_start} → {run_end} apply) ===')
+        vgm = kg.fit_and_save_variogram(start=cfg.TRAIN_START, end=cfg.TRAIN_END,
+                                        progress=tqdm)
+    print(f'  target              : {cfg.B1_VARIOGRAM_TARGET}')
+    print(f'  metric var          : {vgm.metric.var:.4f}')
+    print(f'  metric range_km     : {vgm.metric.len_scale:.2f}')
+    print(f'  metric nugget       : {vgm.metric.nugget:.4f}')
     print(f'  anisotropy k (km/h) : {vgm.k_km_per_hour:.3f}')
 
     t0 = time.time()
@@ -96,16 +107,38 @@ def run_b1(overwrite: bool, run_start, run_end) -> None:
     print(f'  B1 wrote {n} NC files in {time.time() - t0:.1f}s.')
 
 
-def run_b2(model_name: str, overwrite: bool, run_start, run_end) -> None:
-    print(f'\n=== B2: Random Forest  (tune on {cfg.TRAIN_START} → {cfg.TRAIN_END}) ===')
-    best_hp, tune_results = rf.tune_rf(
-        start=cfg.TRAIN_START, end=cfg.TRAIN_END,
-        name=model_name, progress=tqdm,
-    )
-    print(f'  best hyperparameters: {best_hp}')
-    pd.DataFrame(tune_results).to_csv(
-        cfg.MODELS_DIR / f'{model_name}_tune_results.csv', index=False
-    )
+def run_b2(model_name: str, overwrite: bool, run_start, run_end,
+           report_train_rmse: bool = cfg.RF_TUNE_REPORT_TRAIN_RMSE,
+           infer_only: bool = False,
+           no_tune: bool = False) -> None:
+    if infer_only:
+        print(f'\n=== B2: Random Forest  (reuse saved bundle {model_name!r}, '
+              f'{run_start} → {run_end} apply) ===')
+    elif no_tune:
+        print(f'\n=== B2: Random Forest  (train with config defaults, no grid '
+              f'search, {cfg.TRAIN_START} → {cfg.TRAIN_END}) ===')
+        hp = {
+            'n_estimators':     cfg.RF_N_ESTIMATORS,
+            'max_depth':        cfg.RF_MAX_DEPTH,
+            'min_samples_leaf': cfg.RF_MIN_SAMPLES_LEAF,
+            'max_features':     cfg.RF_MAX_FEATURES,
+        }
+        print(f'  hyperparameters: {hp}')
+        rf.train_rf(
+            start=cfg.TRAIN_START, end=cfg.TRAIN_END,
+            name=model_name, hp=hp, progress=tqdm,
+        )
+    else:
+        print(f'\n=== B2: Random Forest  (tune on {cfg.TRAIN_START} → {cfg.TRAIN_END}) ===')
+        best_hp, tune_results = rf.tune_rf(
+            start=cfg.TRAIN_START, end=cfg.TRAIN_END,
+            name=model_name, progress=tqdm,
+            report_train_rmse=report_train_rmse,
+        )
+        print(f'  best hyperparameters: {best_hp}')
+        pd.DataFrame(tune_results).to_csv(
+            cfg.MODELS_DIR / f'{model_name}_tune_results.csv', index=False
+        )
 
     bundle = rf.load_bundle(model_name)
     print(f'  training window : {bundle.training_window}')
@@ -192,29 +225,69 @@ def main() -> None:
     ap.add_argument('--all',      action='store_true', help='run B1 + B2 + validation')
     ap.add_argument('--overwrite', action='store_true',
                     help='overwrite existing NC outputs (default: skip existing)')
-    ap.add_argument('--model-name', default='rf_tuned',
-                    help='RF bundle name (default: rf_tuned, matching the notebook)')
+    default_model_name = (
+        cfg.RF_RESIDUAL_BUNDLE_NAME
+        if cfg.RF_TARGET_KIND == 'aod_minus_cams'
+        else 'rf_tuned'
+    )
+    ap.add_argument('--model-name', default=default_model_name,
+                    help=f'RF bundle name (default: {default_model_name}, '
+                         f'derived from RF_TARGET_KIND={cfg.RF_TARGET_KIND!r}). '
+                         f'Pass --model-name rf_tuned to keep training/load '
+                         f'the legacy direct-AOD bundle.')
+    ap.add_argument('--train-rmse', action='store_true',
+                    default=cfg.RF_TUNE_REPORT_TRAIN_RMSE,
+                    help=f'tune_rf: also report per-combo train_rmse_mean '
+                         f'(adds ~10–20%% wall-clock to grid sweep). '
+                         f'Default from config.RF_TUNE_REPORT_TRAIN_RMSE='
+                         f'{cfg.RF_TUNE_REPORT_TRAIN_RMSE}.')
+    ap.add_argument('--start', type=_parse_date, default=None,
+                    metavar='YYYY-MM-DD',
+                    help='override apply window start (default: cfg.TEST_START). '
+                         'Applies to B1, B2, and validation phases.')
+    ap.add_argument('--end', type=_parse_date, default=None,
+                    metavar='YYYY-MM-DD',
+                    help='override apply window end (default: cfg.TEST_END).')
+    ap.add_argument('--infer-only', action='store_true',
+                    help='skip variogram refit (B1) and RF tune (B2); reuse the '
+                         'saved st_variogram.json and model bundle. Use after a '
+                         'CAMS backfill to re-run inference on new slots without '
+                         'paying for training again. Pair with --overwrite to '
+                         'replace existing per-slot NC files.')
+    ap.add_argument('--no-tune', action='store_true',
+                    help='B2 only: skip the RF_GRID grid search and train once '
+                         'with the RF_* defaults from config.py '
+                         '(n_estimators, max_depth, min_samples_leaf, '
+                         'max_features). Mutually exclusive with --infer-only.')
     args = ap.parse_args()
 
     if not (args.b1 or args.b2 or args.validate or args.all):
         ap.error('pick at least one of --b1 --b2 --validate --all')
 
+    if args.no_tune and args.infer_only:
+        ap.error('--no-tune and --infer-only are mutually exclusive')
+
     for d in (cfg.ST_KRIGING_DIR, cfg.RF_OUTPUT_DIR, cfg.MODELS_DIR,
               cfg.VALIDATION_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
-    run_start, run_end = cfg.TEST_START, cfg.TEST_END
+    run_start = args.start if args.start is not None else cfg.TEST_START
+    run_end   = args.end   if args.end   is not None else cfg.TEST_END
     print(f'Training : {cfg.TRAIN_START} → {cfg.TRAIN_END}')
     print(f'Held-out : {cfg.TEST_START} → {cfg.TEST_END}')
-    print(f'Full run : {run_start} → {run_end}')
+    print(f'Full run : {run_start} → {run_end}'
+          f'{"  [infer-only: reusing saved artifacts]" if args.infer_only else ""}')
     print(f'Validation root : {cfg.VALIDATION_DIR}')
 
     if args.all or args.b1:
-        run_b1(args.overwrite, run_start, run_end)
+        run_b1(args.overwrite, run_start, run_end, infer_only=args.infer_only)
     if args.all or args.b2:
-        run_b2(args.model_name, args.overwrite, run_start, run_end)
+        run_b2(args.model_name, args.overwrite, run_start, run_end,
+               report_train_rmse=args.train_rmse,
+               infer_only=args.infer_only,
+               no_tune=args.no_tune)
     if args.all or args.validate:
-        run_validation(args.model_name, cfg.TEST_START, cfg.TEST_END)
+        run_validation(args.model_name, run_start, run_end)
 
 
 if __name__ == '__main__':

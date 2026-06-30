@@ -1,11 +1,17 @@
 """Step B1 — spatiotemporal kriging at 30-min cadence (stage_b_fixes §7.7).
 
-Yang & Hu (2018) sum-metric variogram:
+**Metric** variogram (single component over the space-time metric distance):
 
-    γ_ST(h_s, h_t) = γ_S(h_s) + γ_T(h_t) + γ_J( √(h_s² + k² · h_t²) )
+    γ_ST(h_s, h_t) = γ_metric( √(h_s² + k² · h_t²) )
 
-with spatial, temporal, and joint sub-components plus anisotropy `k`
-(km / hour).  Sub-component families come from `config.B1_VARIOGRAM_SPEC`.
+with anisotropy `k` (km / hour).  Sum-metric was dropped after the §4
+empirical-variogram diagnostic showed the data cannot constrain three
+components (most (h_s, h_t) bins under 30 pairs and a structural day-night
+hole on the temporal axis).  Family comes from `config.B1_VARIOGRAM_SPEC`.
+
+The kriger predicts the **(AOD − CAMS) residual** by default
+(`B1_VARIOGRAM_TARGET = 'aod_minus_cams'`); CAMS is added back at the target
+cell.  Set `target_kind='aod'` to recover the legacy raw-AOD behaviour.
 
 Outputs — per-slot NC files in **parallel product tree**
 `ST_KRIGING_DIR / YYYY / MM / DD / aod_YYYYMMDD_HHMM.nc`:
@@ -41,6 +47,10 @@ from config import (
     B1_MAX_NEIGHBOURS, B1_MIN_NEIGHBOURS,
     B1_VARIOGRAM_SUBSAMPLE,
     B1_VARIOGRAM_SPEC, B1_VARIOGRAM_INIT,
+    B1_VARIOGRAM_TARGET,
+    B1_VARIOGRAM_PAIRS_PER_CELL, B1_VARIOGRAM_PAIRS_PER_SLOT,
+    B1_VARIOGRAM_MIN_BIN_PAIRS, B1_VARIOGRAM_T_BAND_H,
+    B1_VARIOGRAM_N_BINS_S, B1_VARIOGRAM_N_BINS_T,
     EARTH_RADIUS_KM,
     TRAIN_START, TRAIN_END,
     SLOTS_PER_DAY,
@@ -49,10 +59,11 @@ from slots import (
     load_slot, iter_local_days, iter_window_slots, slot_index,
     window_slot_indices, observed_slot_indices,
 )
+from ancillary import cams_aod_slot
 
 
 METHOD_TAG = 'st_kriging'
-METHOD_VERSION = 'v1.0'
+METHOD_VERSION = 'v2.0'   # metric variogram on (AOD − CAMS) residual
 
 LAT_2D, LON_2D = np.meshgrid(LATS, LONS, indexing='ij')
 
@@ -65,7 +76,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
-# ── Sum-metric variogram ─────────────────────────────────────────────────────
+# ── Metric variogram (single component over d = √(h_s² + (k·h_t)²)) ─────────
 
 _COV_FAMILIES = {
     'Gaussian':    gs.Gaussian,
@@ -76,23 +87,18 @@ _COV_FAMILIES = {
 
 
 @dataclass
-class SumMetricVariogram:
-    spatial:  gs.CovModel
-    temporal: gs.CovModel
-    joint:    gs.CovModel
-    k_km_per_hour: float
+class MetricVariogram:
+    metric: gs.CovModel          # γ as a function of metric distance d (km)
+    k_km_per_hour: float         # space-time anisotropy (km of equivalent h_s per h_t)
 
     def gamma(self, h_s_km: np.ndarray, h_t_h: np.ndarray) -> np.ndarray:
         h_s = np.asarray(h_s_km, dtype=np.float64)
         h_t = np.asarray(h_t_h,  dtype=np.float64)
-        g_s = self.spatial.variogram(h_s)
-        g_t = self.temporal.variogram(h_t)
-        joint_h = np.sqrt(h_s ** 2 + (self.k_km_per_hour * h_t) ** 2)
-        g_j = self.joint.variogram(joint_h)
-        return g_s + g_t + g_j
+        d = np.sqrt(h_s ** 2 + (self.k_km_per_hour * h_t) ** 2)
+        return self.metric.variogram(d)
 
     def total_sill(self) -> float:
-        return float(self.spatial.sill + self.temporal.sill + self.joint.sill)
+        return float(self.metric.sill)
 
 
 def _build_cov(family_name: str, var: float, len_scale: float,
@@ -101,84 +107,182 @@ def _build_cov(family_name: str, var: float, len_scale: float,
     return cls(dim=dim, var=var, len_scale=len_scale, nugget=nugget)
 
 
+# ── Structured pair sampling ────────────────────────────────────────────────
+# Random pairs from a (cell × slot × day) cube are dominated by combinatorially
+# common combinations: far in space AND far in time.  Short-lag bins stay empty.
+# Three samplers concatenated → dense coverage of both marginals + the joint.
+
+def _group_pairs(keys: np.ndarray, *,
+                 max_per_group: int,
+                 rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """Form ≤ max_per_group random pairs from each group of identical keys."""
+    order = np.argsort(keys, kind='stable')
+    keys_sorted = keys[order]
+    breaks = np.flatnonzero(np.diff(keys_sorted)) + 1
+    starts = np.r_[0, breaks]
+    ends   = np.r_[breaks, keys_sorted.size]
+    is_list: list[np.ndarray] = []
+    js_list: list[np.ndarray] = []
+    for s, e in zip(starts, ends):
+        m = e - s
+        if m < 2:
+            continue
+        idx = order[s:e]
+        n_pairs = min(max_per_group, m * (m - 1) // 2)
+        ii = rng.integers(0, m, size=n_pairs)
+        jj = rng.integers(0, m, size=n_pairs)
+        keep = ii != jj
+        is_list.append(idx[ii[keep]])
+        js_list.append(idx[jj[keep]])
+    if not is_list:
+        return (np.array([], dtype=np.int64), np.array([], dtype=np.int64))
+    return np.concatenate(is_list), np.concatenate(js_list)
+
+
+def _structured_pair_indices(obs_lat: np.ndarray,
+                             obs_lon: np.ndarray,
+                             obs_time_h: np.ndarray,
+                             *,
+                             n_mixed: int,
+                             rng_seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Three concatenated samplers.
+
+    Returns (i, j, src) where src is 0=same-cell, 1=same-slot, 2=mixed — useful
+    for diagnostics.
+    """
+    rng = np.random.default_rng(rng_seed)
+    n = obs_lat.size
+
+    # Same-cell: encode (lat, lon) into an int64 key (production grid is fixed).
+    keys_cell = ((np.round(obs_lat, 5) * 1_000_000).astype(np.int64) * 100_000_000
+                 + (np.round(obs_lon, 5) * 1_000_000).astype(np.int64))
+    cell_i, cell_j = _group_pairs(keys_cell,
+                                  max_per_group=B1_VARIOGRAM_PAIRS_PER_CELL,
+                                  rng=rng)
+
+    # Same-slot: t_h is already in hours-from-epoch, equal slot ⇒ equal float.
+    slot_i, slot_j = _group_pairs(obs_time_h,
+                                  max_per_group=B1_VARIOGRAM_PAIRS_PER_SLOT,
+                                  rng=rng)
+
+    # Mixed: truly random pairs over the whole pool.
+    n_target = max(0, min(n_mixed, n * (n - 1) // 2))
+    mix_i = rng.integers(0, n, size=n_target)
+    mix_j = rng.integers(0, n, size=n_target)
+    keep  = mix_i != mix_j
+    mix_i, mix_j = mix_i[keep], mix_j[keep]
+
+    i = np.concatenate([cell_i, slot_i, mix_i])
+    j = np.concatenate([cell_j, slot_j, mix_j])
+    src = np.concatenate([
+        np.zeros(cell_i.size, dtype=np.uint8),
+        np.ones (slot_i.size, dtype=np.uint8),
+        np.full (mix_i.size, 2, dtype=np.uint8),
+    ])
+    return i, j, src
+
+
 def _empirical_st_variogram(obs_lat, obs_lon, obs_time_h, obs_val,
-                            n_pairs: int = B1_VARIOGRAM_SUBSAMPLE,
-                            rng_seed: int = 0):
+                            *,
+                            n_mixed_pairs: int = B1_VARIOGRAM_SUBSAMPLE,
+                            t_band_h: float = B1_VARIOGRAM_T_BAND_H,
+                            s_max_km: float | None = None,
+                            min_bin_pairs: int = B1_VARIOGRAM_MIN_BIN_PAIRS,
+                            n_bins_s: int = B1_VARIOGRAM_N_BINS_S,
+                            n_bins_t: int = B1_VARIOGRAM_N_BINS_T,
+                            rng_seed: int = 0,
+                            return_counts: bool = False):
+    """Empirical (h_s, h_t) variogram from structured pair samples.
+
+    * Pairs sampled by three concatenated samplers (same-cell, same-slot, mixed)
+      so short-lag bins are densely populated.
+    * Pairs with h_t > t_band_h are dropped (Stage A has a structural cross-day
+      gap; including those pairs warps the temporal axis).
+    * Bins with fewer than min_bin_pairs samples are returned as NaN — the
+      fitter then ignores them.
+    """
     n = obs_val.size
     if n < B1_MIN_NEIGHBOURS:
         raise ValueError(f'Too few obs ({n}) for variogram fit.')
-    rng = np.random.default_rng(rng_seed)
-    n_target = min(n_pairs, n * (n - 1) // 2)
-    i = rng.integers(0, n, size=n_target)
-    j = rng.integers(0, n, size=n_target)
-    mask = i != j
-    i, j = i[mask], j[mask]
+    if s_max_km is None:
+        s_max_km = B1_W_SPACE_KM * 1.5
+
+    i, j, _src = _structured_pair_indices(
+        obs_lat, obs_lon, obs_time_h,
+        n_mixed=n_mixed_pairs, rng_seed=rng_seed,
+    )
+    if i.size == 0:
+        raise RuntimeError('Structured samplers produced zero pairs.')
+
     h_s = haversine_km(obs_lat[i], obs_lon[i], obs_lat[j], obs_lon[j])
     h_t = np.abs(obs_time_h[i] - obs_time_h[j])
-    gamma = 0.5 * (obs_val[i] - obs_val[j]) ** 2
+    keep = (h_t <= t_band_h) & (h_s <= s_max_km)
+    h_s, h_t = h_s[keep], h_t[keep]
+    gamma = 0.5 * (obs_val[i[keep]] - obs_val[j[keep]]) ** 2
 
-    s_edges = np.linspace(0, B1_W_SPACE_KM * 1.5, 12)
-    t_edges = np.linspace(0, B1_W_TIME_H  * 1.5, 12)
+    s_edges = np.linspace(0, s_max_km, n_bins_s + 1)
+    t_edges = np.linspace(0, t_band_h, n_bins_t + 1)
     s_centres = 0.5 * (s_edges[:-1] + s_edges[1:])
     t_centres = 0.5 * (t_edges[:-1] + t_edges[1:])
-    s_idx = np.clip(np.digitize(h_s, s_edges) - 1, 0, len(s_centres) - 1)
-    t_idx = np.clip(np.digitize(h_t, t_edges) - 1, 0, len(t_centres) - 1)
-    g_sum   = np.zeros((len(s_centres), len(t_centres)), dtype=np.float64)
-    g_count = np.zeros_like(g_sum, dtype=np.int64)
-    np.add.at(g_sum,   (s_idx, t_idx), gamma)
-    np.add.at(g_count, (s_idx, t_idx), 1)
+    s_idx = np.clip(np.digitize(h_s, s_edges) - 1, 0, n_bins_s - 1)
+    t_idx = np.clip(np.digitize(h_t, t_edges) - 1, 0, n_bins_t - 1)
+    g_sum = np.zeros((n_bins_s, n_bins_t), dtype=np.float64)
+    g_cnt = np.zeros_like(g_sum, dtype=np.int64)
+    np.add.at(g_sum, (s_idx, t_idx), gamma)
+    np.add.at(g_cnt, (s_idx, t_idx), 1)
     with np.errstate(invalid='ignore', divide='ignore'):
-        g_mean = np.where(g_count > 0, g_sum / g_count, np.nan)
+        g_mean = np.where(g_cnt >= min_bin_pairs,
+                          g_sum / np.maximum(g_cnt, 1),
+                          np.nan)
+    if return_counts:
+        return s_centres, t_centres, g_mean, g_cnt
     return s_centres, t_centres, g_mean
 
 
-def fit_variogram(obs_lat, obs_lon, obs_time_h, obs_val) -> SumMetricVariogram:
-    s_c, t_c, g_grid = _empirical_st_variogram(obs_lat, obs_lon, obs_time_h, obs_val)
+def fit_variogram(obs_lat, obs_lon, obs_time_h, obs_val) -> MetricVariogram:
+    s_c, t_c, g_grid, g_cnt = _empirical_st_variogram(
+        obs_lat, obs_lon, obs_time_h, obs_val, return_counts=True,
+    )
     valid = np.isfinite(g_grid)
     if valid.sum() < 6:
-        raise RuntimeError('Empirical ST variogram has <6 populated bins.')
+        raise RuntimeError(
+            f'Empirical variogram has {valid.sum()} populated bins (need ≥6). '
+            f'Try lowering B1_VARIOGRAM_MIN_BIN_PAIRS '
+            f'(current={B1_VARIOGRAM_MIN_BIN_PAIRS}) or sampling more pairs.'
+        )
     S, T = np.meshgrid(s_c, t_c, indexing='ij')
     h_s_flat = S[valid]
     h_t_flat = T[valid]
     g_flat   = g_grid[valid]
+    # Inverse-variance-style weighting: bins with more pairs are more trusted.
+    w_flat   = np.sqrt(g_cnt[valid].astype(np.float64))
 
-    init = B1_VARIOGRAM_INIT
+    init = B1_VARIOGRAM_INIT['metric']
 
     def _unpack(params):
-        var_s, len_s, nug_s, var_t, len_t, nug_t, var_j, len_j, nug_j, k = params
-        return SumMetricVariogram(
-            spatial  = _build_cov(B1_VARIOGRAM_SPEC['spatial'],  var_s, len_s, nug_s),
-            temporal = _build_cov(B1_VARIOGRAM_SPEC['temporal'], var_t, len_t, nug_t),
-            joint    = _build_cov(B1_VARIOGRAM_SPEC['joint'],    var_j, len_j, nug_j),
-            k_km_per_hour = k,
+        var, len_scale, nugget, k = params
+        return MetricVariogram(
+            metric=_build_cov(B1_VARIOGRAM_SPEC['metric'], var, len_scale, nugget),
+            k_km_per_hour=float(k),
         )
 
     def resid(params):
         try:
-            model = _unpack(np.clip(params, 1e-6, None))
+            model = _unpack(params)
             pred = model.gamma(h_s_flat, h_t_flat)
         except Exception:
             return np.full_like(g_flat, 1e6)
-        return pred - g_flat
+        return (pred - g_flat) * w_flat
 
     x0 = np.array([
-        init['spatial']['var'],  init['spatial']['len_scale_km'],     init['spatial']['nugget'] + 1e-6,
-        init['temporal']['var'], init['temporal']['len_scale_hours'], init['temporal']['nugget'] + 1e-6,
-        init['joint']['var'],    init['joint']['len_scale_km'],       init['joint']['nugget'] + 1e-6,
-        init['k_km_per_hour'],
+        init['var'], init['len_scale_km'], init['nugget'] + 1e-5,
+        B1_VARIOGRAM_INIT['k_km_per_hour'],
     ], dtype=np.float64)
+    lb = np.array([1e-4, 1.0,                1e-5,                  1e-3])
+    ub = np.array([10.0, B1_W_SPACE_KM * 20, 1.0,                   B1_W_SPACE_KM])
 
     from scipy.optimize import least_squares
-    res = least_squares(
-        resid, x0=x0,
-        bounds=(1e-6, [
-            10.0, B1_W_SPACE_KM * 4, 1.0,
-            10.0, B1_W_TIME_H  * 4, 1.0,
-            10.0, B1_W_SPACE_KM * 20, 1.0,
-            B1_W_SPACE_KM,
-        ]),
-        max_nfev=300,
-    )
+    res = least_squares(resid, x0=x0, bounds=(lb, ub), max_nfev=500)
     return _unpack(res.x)
 
 
@@ -187,27 +291,34 @@ def fit_variogram(obs_lat, obs_lon, obs_time_h, obs_val) -> SumMetricVariogram:
 _VGM_PATH = MODELS_DIR / 'st_variogram.json'
 
 
-def save_variogram(vgm: SumMetricVariogram, path: Optional[Path] = None) -> Path:
+def save_variogram(vgm: MetricVariogram, path: Optional[Path] = None) -> Path:
     path = path or _VGM_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        'spec': B1_VARIOGRAM_SPEC,
-        'spatial':  {'var': vgm.spatial.var,  'len_scale': vgm.spatial.len_scale,  'nugget': vgm.spatial.nugget},
-        'temporal': {'var': vgm.temporal.var, 'len_scale': vgm.temporal.len_scale, 'nugget': vgm.temporal.nugget},
-        'joint':    {'var': vgm.joint.var,    'len_scale': vgm.joint.len_scale,    'nugget': vgm.joint.nugget},
+        'kind':   'metric',
+        'spec':   B1_VARIOGRAM_SPEC,
+        'target': B1_VARIOGRAM_TARGET,
+        'metric': {'var': vgm.metric.var,
+                   'len_scale': vgm.metric.len_scale,
+                   'nugget': vgm.metric.nugget},
         'k_km_per_hour': vgm.k_km_per_hour,
     }
     path.write_text(json.dumps(payload, indent=2, default=float))
     return path
 
 
-def load_variogram(path: Optional[Path] = None) -> SumMetricVariogram:
+def load_variogram(path: Optional[Path] = None) -> MetricVariogram:
     path = path or _VGM_PATH
     payload = json.loads(path.read_text())
-    return SumMetricVariogram(
-        spatial  = _build_cov(payload['spec']['spatial'],  **{k: payload['spatial'] [k] for k in ('var', 'len_scale', 'nugget')}),
-        temporal = _build_cov(payload['spec']['temporal'], **{k: payload['temporal'][k] for k in ('var', 'len_scale', 'nugget')}),
-        joint    = _build_cov(payload['spec']['joint'],    **{k: payload['joint']   [k] for k in ('var', 'len_scale', 'nugget')}),
+    if payload.get('kind') != 'metric':
+        raise ValueError(
+            f'{path} is not a metric variogram (kind={payload.get("kind")!r}). '
+            f'Re-fit with the current code: kriging.fit_and_save_variogram(...).'
+        )
+    return MetricVariogram(
+        metric = _build_cov(payload['spec']['metric'],
+                            **{k: payload['metric'][k]
+                               for k in ('var', 'len_scale', 'nugget')}),
         k_km_per_hour = payload['k_km_per_hour'],
     )
 
@@ -217,10 +328,20 @@ def load_variogram(path: Optional[Path] = None) -> SumMetricVariogram:
 def collect_training_pairs(
     start: date = TRAIN_START,
     end:   date = TRAIN_END,
+    target_kind: str = B1_VARIOGRAM_TARGET,
     max_pairs: int = B1_VARIOGRAM_SUBSAMPLE,
     rng_seed: int = 0,
     progress: Optional[Callable] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Flat pool of obs samples over [start, end].
+
+    target_kind:
+      'aod'             — returns Stage A AOD directly.
+      'aod_minus_cams'  — returns (Stage A − CAMS) residual; slots without
+                          CAMS coverage are skipped entirely.
+    """
+    if target_kind not in ('aod', 'aod_minus_cams'):
+        raise ValueError(f'Unknown target_kind={target_kind!r}')
     rng = np.random.default_rng(rng_seed)
     epoch = datetime(start.year, start.month, start.day)
     lats, lons, ts, vals = [], [], [], []
@@ -235,17 +356,28 @@ def collect_training_pairs(
             if payload is None:
                 continue
             valid = np.isfinite(payload['aod']) & (payload['aod'] >= 0)
+
+            cams_field = None
+            if target_kind == 'aod_minus_cams':
+                cams_field = cams_aod_slot(slot_utc)
+                if cams_field is None:
+                    continue
+                valid &= np.isfinite(cams_field)
+
             rows, cols = np.where(valid)
             if rows.size == 0:
                 continue
             n_take = min(target_per_slot, rows.size)
             pick = rng.choice(rows.size, size=n_take, replace=False)
             r = rows[pick]; c = cols[pick]
+            aod = payload['aod'][r, c].astype(np.float64)
+            if target_kind == 'aod_minus_cams':
+                aod = aod - cams_field[r, c].astype(np.float64)
             lats.append(LATS[r])
             lons.append(LONS[c])
             t_hours = (slot_utc - epoch).total_seconds() / 3600.0
             ts.append(np.full(n_take, t_hours, dtype=np.float64))
-            vals.append(payload['aod'][r, c].astype(np.float64))
+            vals.append(aod)
 
     if not vals:
         raise RuntimeError(f'No valid Stage A slots in [{start}, {end}]')
@@ -255,8 +387,11 @@ def collect_training_pairs(
 
 def fit_and_save_variogram(start: date = TRAIN_START,
                             end:   date = TRAIN_END,
-                            progress: Optional[Callable] = None) -> SumMetricVariogram:
-    lat, lon, t_h, val = collect_training_pairs(start, end, progress=progress)
+                            target_kind: str = B1_VARIOGRAM_TARGET,
+                            progress: Optional[Callable] = None) -> MetricVariogram:
+    lat, lon, t_h, val = collect_training_pairs(
+        start, end, target_kind=target_kind, progress=progress,
+    )
     vgm = fit_variogram(lat, lon, t_h, val)
     save_variogram(vgm)
     return vgm
@@ -273,7 +408,8 @@ class _SlotObservations:
 
 
 def _gather_window_observations(target_utc: datetime,
-                                w_t_hours: float = B1_W_TIME_H) -> _SlotObservations:
+                                w_t_hours: float = B1_W_TIME_H,
+                                target_kind: str = B1_VARIOGRAM_TARGET) -> _SlotObservations:
     pool_lat, pool_lon, pool_t, pool_v = [], [], [], []
     for day_offset in (-1, 0, 1):
         d = target_utc.date() + timedelta(days=day_offset)
@@ -285,13 +421,24 @@ def _gather_window_observations(target_utc: datetime,
             if payload is None:
                 continue
             valid = np.isfinite(payload['aod']) & (payload['aod'] >= 0)
+
+            cams_field = None
+            if target_kind == 'aod_minus_cams':
+                cams_field = cams_aod_slot(s_utc)
+                if cams_field is None:
+                    continue
+                valid &= np.isfinite(cams_field)
+
             r, c = np.where(valid)
             if r.size == 0:
                 continue
+            aod = payload['aod'][r, c].astype(np.float64)
+            if target_kind == 'aod_minus_cams':
+                aod = aod - cams_field[r, c].astype(np.float64)
             pool_lat.append(LATS[r])
             pool_lon.append(LONS[c])
             pool_t.append(np.full(r.size, dt_h, dtype=np.float64))
-            pool_v.append(payload['aod'][r, c].astype(np.float64))
+            pool_v.append(aod)
 
     if not pool_v:
         return _SlotObservations(np.array([]), np.array([]),
@@ -325,7 +472,7 @@ def _build_pool_index(pool: _SlotObservations) -> Optional[cKDTree]:
 def _krige_target(tgt_lat: float, tgt_lon: float,
                   pool: _SlotObservations,
                   tree: Optional[cKDTree],
-                  vgm: SumMetricVariogram,
+                  vgm: MetricVariogram,
                   w_s_km: float = B1_W_SPACE_KM,
                   k_max: int = B1_MAX_NEIGHBOURS) -> tuple[float, float]:
     if pool.val.size == 0 or tree is None:
@@ -371,7 +518,10 @@ def _krige_target(tgt_lat: float, tgt_lon: float,
     variance = float(np.dot(w[:K], b[:K]) + w[-1])
     if not np.isfinite(estimate):
         return np.nan, np.nan
-    return float(np.clip(estimate, 0.0, 5.0)), max(variance, 0.0)
+    # NOTE: do not clip here — for residual kriging the estimate is (AOD − CAMS)
+    # and is allowed to be negative.  Final [0, 5] clamp is applied in krige_slot
+    # after CAMS has been added back.
+    return estimate, max(variance, 0.0)
 
 
 # ── Output file path + writer ────────────────────────────────────────────────
@@ -428,12 +578,17 @@ def _write_slot(slot_utc: datetime,
 
 # ── Slot-level driver ────────────────────────────────────────────────────────
 
-def krige_slot(slot_utc: datetime, vgm: SumMetricVariogram,
-                training_window: str = '') -> Optional[Path]:
+def krige_slot(slot_utc: datetime, vgm: MetricVariogram,
+                training_window: str = '',
+                target_kind: str = B1_VARIOGRAM_TARGET) -> Optional[Path]:
     """Krige one 30-min slot and write the NC file.
 
     Per Yang & Hu (2018): cells where the spatiotemporal pool is empty or
     where the kriging solve fails are left as NaN (no climatology backstop).
+
+    target_kind='aod_minus_cams' (default): the kriger predicts a residual and
+    CAMS is added back at the target cell.  Cells where CAMS is unavailable at
+    the target slot are left as NaN.
     """
     payload = load_slot(slot_utc)
     if payload is not None:
@@ -450,15 +605,26 @@ def krige_slot(slot_utc: datetime, vgm: SumMetricVariogram,
 
     missing = np.argwhere(~is_observed)
     if missing.size > 0:
-        pool = _gather_window_observations(slot_utc, B1_W_TIME_H)
+        cams_target = None
+        if target_kind == 'aod_minus_cams':
+            cams_target = cams_aod_slot(slot_utc)
+            # Cells with no CAMS coverage stay NaN — handled per-pixel below.
+
+        pool = _gather_window_observations(slot_utc, B1_W_TIME_H,
+                                            target_kind=target_kind)
         if pool.val.size >= B1_MIN_NEIGHBOURS:
             tree = _build_pool_index(pool)
             for (r, c) in missing:
                 est, var = _krige_target(float(LATS[r]), float(LONS[c]),
                                           pool, tree, vgm)
-                if np.isfinite(est):
-                    final[r, c]       = np.float32(est)
-                    uncertainty[r, c] = np.float32(var)
+                if not np.isfinite(est):
+                    continue
+                if target_kind == 'aod_minus_cams':
+                    if cams_target is None or not np.isfinite(cams_target[r, c]):
+                        continue
+                    est = est + float(cams_target[r, c])
+                final[r, c]       = np.float32(np.clip(est, 0.0, 5.0))
+                uncertainty[r, c] = np.float32(var)
 
     return _write_slot(slot_utc, final, is_observed, uncertainty, weight_sum,
                         training_window=training_window)
@@ -469,7 +635,7 @@ def krige_slot(slot_utc: datetime, vgm: SumMetricVariogram,
 # Worker-side state: each worker process loads the variogram once from disk
 # in its initializer, then re-uses it across all slots it processes.  This is
 # more robust than pickling gstools CovModel instances across the pipe.
-_WORKER_VGM: Optional[SumMetricVariogram] = None
+_WORKER_VGM: Optional[MetricVariogram] = None
 
 
 def _init_worker():
@@ -489,7 +655,7 @@ def _worker_krige_slot(args: tuple[datetime, str]) -> bool:
 
 def run(start: date,
         end:   date,
-        vgm:   Optional[SumMetricVariogram] = None,
+        vgm:   Optional[MetricVariogram] = None,
         training_window: Optional[str] = None,
         overwrite: bool = False,
         refit_variogram: bool = False,

@@ -341,8 +341,8 @@ def _print_final_report(r: dict) -> None:
 
 if __name__ == "__main__":
     run_merra2_m2t1nxaer(
-        start="2022-09-01",
-        end="2026-04-01",
+        start="2026-04-01",
+        end="2026-04-30",
         output_dir="/home/slow_data/Air_Quality/MERRA2/M2T1NXAER",
         bbox=VIETNAM_BBOX,
         keep_global=False,

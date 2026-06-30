@@ -311,6 +311,7 @@ def cmd_tc_variance(args: argparse.Namespace) -> None:
         ee_floor_sigma2 as _tc_ee_floor,
     )
     from fusion import save_tc_variance
+    from config import TC_INPUT_SPACE
 
     ts = getattr(args, 'train_start', None)
     te = getattr(args, 'train_end',   None)
@@ -322,6 +323,9 @@ def cmd_tc_variance(args: argparse.Namespace) -> None:
     print(f'\n[tc_variance] σ²_TC per (sensor, region, season)'
           + ('  [strict independence]' if strict else '  [permissive independence]'))
     print(f'  Window  : {train_start} → {train_end} (inclusive)')
+    print(f'  Input   : {TC_INPUT_SPACE} '
+          + ('(α·sat+β applied before TC)' if TC_INPUT_SPACE == 'calibrated'
+             else '(raw AOD into TC; fusion rescales by α²)'))
     print(f'  Output  : {TC_VARIANCE_FILE}')
     if stride > 1:
         print(f'  Stride  : every {stride}th 30-min slot')
@@ -379,7 +383,7 @@ def cmd_tc_variance(args: argparse.Namespace) -> None:
             if not np.isfinite(sigma2):
                 sigma2 = ee
             else:
-                sigma2 = float(sigma2)
+                sigma2 = max(float(sigma2), ee)
             sensor_table.setdefault(sensor, {})[f'{region}|{season}'] = {
                 'sigma2':          float(sigma2),
                 'n_triplets':      int(entry.get('n_triplets', 0)),

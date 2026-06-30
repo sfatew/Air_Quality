@@ -306,10 +306,16 @@ def collect_stratum_triplets(
         SLOT_MINUTES, DRY_MONTHS,
         NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
         LATS, REGIONS, SEASONS,
+        TC_INPUT_SPACE,
     )
     from grid import read_gridded_slot, ALL_SENSORS
     from bias_correction import apply_soft_calibration_grid
     import merra2
+
+    # config.TC_INPUT_SPACE: 'calibrated' applies α·sat+β before computing σ²;
+    # 'raw' feeds uncalibrated AOD into TC (Gruber 2016 §2.1) and lets fusion
+    # rescale σ²_raw → α²·σ²_raw in calibrated space.
+    use_calibrated_inputs = (TC_INPUT_SPACE == 'calibrated')
 
     try:
         from tqdm import tqdm as _tqdm
@@ -359,15 +365,20 @@ def collect_stratum_triplets(
             continue
         season = 'dry' if slot_utc.month in DRY_MONTHS else 'wet'
 
-        # Build per-member soft-calibrated grids for this slot.  Sensors
-        # missing from `g` stay None so per-triplet validity masks reject them.
+        # Build per-member grids for this slot.  Sensors missing from `g` stay
+        # None so per-triplet validity masks reject them.  In 'calibrated' mode
+        # (default) we soft-calibrate each satellite before TC; in 'raw' mode
+        # we pass the gridded AOD through unmodified so σ² stays in raw space.
         grids: dict = {}
         for sensor in ('himawari_l2', 'himawari_l3',
                        'modis_maiac', 'viirs_snpp', 'viirs_noaa20'):
             if sensor in g:
-                grids[sensor] = apply_soft_calibration_grid(
-                    g[sensor]['aod_mean'], sensor, slot_utc.month, soft_cals
-                )
+                sat = g[sensor]['aod_mean']
+                if use_calibrated_inputs:
+                    sat = apply_soft_calibration_grid(
+                        sat, sensor, slot_utc.month, soft_cals
+                    )
+                grids[sensor] = sat
             else:
                 grids[sensor] = None
         grids['merra2'] = merra2.get_slot_grid(slot_utc)

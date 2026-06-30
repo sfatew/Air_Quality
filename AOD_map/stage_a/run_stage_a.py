@@ -8,13 +8,15 @@ For each calendar day the pipeline:
   1. Iterates over 48 UTC half-hour slots (00:00, 00:30, …, 23:30).
   2. Reads the pre-gridded per-sensor AOD from GRIDDED_DIR.
   3. Applies the §7.4.1 linear MERRA-2 soft calibration per (sensor, region,
-     season) stratum.
-  4. Merges Himawari L2 + L3 into a single Himawari channel using the stratum-
-     aware per-pixel preference (§7.5: the level with the lower σ²_TC supplies
-     the primary pixel value; the other fills its gaps).
-  5. TC-weighted fusion (§7.5) of the soft-calibrated sensors into AOD_merged.
-  6. Step A3 physics normalization on the fused field (§7.3, AFTER fusion).
-  7. Writes one NetCDF per slot to MERGED_DIR / YYYY / MM / DD.
+     season) stratum — Himawari L2 and L3 are calibrated independently and
+     remain as two separate sensor channels.
+  4. TC-weighted fusion (§7.5) of the soft-calibrated sensors into AOD_merged.
+     v3.6 promotes Himawari L2 and L3 to first-class fusion inputs (5 sensors
+     total), so the prior pre-fusion L2/L3 merge step is gone — TC weights now
+     arbitrate between L2 and L3 per pixel via 1/σ²_TC the same way they do
+     for any pair of LEO sensors.
+  5. Step A3 physics normalization on the fused field (§7.3, AFTER fusion).
+  6. Writes one NetCDF per slot to MERGED_DIR / YYYY / MM / DD.
 
 Prerequisites:
   * `run_collocate.py grid` for the same date range (GRIDDED_DIR populated).
@@ -62,8 +64,6 @@ from config import (
     LATS, LONS, NLAT, NLON,
     MERGED_DIR,
     SLOT_MINUTES,
-    DRY_MONTHS,
-    NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
 )
 from grid            import read_gridded_slot
 from physics         import apply_physics_correction, close_era5
@@ -72,11 +72,9 @@ from fusion          import fuse, load_tc_variance, load_routes, ee_floor_sigma2
 
 
 _ALL_SENSOR_GROUPS = ('himawari', 'viirs', 'modis')
-# Each Himawari level is soft-calibrated independently against MERRA-2; the
-# corrected per-level grids are then merged into one 'himawari' grid using the
-# σ²_TC table (the level with the lower σ²_TC per (region, season) is the
-# per-pixel primary; the other fills its gaps).  Fusion sees only the merged
-# 'himawari' grid (§7.5 'Himawari L2/L3 stratum-aware per-pixel merge').
+# Himawari L2 and L3 are soft-calibrated independently against MERRA-2 and
+# fed into fusion as two separate sensors (v3.6).  No pre-fusion L2/L3 merge
+# remains; TC weights arbitrate between them per pixel via 1/σ²_TC.
 _SENSOR_KEYS = {
     'himawari': ['himawari_l2', 'himawari_l3'],
     'viirs':    ['viirs_snpp', 'viirs_noaa20'],
@@ -84,32 +82,6 @@ _SENSOR_KEYS = {
 }
 
 SLOTS_PER_DAY = 48
-
-
-def _himawari_prefer_l2_mask(
-    lat_2d: np.ndarray,
-    month: int,
-    sigma2_table: dict,
-) -> np.ndarray:
-    """Per-pixel boolean mask: True where L2's σ²_TC beats L3's for (region, season).
-
-    §7.5: for each stratum the level with the lower σ²_TC supplies the primary
-    pixel value; the other fills its gaps.  Ties and missing entries default to
-    False (L3-first); when only one level has a TC entry the mask is irrelevant
-    because the fallback path is the only available source.
-    """
-    season = 'dry' if month in DRY_MONTHS else 'wet'
-    region_code = np.where(
-        lat_2d >= NORTH_CENTRAL_LAT, 2,
-        np.where(lat_2d < CENTRAL_SOUTH_LAT, 0, 1),
-    )
-    mask = np.zeros(lat_2d.shape, dtype=bool)
-    for code, reg in ((0, 'south'), (1, 'central'), (2, 'north')):
-        l2 = sigma2_table.get(('himawari_l2', reg, season))
-        l3 = sigma2_table.get(('himawari_l3', reg, season))
-        if l2 is not None and l3 is not None and l2 < l3:
-            mask[region_code == code] = True
-    return mask
 
 
 # ── Environment banner ────────────────────────────────────────────────────────
@@ -190,7 +162,8 @@ def _write_netcdf(
         _add_var('n_sensors',       merged['n_sensors'],
                  'Number of sensors contributing', dtype='i1', fill=-1)
         _add_var('dominant_sensor', merged['dominant_sensor'],
-                 'Sensor with highest TC weight (1=Himawari merged,3=MAIAC,4=SNPP,5=N20)',
+                 'Sensor with highest TC weight '
+                 '(1=Himawari L2, 2=Himawari L3, 3=MAIAC, 4=SNPP, 5=N20)',
                  dtype='i1', fill=0)
         _add_var('confidence_flag', merged['confidence_flag'],
                  'Confidence: 0=none,1=H-only,2=LEO-only,3=H+LEO,4=multi-LEO+H',
@@ -247,34 +220,17 @@ def _process_slot(
     if dry_run:
         return Path('dry_run')
 
-    # ── Step A4: per-level Himawari soft calibration, then per-pixel merge ──
+    # ── Step A4: per-sensor soft calibration (L2 and L3 stay separate) ─────
     corrected: dict[str, Optional[np.ndarray]] = {}
 
-    himawari_l2_corrected = (
+    corrected['himawari_l2'] = (
         apply_soft_calibration_grid(himawari_l2_raw, 'himawari_l2', month, soft_cals)
         if himawari_l2_raw is not None else None
     )
-    himawari_l3_corrected = (
+    corrected['himawari_l3'] = (
         apply_soft_calibration_grid(himawari_l3_raw, 'himawari_l3', month, soft_cals)
         if himawari_l3_raw is not None else None
     )
-
-    # Per-pixel L2/L3 merge governed by σ²_TC per (region, season) — §7.5.
-    if himawari_l2_corrected is not None and himawari_l3_corrected is not None:
-        prefer_l2 = _himawari_prefer_l2_mask(lat_2d, month, sigma2_table)
-        primary  = np.where(prefer_l2, himawari_l2_corrected, himawari_l3_corrected)
-        fallback = np.where(prefer_l2, himawari_l3_corrected, himawari_l2_corrected)
-        himawari_corrected = np.where(
-            np.isfinite(primary), primary, fallback
-        ).astype(np.float32)
-    elif himawari_l2_corrected is not None:
-        himawari_corrected = himawari_l2_corrected
-    elif himawari_l3_corrected is not None:
-        himawari_corrected = himawari_l3_corrected
-    else:
-        himawari_corrected = None
-
-    corrected['himawari'] = himawari_corrected
 
     # LEO soft calibration.
     for sensor, aod in raw_grids.items():
@@ -285,7 +241,7 @@ def _process_slot(
 
     # ── Step A5: TC-weighted fusion ────────────────────────────────────────
     valid_corrected = {k: v for k, v in corrected.items() if v is not None}
-    merged = fuse(valid_corrected, month, lat_2d, sigma2_table, routes)
+    merged = fuse(valid_corrected, month, lat_2d, sigma2_table, routes, soft_cals)
 
     # ── Step A3: physics normalization — SEPARATE output, not fed back ─────
     physics_fields: Optional[dict] = None

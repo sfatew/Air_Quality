@@ -45,11 +45,19 @@ Gate (on k-fold CV mean):
     |β_aer_cv| ≤ AERONET_FALLBACK_BETA_ABSMAX
     rmse_aer_after_cv ≤ rmse_aer_before − AERONET_FALLBACK_RMSE_DROP_MIN
 
-When the fallback passes, the persisted SoftCal swaps `alpha`/`beta` to the
-AERONET-anchored in-sample fit and records `anchor='aeronet'`; route flips
-to 'apply'.  When it fails, the stratum stays 'none' and `anchor` records
-which side failed last ('merra2' if AERONET was never tried, 'aeronet' if
-it was).
+A *cross-anchor cap* (Fix 2) is then applied by fit_stratum: when the
+MERRA-2 anchor has finite CV α/β, the AERONET fit's CV α must lie within
+[ALPHA_RATIO_MIN, ALPHA_RATIO_MAX] × MERRA-2 CV α, and |β_aer − β_merra2|
+must be ≤ BETA_MAX_DIFF.  This is the mechanism that prevents a single-
+station AERONET fit (Nghia Do, Bac Lieu) from diverging wildly from the
+full-band MERRA-2 view inside a stratum — the Hima-L3 north|dry α=1.78 vs
+MERRA-2 α=0.77 case in v3.5.
+
+When the fallback passes both its bounds *and* the cap, the persisted
+SoftCal swaps `alpha`/`beta` to the AERONET-anchored in-sample fit and
+records `anchor='aeronet'`; route flips to 'apply'.  When it fails either,
+the stratum stays 'none' and `anchor` records which side failed last
+('merra2' if AERONET was never tried, 'aeronet' if it was).
 
 Persistence
 -----------
@@ -95,14 +103,20 @@ from config import (
     SOFT_CAL_BETA_ABSMAX,
     SOFT_CAL_CV_FOLDS,
     SOFT_CAL_MIN_PAIRS,
+    SOFT_CAL_ACCEPT_ALL_MERRA2,
     SOFT_CAL_OUTPUT_MIN, SOFT_CAL_OUTPUT_MAX,
     SOFTCAL_BLEND_HALF_WIDTH,
+    SOFTCAL_BLEND_ENABLED,
     GATE_A_RMSE_DROP_MIN,
     TRAIN_START, TRAIN_END,
     AERONET_FALLBACK_MIN_PAIRS,
     AERONET_FALLBACK_ALPHA_MIN, AERONET_FALLBACK_ALPHA_MAX,
     AERONET_FALLBACK_BETA_ABSMAX,
     AERONET_FALLBACK_RMSE_DROP_MIN,
+    AERONET_VS_MERRA2_ALPHA_RATIO_MIN, AERONET_VS_MERRA2_ALPHA_RATIO_MAX,
+    AERONET_VS_MERRA2_BETA_MAX_DIFF,
+    SOFT_CAL_RACE_ANCHORS,
+    SOFT_CAL_RACE_BASELINE_DROP_MIN,
     COLLOCATE_DIR,
 )
 from grid import read_gridded_slot, ALL_SENSORS as _ALL_GRID_SENSORS
@@ -156,6 +170,10 @@ class SoftCal:
     rmse_after:  float      # MERRA-2 − (α · sat + β) (training)
     rmse_after_cv: float    # 5-fold CV; what fusion downstream uses for diagnostics
     route:    str           # 'apply' | 'none'
+    # Which anchor's (alpha, beta) the apply step uses.  Invariant:
+    #   route == 'apply' ⇒ anchor ∈ {'merra2', 'aeronet'}
+    #   route == 'none'  ⇒ anchor == 'none'  (nothing applied; diagnostics
+    #   for who-lost-the-race live in the rmse_* / n_aeronet fields below).
     anchor:   str = 'merra2'  # 'merra2' | 'aeronet' | 'none'
     # AERONET fallback diagnostics — NaN/0 when fallback never ran (central
     # regions or MERRA-2 anchor already passed).  Schema mirrors the MERRA-2
@@ -169,6 +187,10 @@ class SoftCal:
     rmse_aer_before:     float = float('nan')   # uncorrected, all pairs
     rmse_aer_after:      float = float('nan')   # in-sample fit, all pairs
     rmse_aer_after_cv:   float = float('nan')   # mean fold-out RMSE (the gate)
+    # Race-mode only (SOFT_CAL_RACE_ANCHORS=True): MERRA-2 (α, β) evaluated on
+    # AERONET pairs.  Out-of-sample because MERRA-2 fit never saw AERONET data.
+    # Comparable head-to-head against rmse_aer_after_cv as the race metric.
+    rmse_merra2_on_aer:  float = float('nan')
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -381,11 +403,21 @@ def _classify_route(
 
     NaN rmse_after_cv (e.g. _kfold_cv bailed) is treated as a gate-A failure,
     matching the conservative reading of §7.4.1 step 3.
+
+    When SOFT_CAL_ACCEPT_ALL_MERRA2 is True the α/β bounds are bypassed
+    (N-min and finiteness still apply) — see config docstring for the side
+    effect on the AERONET fallback.
+
+    The α/β bounds apply uniformly, including in race mode, because they are
+    the only structural guard rail for central strata (no AERONET station →
+    the race degenerates to MERRA-2 own-gate alone).
     """
     if n_pairs < SOFT_CAL_MIN_PAIRS:
         return 'none'
     if not (np.isfinite(alpha_cv) and np.isfinite(beta_cv)):
         return 'none'
+    if SOFT_CAL_ACCEPT_ALL_MERRA2:
+        return 'apply'
     if alpha_cv < SOFT_CAL_ALPHA_MIN or alpha_cv > SOFT_CAL_ALPHA_MAX:
         return 'none'
     if abs(beta_cv) > SOFT_CAL_BETA_ABSMAX:
@@ -463,6 +495,85 @@ def _try_aeronet_fallback(
     return result
 
 
+def _aeronet_within_merra2_cap(
+    alpha_aer_cv: float, beta_aer_cv: float,
+    alpha_merra2_cv: float, beta_merra2_cv: float,
+) -> bool:
+    """Cross-anchor cap: AERONET CV α/β must agree with MERRA-2 CV α/β.
+
+    When MERRA-2 CV α/β are non-finite (e.g. no MERRA-2 pairs at all in the
+    stratum), there is nothing to cap against — return True.  Otherwise
+    require α_aer ∈ [ratio_min, ratio_max] × α_merra2 and
+    |β_aer − β_merra2| ≤ beta_max_diff.
+    """
+    if not (np.isfinite(alpha_merra2_cv) and np.isfinite(beta_merra2_cv)):
+        return True
+    if not (np.isfinite(alpha_aer_cv) and np.isfinite(beta_aer_cv)):
+        return False
+    alpha_lo = AERONET_VS_MERRA2_ALPHA_RATIO_MIN * alpha_merra2_cv
+    alpha_hi = AERONET_VS_MERRA2_ALPHA_RATIO_MAX * alpha_merra2_cv
+    if not (alpha_lo <= alpha_aer_cv <= alpha_hi):
+        return False
+    if abs(beta_aer_cv - beta_merra2_cv) > AERONET_VS_MERRA2_BETA_MAX_DIFF:
+        return False
+    return True
+
+
+def _evaluate_on_aeronet(
+    alpha: float, beta: float,
+    sat: np.ndarray, aer: np.ndarray,
+) -> float:
+    """RMSE of `α·sat + β` against AERONET truth.
+
+    Used in race mode to score the MERRA-2 candidate (α, β) on AERONET pairs.
+    Fully out-of-sample by construction: the MERRA-2 fit never touched these
+    AERONET observations.  NaN-safe; returns NaN if α/β are non-finite or the
+    pair set is empty.
+    """
+    if sat.size == 0 or not (np.isfinite(alpha) and np.isfinite(beta)):
+        return float('nan')
+    return _rmse(alpha * sat + beta, aer)
+
+
+def _select_anchor(
+    merra2_passed_gate: bool,
+    aeronet_passed_gate: bool,
+    rmse_merra2_on_aer: float,
+    rmse_aer_on_aer_cv: float,
+    rmse_aer_baseline: float,
+    baseline_drop_min: float = SOFT_CAL_RACE_BASELINE_DROP_MIN,
+) -> str:
+    """Race-mode anchor selection.  Returns 'merra2' | 'aeronet' | 'none'.
+
+    Each anchor must (a) pass its own gate and (b) have a finite AERONET RMSE
+    to enter the race.  Among entrants the lower AERONET RMSE wins strictly
+    (no tie tolerance).  The winner's AERONET RMSE must also beat the raw
+    AERONET RMSE by ≥ `baseline_drop_min`, otherwise route='none'.
+
+    NaN-baseline degeneracy: when the AERONET pair count for this stratum is
+    below AERONET_FALLBACK_MIN_PAIRS, `rmse_aer_baseline` is NaN — the race
+    is undefined because there is no AERONET truth to score against.  We then
+    defer to MERRA-2's own (MERRA-2-truth) gate: apply if it passed, else 'none'.
+    """
+    if not np.isfinite(rmse_aer_baseline):
+        # No AERONET truth available → race undefined → MERRA-2 own-gate decides.
+        return 'merra2' if merra2_passed_gate else 'none'
+
+    candidates: list[tuple[str, float]] = []
+    if merra2_passed_gate and np.isfinite(rmse_merra2_on_aer):
+        candidates.append(('merra2', rmse_merra2_on_aer))
+    if aeronet_passed_gate and np.isfinite(rmse_aer_on_aer_cv):
+        candidates.append(('aeronet', rmse_aer_on_aer_cv))
+
+    if not candidates:
+        return 'none'
+
+    winner, winner_rmse = min(candidates, key=lambda x: x[1])
+    if winner_rmse > rmse_aer_baseline - baseline_drop_min:
+        return 'none'
+    return winner
+
+
 def fit_stratum(
     sensor: str, region: str, season: str,
     sat: np.ndarray, merra2_aod: np.ndarray,
@@ -509,6 +620,55 @@ def fit_stratum(
             anchor=('merra2' if route == 'apply' else 'none'),
         )
 
+    # Snapshot MERRA-2 anchor's gate verdict before any race-mode mutation,
+    # so `_select_anchor` sees the original MERRA-2 pass/fail decision.
+    merra2_passed_gate = (fit.route == 'apply')
+
+    if SOFT_CAL_RACE_ANCHORS and aeronet_pairs is not None:
+        # Race mode — both anchors compete head-to-head on AERONET truth RMSE.
+        sat_aer = aeronet_pairs.get('sat', np.empty(0, np.float32))
+        aer_obs = aeronet_pairs.get('aer', np.empty(0, np.float32))
+
+        aer = _try_aeronet_fallback(sat_aer, aer_obs, n_folds=n_folds)
+        fit.n_aeronet         = aer['n']
+        fit.alpha_aer         = aer['alpha']
+        fit.beta_aer          = aer['beta']
+        fit.alpha_aer_cv      = aer['alpha_cv']
+        fit.beta_aer_cv       = aer['beta_cv']
+        fit.rmse_aer_before   = aer['rmse_before']
+        fit.rmse_aer_after    = aer['rmse_after']
+        fit.rmse_aer_after_cv = aer['rmse_after_cv']
+
+        # Evaluate MERRA-2 (α, β) on AERONET pairs — out-of-sample by design.
+        fit.rmse_merra2_on_aer = _evaluate_on_aeronet(
+            fit.alpha, fit.beta, sat_aer, aer_obs,
+        )
+
+        winner = _select_anchor(
+            merra2_passed_gate=merra2_passed_gate,
+            aeronet_passed_gate=bool(aer['passed']),
+            rmse_merra2_on_aer=fit.rmse_merra2_on_aer,
+            rmse_aer_on_aer_cv=fit.rmse_aer_after_cv,
+            rmse_aer_baseline=fit.rmse_aer_before,
+        )
+
+        if winner == 'merra2':
+            fit.route  = 'apply'
+            fit.anchor = 'merra2'
+            # α/β already MERRA-2's in-sample fit; nothing to swap.
+        elif winner == 'aeronet':
+            fit.alpha  = aer['alpha']
+            fit.beta   = aer['beta']
+            fit.route  = 'apply'
+            fit.anchor = 'aeronet'
+        else:
+            fit.route  = 'none'
+            fit.anchor = 'none'
+            # Diagnostic context (who was a live contender) lives in the
+            # rmse_merra2_on_aer / rmse_aer_after_cv / n_aeronet fields below.
+        return fit
+
+    # Non-race (default) path — AERONET acts as fallback only when MERRA-2 fails.
     if fit.route == 'apply':
         return fit
     if aeronet_pairs is None:
@@ -527,6 +687,9 @@ def fit_stratum(
     fit.rmse_aer_after    = aer['rmse_after']
     fit.rmse_aer_after_cv = aer['rmse_after_cv']
 
+    # if aer['passed'] and _aeronet_within_merra2_cap(
+    #     aer['alpha_cv'], aer['beta_cv'], fit.alpha_cv, fit.beta_cv,
+    # ):
     if aer['passed']:
         # Swap winning fit to the AERONET anchor; route flips to 'apply'.
         fit.alpha  = aer['alpha']
@@ -535,7 +698,9 @@ def fit_stratum(
         fit.anchor = 'aeronet'
     # else: route stays 'none', anchor stays 'none'.  The diagnostic fields
     # above let you tell 'AERONET never tried' (n_aeronet=0) from
-    # 'AERONET tried and failed' (n_aeronet > 0).
+    # 'AERONET tried and failed' (n_aeronet > 0).  When the cap rejects an
+    # otherwise-passing AERONET fit, the AERONET diagnostics are persisted
+    # but the anchor is left at its pre-fallback value.
 
     return fit
 
@@ -560,6 +725,13 @@ def train_all_sensors(
     this run, so a partial re-train doesn't wipe other sensors' fits.
     """
     out: dict[str, dict[str, SoftCal]] = {}
+
+    if SOFT_CAL_ACCEPT_ALL_MERRA2:
+        print('[soft_cal] SOFT_CAL_ACCEPT_ALL_MERRA2=True — α/β bounds '
+              'bypassed; AERONET fallback effectively disabled.')
+    if SOFT_CAL_RACE_ANCHORS:
+        print('[soft_cal] SOFT_CAL_RACE_ANCHORS=True — MERRA-2 and AERONET '
+              'anchors race head-to-head on AERONET RMSE per stratum.')
 
     for sensor in sensors:
         print(f'\n[soft_cal] {sensor}: collecting (sat, MERRA-2) pairs '
@@ -597,12 +769,19 @@ def train_all_sensors(
                 sensor_out[f'{region}|{season}'] = fit
                 tag = (f'[{fit.route}/{fit.anchor}]' if fit.anchor != 'merra2'
                        else f'[{fit.route}]')
+                race_tail = ''
+                if SOFT_CAL_RACE_ANCHORS and fit.n_aeronet > 0:
+                    race_tail = (
+                        f'  aer_rmse raw={fit.rmse_aer_before:.3f} '
+                        f'm2→aer={fit.rmse_merra2_on_aer:.3f} '
+                        f'aer→aer_cv={fit.rmse_aer_after_cv:.3f}'
+                    )
                 print(f'  {sensor:>14}  {region:>7} {season:>3}  '
                       f'N={fit.n_pairs:>7d}  '
                       f'α={fit.alpha:6.3f} β={fit.beta:+6.3f}  '
                       f'α_CV={fit.alpha_cv:6.3f} β_CV={fit.beta_cv:+6.3f}  '
                       f'rmse {fit.rmse_before:.3f} → {fit.rmse_after_cv:.3f}  '
-                      f'{tag}')
+                      f'{tag}{race_tail}')
         out[sensor] = sensor_out
 
     _persist_soft_calibrations(out, output_file)
@@ -708,6 +887,36 @@ def _ab_for_region(
     return float(fit['alpha']), float(fit['beta'])
 
 
+def build_alpha_lat(
+    sensor_fits: dict[tuple[str, str], dict],
+    season: str,
+) -> np.ndarray:
+    """Per-row α(lat) for one sensor at one season — shape (NLAT,).
+
+    Same region resolution + cosine taper as `apply_soft_calibration_grid`'s
+    α path: when SOFTCAL_BLEND_ENABLED the α is Hann-half-tapered across each
+    region boundary; otherwise hard region masks.  Strata routed to 'none'
+    (or absent) contribute identity α=1.0.
+
+    Used by fusion in TC_INPUT_SPACE='raw' mode to rescale stratum-level
+    σ²_raw into calibrated space (σ²_used = α² · σ²_raw) before forming
+    inverse-variance weights.  Mirroring SOFTCAL_BLEND_ENABLED keeps the σ²
+    rescaling consistent with how the AOD itself is calibrated.
+    """
+    ab = {r: _ab_for_region(sensor_fits, r, season) for r in REGIONS}
+    if SOFTCAL_BLEND_ENABLED:
+        alpha_1d = np.full(NLAT, ab['south'][0], dtype=np.float64)
+        for boundary, upper, _lower in _REGION_BOUNDARIES_NS:
+            w = _upper_region_weight(LATS, boundary)
+            a_u = ab[upper][0]
+            alpha_1d = (1.0 - w) * alpha_1d + w * a_u
+        return alpha_1d
+    return np.where(
+        LATS >= NORTH_CENTRAL_LAT, ab['north'][0],
+        np.where(LATS >= CENTRAL_SOUTH_LAT, ab['central'][0], ab['south'][0]),
+    ).astype(np.float64)
+
+
 def apply_soft_calibration_grid(
     sat: np.ndarray,
     sensor: str,
@@ -734,16 +943,27 @@ def apply_soft_calibration_grid(
     season = _season_of(month)
     ab = {r: _ab_for_region(sensor_fits, r, season) for r in REGIONS}
 
-    # Sequential blend south → north.  The two bands ([11, 12] and [15.5, 16.5])
-    # are non-overlapping, so each boundary's blend acts independently on the
-    # already-resolved (α, β) below it.
-    alpha_1d = np.full(NLAT, ab['south'][0], dtype=np.float64)
-    beta_1d  = np.full(NLAT, ab['south'][1], dtype=np.float64)
-    for boundary, upper, _lower in _REGION_BOUNDARIES_NS:
-        w = _upper_region_weight(LATS, boundary)
-        a_u, b_u = ab[upper]
-        alpha_1d = (1.0 - w) * alpha_1d + w * a_u
-        beta_1d  = (1.0 - w) * beta_1d  + w * b_u
+    if SOFTCAL_BLEND_ENABLED:
+        # Sequential blend south → north.  The two bands ([11, 12] and [15.5, 16.5])
+        # are non-overlapping, so each boundary's blend acts independently on the
+        # already-resolved (α, β) below it.
+        alpha_1d = np.full(NLAT, ab['south'][0], dtype=np.float64)
+        beta_1d  = np.full(NLAT, ab['south'][1], dtype=np.float64)
+        for boundary, upper, _lower in _REGION_BOUNDARIES_NS:
+            w = _upper_region_weight(LATS, boundary)
+            a_u, b_u = ab[upper]
+            alpha_1d = (1.0 - w) * alpha_1d + w * a_u
+            beta_1d  = (1.0 - w) * beta_1d  + w * b_u
+    else:
+        # Hard region masks — step discontinuity at lat=11.5 and lat=16.
+        alpha_1d = np.where(
+            LATS >= NORTH_CENTRAL_LAT, ab['north'][0],
+            np.where(LATS >= CENTRAL_SOUTH_LAT, ab['central'][0], ab['south'][0]),
+        )
+        beta_1d = np.where(
+            LATS >= NORTH_CENTRAL_LAT, ab['north'][1],
+            np.where(LATS >= CENTRAL_SOUTH_LAT, ab['central'][1], ab['south'][1]),
+        )
 
     alpha_2d = alpha_1d[:, None]
     beta_2d  = beta_1d[:, None]

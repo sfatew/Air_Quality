@@ -37,7 +37,7 @@ import rasterio
 
 from config import (
     HIMAWARI_L2_DIR, HIMAWARI_L3_DIR,
-    HIMAWARI_RF_MIN, HIMAWARI_UNC_MAX, HIMAWARI_AOT_MIN,
+    HIMAWARI_AOT_MIN,
     NLAT, NLON, GRID_RES, LAT_MAX, LON_MIN,
 )
 
@@ -89,23 +89,102 @@ def _get_tif_grid_offset(fpath: str) -> tuple[int, int, int, int]:
 # Fill sentinel values used in the GeoTIFF
 _FILL_VALUES = {-9999.0, -999.0, 9999.0}
 
-# ── JAXA strict QA bit-mask (Band 4 L2 / Band 8 L3 QA_flag_Merged) ───────────
+# Historic H08 L2 band ordering (no descriptions embedded in the TIF).  H09 L2
+# reshuffled the bands and embeds per-band descriptions; we look those up at
+# runtime via `_l2_band_lookup` so the same QA / wavelength-correction pipeline
+# works for both satellites.
+_H08_L2_BAND_ORDER = {'AOT': 1, 'Unc': 2, 'AE': 3, 'QA': 4, 'SSA': 5, 'RF': 6}
+_L2_BAND_ALIASES = {
+    'AOT': ('AOT',),
+    'Unc': ('AOT_uncertainty', 'Uncertainty'),
+    'AE':  ('AE',),
+    'QA':  ('QA_flag',),
+    'SSA': ('SSA',),
+    'RF':  ('RF',),
+}
 
-def _qa_passes(qa: np.ndarray) -> np.ndarray:
-    """Vectorised strict JAXA quality screening (returns 2-D bool array).
 
-    Pixel passes iff ALL of:
-        bit 0   data_avail          = 0
-        bit 2   cloud               = 0
-        bit 3   retrieval ok        = 0
-        bit 4-5 AOT confidence      = 00  (very good)
-        bit 8   additional cloud    = 0
-        bit 10  Solz/Satz > 70°     = 0   (replaces the prior SZA+VZA filters)
-        bit 11  surface refl bad    = 0
-        bit 12  snow/ice            = 0   (L2-only; 0 on L3 by design)
-        bit 13  turbid water        = 0   (L2-only; 0 on L3 by design)
+def _l2_band_lookup(src) -> dict[str, int]:
+    """Map logical L2 band-name → 1-based TIF band index.
 
-    Source: Himawari/extract_aod/extract_stations_aod.py::qa_passes_array.
+    H09 L2ARP031 embeds per-band descriptions; H08 has none and uses the
+    documented historic ordering.
+    """
+    desc = src.descriptions
+    if not any(desc):
+        return _H08_L2_BAND_ORDER
+    out: dict[str, int] = {}
+    for key, names in _L2_BAND_ALIASES.items():
+        for i, d in enumerate(desc, start=1):
+            if d in names:
+                out[key] = i
+                break
+        else:
+            raise KeyError(
+                f'L2 band {key!r} not found in TIF descriptions {desc}'
+            )
+    return out
+
+# ── JAXA strict QA bit-mask (per official L2 / L3 spec) ──────────────────────
+#
+# L2 and L3 have DIFFERENT bit layouts because L3 collapses out the per-pixel
+# SSA confidence (L2 bits 8-9) and AE confidence (L2 bits 6-7), shifting every
+# higher bit down by two on L3.  A single shared mask therefore cannot be
+# correct on both — earlier versions of this module mis-checked SSA confidence
+# (L2 bit 8) as "additional cloud" and never checked snow/ice or turbid water
+# at their true positions (L2 bits 14, 15).
+
+def _qa_passes_l2(qa: np.ndarray) -> np.ndarray:
+    """Strict JAXA L2 quality screening (returns 2-D bool array).
+
+    L2 bit layout (JAXA AHI L2ARP031 spec):
+        bit 0     data availability       (0 = available)
+        bit 2     cloud                    (0 = clear)
+        bit 3     retrieval status         (0 = success)
+        bits 4-5  AOT confidence           (00 = very good ≡ AOT uncertainty < 0.5)
+        bits 6-7  AE confidence            (00 = very good ≡ fine-ratio uncertainty < 0.5)
+        bit 10    additional cloud         (0 = clear, 12.5-km near-cloud test)
+        bit 12    Solz/Satz > 70°          (0 = below threshold)
+        bit 13    surface reflectance conf (0 = good)
+        bit 14    snow / ice               (0 = none)
+        bit 15    turbid water             (0 = none)
+
+    The bits 4-5 == 00 gate makes the external |Uncertainty| ≤ 0.5 check
+    redundant (JAXA defines very-good as exactly that uncertainty bound),
+    and bits 6-7 == 00 plays the equivalent role for the fine-ratio
+    retrieval — so both former external gates are now expressed in the
+    bit-mask.  SSA confidence (bits 8-9) and sunglint (bit 11) are
+    intentionally not gated: SSA quality is independent retrieval metadata
+    and Vietnam's stations sit far enough inland that sunglint rarely
+    bites, while the bit-13 surface-reflectance gate already catches the
+    cases that matter.
+    """
+    qa_i = qa.astype(np.int32)
+    return (
+        (((qa_i >> 0)  & 1)    == 0)
+        & (((qa_i >> 2)  & 1)    == 0)
+        & (((qa_i >> 3)  & 1)    == 0)
+        & (((qa_i >> 4)  & 0b11) == 0)
+        & (((qa_i >> 6)  & 0b11) == 0)
+        & (((qa_i >> 10) & 1)    == 0)
+        & (((qa_i >> 12) & 1)    == 0)
+        & (((qa_i >> 13) & 1)    == 0)
+        & (((qa_i >> 14) & 1)    == 0)
+        & (((qa_i >> 15) & 1)    == 0)
+    )
+
+
+def _qa_passes_l3(qa: np.ndarray) -> np.ndarray:
+    """Strict JAXA L3 quality screening (returns 2-D bool array).
+
+    L3 bit layout (JAXA AHI 1HARP031 spec — bits 12-15 are TBD/unused):
+        bit 0     data availability       (0 = available, AOT_merge availability)
+        bit 2     cloud                    (0 = clear)
+        bit 3     retrieval status         (0 = success)
+        bits 4-5  AOT confidence           (set to 00 when AOT not missing)
+        bit 8     additional cloud         (0 = clear, 12.5-km near-cloud test)
+        bit 10    Solz/Satz > 70°          (0 = below threshold)
+        bit 11    surface reflectance conf (0 = good)
     """
     qa_i = qa.astype(np.int32)
     return (
@@ -116,8 +195,6 @@ def _qa_passes(qa: np.ndarray) -> np.ndarray:
         & (((qa_i >> 8)  & 1)    == 0)
         & (((qa_i >> 10) & 1)    == 0)
         & (((qa_i >> 11) & 1)    == 0)
-        & (((qa_i >> 12) & 1)    == 0)
-        & (((qa_i >> 13) & 1)    == 0)
     )
 
 
@@ -196,12 +273,15 @@ def read_l2_slot(
     """Read and QA-filter all L2 TIF files within the ±window_min slot.
 
     Step A1 filters applied:
-        • JAXA strict QA bit-mask on Band 4 (QA_flag) — see _qa_passes.
-          Bit 10 already gates Solz/Satz > 70°, so VZA and SZA are no
-          longer computed per pixel.
+        • JAXA strict L2 QA bit-mask on Band 4 (QA_flag) — see _qa_passes_l2.
+          Bits 4-5 == 00 enforce AOT uncertainty < 0.5 (so the legacy
+          external |Uncertainty| ≤ HIMAWARI_UNC_MAX gate is redundant);
+          bits 6-7 == 00 enforce fine-ratio uncertainty < 0.5 (replacing
+          the legacy external RF ≥ HIMAWARI_RF_MIN value-gate, which was
+          an over-strict proxy for AE retrieval quality and was rejecting
+          coarse-mode-dominated coastal/dust scenes); bit 12 gates the
+          high-zenith path so VZA / SZA are no longer computed per pixel.
         • AOT > HIMAWARI_AOT_MIN  (strict-zero gate)
-        • RF  ≥ HIMAWARI_RF_MIN  (fine-mode fraction, Band 6)
-        • |Uncertainty| ≤ HIMAWARI_UNC_MAX  (Band 2)
 
     Step A2: Multiple 10-min files within the slot are averaged.
 
@@ -223,52 +303,64 @@ def read_l2_slot(
     r0, c0, TH, TW = _get_tif_grid_offset(str(files[0]))
     tif_shape = (TH, TW)
 
-    # Accumulators at TIF resolution.  AE and SSA have their own counters because
-    # NaN values for those bands occur independently of the AOT-valid mask; using
-    # the AOT count would dilute their means toward zero.
+    # Accumulators at TIF resolution.  AE, SSA, UNC, RF have their own counters
+    # because NaN values for those bands occur independently of the AOT-valid
+    # mask; using the AOT count would dilute their means toward zero.  The
+    # external |unc| and RF gates have been dropped — bits 4-5 == 00 and
+    # bits 6-7 == 00 in _qa_passes_l2 encode the JAXA "very good" definitions
+    # of AOT-uncertainty < 0.5 and fine-ratio-uncertainty < 0.5 respectively.
     acc: dict[str, np.ndarray] = {
         k: np.zeros(tif_shape, dtype=np.float64)
         for k in ('aot', 'ae', 'unc', 'ssa', 'rf')
     }
-    cnt    = np.zeros(tif_shape, dtype=np.int32)
-    cnt_ae = np.zeros(tif_shape, dtype=np.int32)
-    cnt_ss = np.zeros(tif_shape, dtype=np.int32)
+    cnt     = np.zeros(tif_shape, dtype=np.int32)
+    cnt_ae  = np.zeros(tif_shape, dtype=np.int32)
+    cnt_ssa = np.zeros(tif_shape, dtype=np.int32)
+    cnt_unc = np.zeros(tif_shape, dtype=np.int32)
+    cnt_rf  = np.zeros(tif_shape, dtype=np.int32)
 
     for fpath in files:
         with rasterio.open(str(fpath)) as src:
-            aot = _read_band(src, 1)
-            unc = _read_band(src, 2)
-            ae  = _read_band(src, 3)
-            qa  = src.read(4).astype(np.int32)  # raw bitmask — no fill substitution
-            ssa = _read_band(src, 5)
-            rf  = _read_band(src, 6)
+            b   = _l2_band_lookup(src)
+            aot = _read_band(src, b['AOT'])
+            unc = _read_band(src, b['Unc'])
+            ae  = _read_band(src, b['AE'])
+            qa  = src.read(b['QA']).astype(np.int32)  # raw bitmask
+            ssa = _read_band(src, b['SSA'])
+            rf  = _read_band(src, b['RF'])
 
-        # Step A1 QA filters on TIF-shaped arrays
+        # Step A1 QA filter on TIF-shaped arrays — the JAXA bit-mask now
+        # subsumes the former external |Uncertainty| and RF value gates.
         valid = ~np.isnan(aot) & (aot > HIMAWARI_AOT_MIN)
-        valid &= _qa_passes(qa)
-        valid &= ~np.isnan(rf)  & (rf  >= HIMAWARI_RF_MIN)
-        valid &= ~np.isnan(unc) & (np.abs(unc) <= HIMAWARI_UNC_MAX)
+        valid &= _qa_passes_l2(qa)
 
         acc['aot'][valid] += aot[valid]
-        acc['unc'][valid] += unc[valid]
-        acc['rf'][valid]  += rf[valid]
         cnt[valid] += 1
 
-        # AE/SSA tracked separately so a NaN AE on an otherwise-valid pixel
-        # doesn't pull the mean toward zero.
+        # AE / SSA / UNC / RF tracked with their own counters so a NaN on an
+        # auxiliary band doesn't pull its mean toward zero.
         ae_ok = valid & ~np.isnan(ae)
         acc['ae'][ae_ok] += ae[ae_ok]
         cnt_ae[ae_ok]    += 1
 
         ssa_ok = valid & ~np.isnan(ssa)
         acc['ssa'][ssa_ok] += ssa[ssa_ok]
-        cnt_ss[ssa_ok]     += 1
+        cnt_ssa[ssa_ok]    += 1
+
+        unc_ok = valid & ~np.isnan(unc)
+        acc['unc'][unc_ok] += unc[unc_ok]
+        cnt_unc[unc_ok]    += 1
+
+        rf_ok = valid & ~np.isnan(rf)
+        acc['rf'][rf_ok] += rf[rf_ok]
+        cnt_rf[rf_ok]    += 1
 
     # Embed TIF-resolution results into the full (NLAT, NLON) config grid
     full_shape = (NLAT, NLON)
     result: dict[str, np.ndarray] = {}
 
-    cnt_for = {'aot': cnt, 'unc': cnt, 'rf': cnt, 'ae': cnt_ae, 'ssa': cnt_ss}
+    cnt_for = {'aot': cnt, 'unc': cnt_unc, 'rf': cnt_rf,
+               'ae': cnt_ae, 'ssa': cnt_ssa}
     key_map = {'aot': 'aot', 'ae': 'ae', 'unc': 'uncertainty',
                'ssa': 'ssa', 'rf': 'rf'}
 
@@ -304,10 +396,14 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
     products with different quality characteristics.
 
     Step A1 filters:
-        • JAXA strict QA bit-mask on QA_flag_Merged — see _qa_passes
-          (subsumes the prior SZA/VZA gates via bit 10)
+        • JAXA strict L3 QA bit-mask on QA_flag_Merged — see _qa_passes_l3
+          (bit 10 subsumes the prior SZA/VZA gates).
         • AOT > HIMAWARI_AOT_MIN  (strict-zero gate)
-        • |AOT_Merged_uncertainty| ≤ HIMAWARI_UNC_MAX
+
+    The external |AOT_Merged_uncertainty| ≤ HIMAWARI_UNC_MAX gate was
+    dropped: AOT_Merged_uncertainty is propagated through JAXA's L2-to-L3
+    merge (different units / scale than the L2 retrieval uncertainty), so
+    applying the L2 envelope threshold to it was a category error.
 
     Returns None if no files are found.
     """
@@ -325,9 +421,7 @@ def read_l3_slot(slot_utc: datetime, window_min: int = 30) -> dict[str, np.ndarr
         qa         = src.read(8).astype(np.int32)    # QA_flag_Merged (raw bitmask)
 
     valid = ~np.isnan(aot) & (aot > HIMAWARI_AOT_MIN)
-    valid &= _qa_passes(qa)
-    if not np.all(np.isnan(unc_merged)):
-        valid &= ~np.isnan(unc_merged) & (np.abs(unc_merged) <= HIMAWARI_UNC_MAX)
+    valid &= _qa_passes_l3(qa)
 
     full_shape = (NLAT, NLON)
     nan_full   = np.full(full_shape, np.nan, dtype=np.float32)

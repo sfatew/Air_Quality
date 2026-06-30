@@ -14,13 +14,23 @@ Requires
   ~/.cdsapirc  (or CDSAPI_URL / CDSAPI_KEY env vars) with valid credentials.
   CDS account: https://cds.climate.copernicus.eu
 
-Dataset
-───────
-  cams-global-reanalysis-eac4
+Datasets
+────────
+  Primary: cams-global-reanalysis-eac4
     Spatial : 0.75° × 0.75° global grid
     Temporal: 3-hourly (00, 03, 06, 09, 12, 15, 18, 21 UTC)
     Coverage: 2003-01-01 → ~2 years before present
     All variables are instantaneous (no accumulation, no deaccumulation needed).
+
+  Fallback: cams-global-atmospheric-composition-forecasts
+    Spatial : 0.4° × 0.4°  (only difference from EAC4 — handled downstream
+                            by stage_b's `_interp_to_grid`, which reads
+                            latitude/longitude from the file directly)
+    Temporal: 3-hourly to match EAC4 — base times (00:00, 12:00) ×
+              leadtime_hour (0, 3, 6, 9) → valid times {00,03,06,09,12,15,18,21}
+    Coverage: near-real-time (closes the EAC4 ~2-year latency gap)
+    Used per-month when EAC4 retrieval fails.  On-disk schema after
+    postprocess is identical to EAC4 (time/lat/lon/AOD550 + species).
 
 Output variable
 ───────────────
@@ -35,13 +45,14 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cdsapi
+import numpy as np
 import pandas as pd
 import xarray as xr
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 BBOX         = [23.5, 102.0, 8.0, 110.0]   # [N, W, S, E] — CDS convention
-START        = (2022, 9)
-END          = (2025, 9)
+START        = (2026, 2)
+END          = (2026, 2)
 
 # How many months to download concurrently.
 # CDS fair-use limit is ~20 active jobs per user; 1 job per month → keep ≤16.
@@ -55,7 +66,9 @@ OUTPUT_DIR   = "/home/slow_data/Air_Quality/CAM"
 MONTHLY_DIR  = os.path.join(OUTPUT_DIR, "_monthly_raw")
 
 # ── CDS request constants ─────────────────────────────────────────────────────
-CDS_DATASET   = "cams-global-reanalysis-eac4"
+CDS_DATASET            = "cams-global-reanalysis-eac4"
+CDS_DATASET_FORECAST   = "cams-global-atmospheric-composition-forecasts"
+
 CDS_VARIABLES =  [
         "black_carbon_aerosol_optical_depth_550nm",
         "dust_aerosol_optical_depth_550nm",
@@ -64,7 +77,9 @@ CDS_VARIABLES =  [
         "sulphate_aerosol_optical_depth_550nm",
         "total_aerosol_optical_depth_550nm"
     ]
-CDS_TIMES     = [f"{h:02d}:00" for h in (0, 3, 6, 9, 12, 15, 18, 21)]
+CDS_TIMES              = [f"{h:02d}:00" for h in (0, 3, 6, 9, 12, 15, 18, 21)]
+CDS_FORECAST_TIMES     = ["00:00", "12:00"]
+CDS_FORECAST_LEADTIMES = ["0", "3", "6", "9"]          # 3-hourly to match EAC4's grid
 
 os.makedirs(OUTPUT_DIR,  exist_ok=True)
 os.makedirs(MONTHLY_DIR, exist_ok=True)
@@ -82,7 +97,7 @@ def iter_months(start: tuple[int, int], end: tuple[int, int]):
 
 # ── CDS download ───────────────────────────────────────────────────────────────
 def _build_request(year: int, month: int) -> dict:
-    """Build the CDS API request body for a single month."""
+    """Build the CDS API request body for a single month — EAC4 reanalysis."""
     n_days = calendar.monthrange(year, month)[1]
     start  = f"{year}-{month:02d}-01"
     end    = f"{year}-{month:02d}-{n_days:02d}"
@@ -95,13 +110,101 @@ def _build_request(year: int, month: int) -> dict:
     }
 
 
-def download_month(year: int, month: int, out_path: str) -> None:
-    """Submit one CDS request for a single month."""
+def _build_request_forecast(year: int, month: int) -> dict:
+    """Build the CDS API request body for the forecast fallback — 3-hourly via
+    (00:00, 12:00) base times × (0, 3, 6, 9) h leadtime → 8 valid times/day
+    matching EAC4's {00,03,06,09,12,15,18,21} UTC grid."""
+    n_days = calendar.monthrange(year, month)[1]
+    start  = f"{year}-{month:02d}-01"
+    end    = f"{year}-{month:02d}-{n_days:02d}"
+    return {
+        "variable":      CDS_VARIABLES,
+        "date":          f"{start}/{end}",
+        "time":          CDS_FORECAST_TIMES,
+        "leadtime_hour": CDS_FORECAST_LEADTIMES,
+        "type":          ["forecast"],
+        "area":          BBOX,
+        "data_format":   "netcdf_zip",
+    }
+
+
+def download_month(year: int, month: int, out_path: str) -> str:
+    """Download one month of CAMS data.
+
+    Tries EAC4 first; on any failure, falls back to the near-real-time forecast
+    product.  Returns the dataset id that produced the file on disk (used by the
+    caller for logging).  Raises if both datasets fail.
+    """
     client = cdsapi.Client(quiet=True)
-    client.retrieve(CDS_DATASET, _build_request(year, month), out_path)
+    try:
+        client.retrieve(CDS_DATASET, _build_request(year, month), out_path)
+        return CDS_DATASET
+    except Exception as exc_eac4:
+        try:
+            client.retrieve(
+                CDS_DATASET_FORECAST,
+                _build_request_forecast(year, month),
+                out_path,
+            )
+            return CDS_DATASET_FORECAST
+        except Exception as exc_fc:
+            raise RuntimeError(
+                f"both CDS datasets failed for {year}-{month:02d} "
+                f"(eac4: {exc_eac4!r}; forecast: {exc_fc!r})"
+            ) from exc_fc
 
 
 # ── Open a CDS download (zip or plain nc) ─────────────────────────────────────
+def _flatten_forecast_time(ds: xr.Dataset) -> xr.Dataset:
+    """Collapse (forecast_reference_time × forecast_period) into a single 1-D
+    `time` axis of valid times.  No-op for EAC4 (which already ships a 1-D time).
+
+    The forecast product returns variables shaped (n_base, n_lead, lat, lon)
+    where n_base = 2 (00:00 + 12:00 base times) and n_lead = 12 (0..11 h).  We
+    compute valid_time = base + lead and reshape to (n_base*n_lead, lat, lon) so
+    downstream code can treat the file identically to EAC4's 3-hourly output.
+    """
+    base_dim = next(
+        (n for n in ("forecast_reference_time", "reference_time") if n in ds.dims),
+        None,
+    )
+    lead_dim = next(
+        (n for n in ("forecast_period", "step", "leadtime_hour") if n in ds.dims),
+        None,
+    )
+    if base_dim is None or lead_dim is None:
+        return ds
+
+    base_vals = ds[base_dim].values                    # datetime64[ns]
+    lead_vals = ds[lead_dim].values                    # timedelta64 or integer hours
+    if not np.issubdtype(lead_vals.dtype, np.timedelta64):
+        lead_vals = lead_vals.astype("timedelta64[h]")
+
+    valid_2d = base_vals[:, None] + lead_vals[None, :]  # (n_base, n_lead)
+    valid_1d = valid_2d.reshape(-1)
+
+    new_vars: dict[str, xr.DataArray] = {}
+    for v in ds.data_vars:
+        arr = ds[v]
+        spatial = [d for d in arr.dims if d not in (base_dim, lead_dim)]
+        arr = arr.transpose(base_dim, lead_dim, *spatial)
+        np_arr = arr.values
+        flat = np_arr.reshape(np_arr.shape[0] * np_arr.shape[1], *np_arr.shape[2:])
+        new_vars[v] = xr.DataArray(
+            flat,
+            dims=("time", *spatial),
+            coords={"time": valid_1d, **{d: ds[d] for d in spatial}},
+            attrs=arr.attrs,
+        )
+
+    out = xr.Dataset(new_vars, attrs=ds.attrs).sortby("time")
+    # Drop duplicate valid times (defensive — the request schema shouldn't produce any)
+    _, uniq = np.unique(out["time"].values, return_index=True)
+    if len(uniq) < out.sizes["time"]:
+        out = out.isel(time=np.sort(uniq))
+    return out
+
+
 def _open_one_file(path: str) -> xr.Dataset:
     """
     Open a single CDS download, handling both ZIP and plain NetCDF formats.
@@ -125,6 +228,10 @@ def _open_one_file(path: str) -> xr.Dataset:
             ds = xr.merge(parts, compat="no_conflicts") if len(parts) > 1 else parts[0]
     else:
         ds = xr.open_dataset(path).load()
+
+    # Forecast files have (forecast_reference_time × forecast_period) instead of
+    # a 1-D time axis.  Flatten to match the EAC4 schema before downstream use.
+    ds = _flatten_forecast_time(ds)
 
     # Normalise dimension name: new CDS API uses 'valid_time', old uses 'time'
     if "valid_time" in ds.dims:
@@ -199,7 +306,8 @@ def _process_month(i: int, total: int, year: int, month: int) -> str:
 
     raw_nc = os.path.join(MONTHLY_DIR, f"cams_{tag}_raw.nc")
 
-    last_exc = None
+    last_exc      = None
+    used_dataset  = None
     for attempt in range(1, MAX_RETRIES + 1):
         if os.path.exists(raw_nc):
             os.remove(raw_nc)
@@ -215,7 +323,7 @@ def _process_month(i: int, total: int, year: int, month: int) -> str:
                 )
                 time.sleep(delay)
 
-            download_month(year, month, raw_nc)
+            used_dataset = download_month(year, month, raw_nc)
             last_exc = None
             break  # success — exit retry loop
 
@@ -229,7 +337,8 @@ def _process_month(i: int, total: int, year: int, month: int) -> str:
     if last_exc is not None:
         raise last_exc
 
-    _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  post-processing …")
+    src_label = "forecast" if used_dataset == CDS_DATASET_FORECAST else "eac4"
+    _safe_print(f"[{i:2d}/{total}] {year}-{month:02d}  post-processing ({src_label}) …")
     ds_raw   = _open_one_file(raw_nc)
     ds_clean = postprocess(ds_raw)
 

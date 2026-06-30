@@ -6,7 +6,8 @@ joins them with AERONET observations using a temporal window.
 Temporal strategy per sensor (satellite-centric — one record per satellite snapshot):
     Himawari L2 : for each L2 snapshot, average all AERONET obs within ±LEO_WINDOW_MIN
                   of the snapshot's UTC timestamp.
-    Himawari L3 : for each calendar date with L3 data, pair with the AERONET daily mean.
+    Himawari L3 : same as L2 — for each L3 snapshot, average all AERONET obs
+                  within ±LEO_WINDOW_MIN of the snapshot's UTC timestamp.
     VIIRS       : for each overpass row, average all AERONET obs within ±LEO_WINDOW_MIN.
     MODIS MAIAC : for each orbit row, average all AERONET obs within ±MODIS_WINDOW_MIN;
                   fallback rows (is_fallback=True) use the AERONET daily mean for that day.
@@ -39,6 +40,7 @@ _TZ = pd.Timedelta(hours=TZ_OFFSET_HOURS)   # subtract from AERONET UTC+7 → UT
 
 _SENSOR_WINDOW: dict[str, int] = {
     'himawari_l2':  LEO_WINDOW_MIN,
+    'himawari_l3':  LEO_WINDOW_MIN,
     'viirs_snpp':   LEO_WINDOW_MIN,
     'viirs_noaa20': LEO_WINDOW_MIN,
     'modis_maiac':  MODIS_WINDOW_MIN,
@@ -192,75 +194,6 @@ def _match_leo(
     return records
 
 
-def _match_l3_daily(
-    sat_df: pd.DataFrame,
-    aer_df: pd.DataFrame,
-    sensor: str,
-    site: str,
-    station_lat: float,
-    station_lon: float,
-) -> list[dict]:
-    """Match Himawari L3 hourly composites to AERONET daily means.
-
-    For each calendar date that has satellite data, averages all L3 snapshots
-    for that day and pairs with the AERONET daily mean (computed in UTC).
-    One record per satellite date.
-    """
-    sat_df = sat_df.copy()
-    sat_df['sat_date'] = pd.to_datetime(sat_df['timestamp_sat']).dt.normalize()
-
-    # Build AERONET daily means keyed by UTC midnight Timestamp
-    aer_clean = aer_df[['datetime', 'aod_550']].dropna(subset=['aod_550']).copy()
-    aer_clean['dt_utc'] = aer_clean['datetime'] - _TZ
-    aer_daily = (
-        aer_clean
-        .assign(utc_date=lambda df: df['dt_utc'].dt.normalize())
-        .groupby('utc_date')['aod_550']
-        .agg(aer_aod='mean', aer_std='std', aer_n='count')
-    )   # DataFrame indexed by UTC midnight Timestamps
-
-    records = []
-    for sat_date, day_sat in sat_df.groupby('sat_date'):
-        # Try satellite UTC date first; fall back to UTC+7 date (midnight boundary)
-        if sat_date in aer_daily.index:
-            aer_row = aer_daily.loc[sat_date]
-        else:
-            utc7_date = sat_date + _TZ
-            if utc7_date in aer_daily.index:
-                aer_row = aer_daily.loc[utc7_date]
-            else:
-                continue
-
-        ts_local = sat_date + _TZ
-        d        = ts_local.date()
-
-        records.append({
-            'sensor':              sensor,
-            'site':                site,
-            'region':              AERONET_SITES[site]['region'],
-            'season':              'dry' if d.month in DRY_MONTHS else 'wet',
-            'month':               d.month,
-            'lat':                 station_lat,
-            'lon':                 station_lon,
-            'date':                d.isoformat(),
-            'timestamp_aeronet':   ts_local.isoformat(),
-            'timestamp_satellite': day_sat.iloc[0]['timestamp_sat'],
-            'satellite_aod':       float(day_sat['sat_aod'].mean()),
-            'aeronet_aod':         float(aer_row['aer_aod']),
-            'aer_n':               int(aer_row['aer_n']),
-            'aer_std':             float(aer_row['aer_std'])
-                                   if pd.notna(aer_row['aer_std']) else 0.0,
-            'dist_km':             0.0,
-            'vza':                 np.nan,
-            'sza':                 np.nan,
-            'spatial_flag':        int(day_sat['spatial_flag'].min()),
-            'box_std':             float(day_sat['sat_aod'].std(ddof=0))
-                                   if len(day_sat) > 1
-                                   else float(day_sat['box_std'].iloc[0]),
-        })
-    return records
-
-
 # ── Main matching entry points ────────────────────────────────────────────────
 
 def match_site(
@@ -317,14 +250,9 @@ def match_site(
             else:
                 sat_df['utc_date'] = from_ts
 
-        if sensor == 'himawari_l3':
-            records = _match_l3_daily(
-                sat_df, aer_all, sensor, site, station_lat, station_lon
-            )
-        else:
-            records = _match_leo(
-                sat_df, aer_all, sensor, site, station_lat, station_lon
-            )
+        records = _match_leo(
+            sat_df, aer_all, sensor, site, station_lat, station_lon
+        )
 
         if not records:
             continue

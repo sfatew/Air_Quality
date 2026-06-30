@@ -10,6 +10,9 @@ Output: one CSV per station at OUTPUT_DIR/<station_name>.csv with columns
     timestamp, station_name, latitude, longitude, T2m, Td2m, RH, Psfc, MSLP,
     U10, V10, WS10m, WD10m, U100, V100, WS100m, WD100m, PBLH, CloudCover,
     CBH, TCWV, SolarRad, Precip, Albedo, CAPE
+
+`timestamp` is written in Vietnam local time (UTC+7, no DST) to match
+satellite product CSVs that are already in LT downstream.
 """
 
 import argparse
@@ -35,6 +38,10 @@ DEFAULT_STATION_CSV = Path(
 DEFAULT_OUTPUT_DIR    = Path("/home/slow_data/Air_Quality/ERA5/stations")
 DEFAULT_MONTHLY_DIR   = Path("/home/slow_data/Air_Quality/ERA5/_monthly_raw")
 MONTHLY_GLOB          = "era5_??????.nc"
+
+# Vietnam local time = UTC + 7 (no DST). Source NetCDFs from CDS are UTC;
+# we shift on write so all downstream files share the same LT clock.
+LOCAL_TZ_OFFSET = pd.Timedelta(hours=7)
 
 EXTRA_STATIONS = {
     "NGHIA_DO": {"lat": 21.048, "lon": 105.800, "city": "Hà Nội"},
@@ -106,6 +113,7 @@ def extract_all_stations(ds: xr.Dataset, stations: dict,
 
     df = pt.to_dataframe().reset_index()
     df = df.rename(columns={"time": "timestamp", "station": "station_name"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"]) + LOCAL_TZ_OFFSET
 
     feature_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
     out_cols = ["timestamp", "station_name", "latitude", "longitude"] + feature_cols

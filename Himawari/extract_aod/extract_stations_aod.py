@@ -12,8 +12,8 @@ Key change vs v3:
       bit 8  (additional cloud)   = 0
       bit 10 (Solz/Satz > 70°)    = 0
       bit 11 (surf refl conf)     = 0
-      bit 12 (snow/ice)           = 0   (L3-only flag; 0 on L2 since TBD)
-      bit 13 (turbid water)       = 0   (L3-only flag; 0 on L2 since TBD)
+      bit 12 (snow/ice)           = 0   (L2-only flag)
+      bit 13 (turbid water)       = 0   (L2-only flag)
   AOT pixels failing QA OR missing → set to NaN in raw 25 cols AND excluded
   from mean / std / valid_count / inner / outer aggregates.
 

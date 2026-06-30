@@ -23,7 +23,6 @@ import sys
 from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT_DIR))
-
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -46,7 +45,7 @@ PRODUCTS = {
             "short_name": "AERDB_L2_VIIRS_NOAA20",
             "collection": "5200",
             "platform": "NOAA20",
-            "aod_variable": "Aerosol_Optical_Thickness_550_Land_Ocean_Best_Estimate",
+            "aod_variable": "vi",
             "aod_all_variable": "Aerosol_Optical_Thickness_550_Land_Ocean",
             "qa_variable": "Aerosol_Optical_Thickness_QA_Flag_Land",
             "qa_variable_ocean": "Aerosol_Optical_Thickness_QA_Flag_Ocean",
@@ -83,7 +82,7 @@ PRODUCTS = {
     },
 }
 
-SITES_CSV = Path("/home/work1/projects/Air_Quality/Masterdata/envisoft_27_stations.csv")
+SITES_CSV = Path("/home/work1/projects/Air_Quality/Masterdata/envisoft_station_map.csv")
 
 
 def load_stations(csv_path: Path = SITES_CSV) -> dict:
@@ -414,9 +413,7 @@ class VIIRSAODProcessor:
             lon = np.array(lon_var[:], dtype=np.float32)
 
             aod_best_var = self._read_variable(ds, self.product["aod_variable"])
-            aod_all_var = self._read_variable(ds, self.product["aod_all_variable"])
             aod_best = self._to_float_array(aod_best_var) if aod_best_var else None
-            aod_all = self._to_float_array(aod_all_var) if aod_all_var else None
 
             qa_land_var = self._read_variable(ds, self.product["qa_variable"])
             qa_ocean_var = self._read_variable(ds, self.product.get("qa_variable_ocean", ""))
@@ -449,9 +446,6 @@ class VIIRSAODProcessor:
             if aod_best is not None:
                 result["aod_best"] = aod_best[mask]
                 result["n_valid_best"] = int(np.sum(~np.isnan(aod_best[mask])))
-            if aod_all is not None:
-                result["aod_all"] = aod_all[mask]
-                result["n_valid_all"] = int(np.sum(~np.isnan(aod_all[mask])))
             return result, None
 
         except Exception as e:
@@ -460,131 +454,57 @@ class VIIRSAODProcessor:
         finally:
             ds.close()
 
-    def extract_station_l2(self, data: dict, radius_km: float = 25.0) -> tuple[list[dict], list[dict]]:
+    def extract_station_l2(self, data: dict, threshold_km: float = 25.0) -> list[dict]:
+        """Best-estimate radius averaging only: pixels within threshold_km of station
+        with valid AOD and qa >= self.qa_threshold are averaged."""
         if data is None:
-            return [], []
+            return []
 
         lat, lon, qa = data["lat"], data["lon"], data["qa"]
         aod_best = data.get("aod_best")
-        aod_all = data.get("aod_all")
-        raw_records, filt_records = [], []
+        if aod_best is None:
+            return []
 
+        records = []
         for name, coords in self.stations.items():
             slat, slon = coords["lat"], coords["lon"]
             dist_km = self._haversine(lat, lon, slat, slon)
-            in_radius = dist_km <= radius_km
-            base = {"datetime": data["datetime"], "station": name,
-                    "station_lat": slat, "station_lon": slon}
-
-            # RAW
-            if aod_all is not None and np.any(in_radius):
-                a = aod_all[in_radius]
-                q = qa[in_radius]
-                has_valid = np.any(~np.isnan(a))
-                qa_u, qa_c = np.unique(q, return_counts=True)
-                qa_dist = dict(zip(qa_u.tolist(), qa_c.tolist()))
-
-                raw_records.append({
-                    **base,
-                    "aod_mean": float(np.nanmean(a)) if has_valid else np.nan,
-                    "aod_median": float(np.nanmedian(a)) if has_valid else np.nan,
-                    "aod_std": float(np.nanstd(a)) if has_valid else np.nan,
-                    "aod_min": float(np.nanmin(a)) if has_valid else np.nan,
-                    "aod_max": float(np.nanmax(a)) if has_valid else np.nan,
-                    "n_pixels_total": int(np.sum(in_radius)),
-                    "n_pixels_valid_aod": int(np.sum(~np.isnan(a))),
-                    "n_pixels_nan": int(np.sum(np.isnan(a))),
-                    "n_qa0_no_retrieval": int(qa_dist.get(0, 0)),
-                    "n_qa1_low": int(qa_dist.get(1, 0)),
-                    "n_qa2_medium": int(qa_dist.get(2, 0)),
-                    "n_qa3_high": int(qa_dist.get(3, 0)),
-                    "qa_distribution": str(qa_dist),
-                    "mean_dist_km": float(np.mean(dist_km[in_radius])),
-                    "source_sds": "Land_Ocean",
-                })
-
-            # FILTERED
-            if aod_best is not None and np.any(in_radius):
-                ab = aod_best[in_radius]
-                qb = qa[in_radius]
-                good = (~np.isnan(ab)) & (qb >= self.qa_threshold)
-                if np.any(good):
-                    af = ab[good]
-                    filt_records.append({
-                        **base,
-                        "aod_mean": float(np.nanmean(af)),
-                        "aod_median": float(np.nanmedian(af)),
-                        "aod_std": float(np.nanstd(af)),
-                        "aod_min": float(np.nanmin(af)),
-                        "aod_max": float(np.nanmax(af)),
-                        "n_pixels": int(np.sum(good)),
-                        "qa_threshold": self.qa_threshold,
-                        "mean_dist_km": float(np.mean(dist_km[in_radius][good])),
-                        "source_sds": "Best_Estimate",
-                    })
-
-        return raw_records, filt_records
-
-    def extract_station_l2_nearest(self, data: dict) -> tuple[list[dict], list[dict]]:
-        """Nearest pixel method."""
-        if data is None:
-            return [], []
-
-        lat, lon, qa = data["lat"], data["lon"], data["qa"]
-        aod_best = data.get("aod_best")
-        aod_all = data.get("aod_all")
-        raw_records, filt_records = [], []
-
-        for name, coords in self.stations.items():
-            slat, slon = coords["lat"], coords["lon"]
-            dist_km = self._haversine(lat, lon, slat, slon)
-            nearest_idx = np.argmin(dist_km)
-            nearest_dist = float(dist_km[nearest_idx])
-
-            if nearest_dist > 6.0:
+            in_radius = dist_km <= threshold_km
+            if not np.any(in_radius):
                 continue
 
-            base = {
+            ab = aod_best[in_radius]
+            qb = qa[in_radius]
+            good = (~np.isnan(ab)) & (qb >= self.qa_threshold)
+            if not np.any(good):
+                continue
+
+            af = ab[good]
+            records.append({
                 "datetime": data["datetime"],
                 "station": name,
                 "station_lat": slat,
                 "station_lon": slon,
-                "pixel_lat": float(lat[nearest_idx]),
-                "pixel_lon": float(lon[nearest_idx]),
-                "dist_km": nearest_dist,
-            }
+                "aod_mean": float(np.mean(af)),
+                "aod_median": float(np.median(af)),
+                "aod_std": float(np.std(af)),
+                "aod_min": float(np.min(af)),
+                "aod_max": float(np.max(af)),
+                "n_pixels": int(np.sum(good)),
+                "qa_threshold": self.qa_threshold,
+                "threshold_km": threshold_km,
+                "mean_dist_km": float(np.mean(dist_km[in_radius][good])),
+                "source_sds": "Best_Estimate",
+            })
 
-            if aod_all is not None:
-                aod_val = float(aod_all[nearest_idx])
-                qa_val = int(qa[nearest_idx])
-                raw_records.append({
-                    **base,
-                    "aod": aod_val if not np.isnan(aod_val) else np.nan,
-                    "qa": qa_val,
-                    "source_sds": "Land_Ocean",
-                })
+        return records
 
-            if aod_best is not None:
-                aod_val = float(aod_best[nearest_idx])
-                qa_val = int(qa[nearest_idx])
-                if not np.isnan(aod_val) and qa_val >= self.qa_threshold:
-                    filt_records.append({
-                        **base,
-                        "aod": aod_val,
-                        "qa": qa_val,
-                        "qa_threshold": self.qa_threshold,
-                        "source_sds": "Best_Estimate",
-                    })
-
-        return raw_records, filt_records
-
-    def process_l2(self, data_dir: Path, radius_km: float = 25.0) -> dict:
+    def process_l2(self, data_dir: Path, threshold_km: float = 25.0) -> pd.DataFrame:
         nc_files = sorted(data_dir.rglob("*.nc"))
         self.process_stats["files_total"] = len(nc_files)
         logger.info("L2: processing %d files from %s", len(nc_files), data_dir)
 
-        radius_raw, radius_filt = [], []
-        nearest_raw, nearest_filt = [], []
+        all_records = []
 
         for i, f in enumerate(nc_files):
             granule, err = self.read_granule_l2(f)
@@ -594,37 +514,18 @@ class VIIRSAODProcessor:
                 self.process_stats["files_no_data"] += 1
             else:
                 self.process_stats["files_processed"] += 1
-                r_raw, r_filt = self.extract_station_l2(granule, radius_km)
-                radius_raw.extend(r_raw)
-                radius_filt.extend(r_filt)
-
-                n_raw, n_filt = self.extract_station_l2_nearest(granule)
-                nearest_raw.extend(n_raw)
-                nearest_filt.extend(n_filt)
+                all_records.extend(self.extract_station_l2(granule, threshold_km))
 
             del granule
             if (i + 1) % GC_EVERY == 0:
                 gc.collect()
-                logger.info(
-                    "L2: %d/%d files (radius_raw=%d, nearest_raw=%d)",
-                    i + 1, len(nc_files), len(radius_raw), len(nearest_raw),
-                )
+                logger.info("L2: %d/%d files, %d records",
+                            i + 1, len(nc_files), len(all_records))
 
         gc.collect()
-
-        result = {
-            "radius_raw": self._to_df(radius_raw),
-            "radius_filtered": self._to_df(radius_filt),
-            "nearest_raw": self._to_df(nearest_raw),
-            "nearest_filtered": self._to_df(nearest_filt),
-        }
-
-        logger.info("Radius — raw: %d | filtered: %d",
-                     len(result["radius_raw"]), len(result["radius_filtered"]))
-        logger.info("Nearest — raw: %d | filtered: %d",
-                     len(result["nearest_raw"]), len(result["nearest_filtered"]))
-
-        return result
+        df = self._to_df(all_records)
+        logger.info("L2 best-estimate records: %d", len(df))
+        return df
 
     # -----------------------------------------------------------------------
     # D3 methods  — OOM-fixed
@@ -783,7 +684,7 @@ class VIIRSAODProcessor:
 # ---------------------------------------------------------------------------
 import yaml
 
-with open("config/config.yaml", "r") as f:
+with open(f"{ROOT_DIR}/config/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 TOKEN = config["VIIRS"]["TOKEN"]
 
@@ -794,7 +695,7 @@ def run_viirs_aod(
     days: int = 1,
     base_dir: str = "/home/slow_data/Air_Quality/VIIRS",
     output_dir: str = None,
-    radius: float = 25.0,
+    threshold: float = 25.0,
     token: str = TOKEN,
     overwrite: bool = False,
     actions: list = None,
@@ -818,6 +719,7 @@ def run_viirs_aod(
 
     level, product_config = get_product_config(product)
     platform = product_config["platform"]
+    short_name = product_config["short_name"]
 
     if output_dir is None:
         output_dir = os.path.join(base_dir, "output")
@@ -831,7 +733,9 @@ def run_viirs_aod(
         end_date = datetime.now() - timedelta(days=1)
         start_date = end_date - timedelta(days=days - 1)
 
-    data_dir = Path(base_dir) / level / platform
+    # Extract reads from {base_dir}/{level}/{short_name} (e.g. L2/AERDB_L2_VIIRS_NOAA20).
+    # Download still writes to {base_dir}/{level}/{platform} via VIIRSAODDownloader.
+    data_dir = Path(base_dir) / level / short_name
 
     run_stats = {
         "product": product,
@@ -861,8 +765,7 @@ def run_viirs_aod(
             run_stats["download"] = downloader.stats.copy()
 
     # --- PROCESS ---
-    df_raw, df_filt = pd.DataFrame(), pd.DataFrame()
-    prefix = f"viirs_aod_{level}_{platform}"
+    df = pd.DataFrame()
 
     if "process" in actions:
         processor = VIIRSAODProcessor(
@@ -871,98 +774,41 @@ def run_viirs_aod(
         )
 
         if level == "L2":
-            results = processor.process_l2(data_dir, radius_km=radius)
-
-            methods = {
-                "radius_avg": ("radius_raw", "radius_filtered"),
-                "nearest_pixel": ("nearest_raw", "nearest_filtered"),
-            }
-
-            for method_name, (raw_key, filt_key) in methods.items():
-                df_r = results[raw_key]
-                df_f = results[filt_key]
-
-                if df_r.empty and df_f.empty:
-                    continue
-
-                stations_in_data = set()
-                if not df_r.empty:
-                    stations_in_data.update(df_r["station"].unique())
-                if not df_f.empty:
-                    stations_in_data.update(df_f["station"].unique())
-
-                for station in stations_in_data:
-                    folder_name = (
-                        station.replace(":", "")
-                        .replace("/", "_")
-                        .replace("\\", "_")
-                        .replace(" ", "_")
-                        .strip("_")
-                    )
-                    station_dir = (Path(output_dir) / f"{level}_{platform}"
-                                   / method_name / folder_name)
-                    station_dir.mkdir(parents=True, exist_ok=True)
-
-                    if not df_r.empty:
-                        s_raw = df_r[df_r["station"] == station].reset_index(drop=True)
-                        if not s_raw.empty:
-                            s_raw.to_csv(station_dir / "raw.csv", index=False)
-
-                    if not df_f.empty:
-                        s_filt = df_f[df_f["station"] == station].reset_index(drop=True)
-                        if not s_filt.empty:
-                            s_filt.to_csv(station_dir / "filtered.csv", index=False)
-
-                logger.info("Saved %s: %d stations", method_name, len(stations_in_data))
-
-            for key, df in results.items():
-                if not df.empty:
-                    csv_path = os.path.join(output_dir, f"{prefix}_{key}.csv")
-                    df.to_csv(csv_path, index=False)
-                    logger.info("Saved: %s (%d records)", csv_path, len(df))
-
-            df_raw = results["radius_raw"]
-            df_filt = results["radius_filtered"]
-
+            df = processor.process_l2(data_dir, threshold_km=threshold)
         elif level == "D3":
-            df_raw = processor.process_d3(data_dir)
-            df_filt = df_raw.copy()
+            df = processor.process_d3(data_dir)
 
-            if not df_raw.empty:
-                for station in df_raw["station"].unique():
-                    folder_name = (
-                        station.replace(":", "")
-                        .replace("/", "_")
-                        .replace("\\", "_")
-                        .replace(" ", "_")
-                        .strip("_")
-                    )
-                    station_dir = Path(output_dir) / f"{level}_{platform}" / folder_name
-                    station_dir.mkdir(parents=True, exist_ok=True)
-                    s_df = df_raw[df_raw["station"] == station].reset_index(drop=True)
-                    s_df.to_csv(station_dir / "data.csv", index=False)
-
-                d3_csv = os.path.join(output_dir, f"{prefix}.csv")
-                df_raw.to_csv(d3_csv, index=False)
-                logger.info("Saved: %s (%d records)", d3_csv, len(df_raw))
+        if not df.empty:
+            level_dir = Path(output_dir) / f"{level}_{platform}"
+            level_dir.mkdir(parents=True, exist_ok=True)
+            for station in df["station"].unique():
+                fname = (
+                    station.replace(":", "")
+                    .replace("/", "_")
+                    .replace("\\", "_")
+                    .replace(" ", "_")
+                    .strip("_")
+                )
+                s_df = df[df["station"] == station].reset_index(drop=True)
+                s_df.to_csv(level_dir / f"{fname}.csv", index=False)
+            logger.info("Saved %d stations under %s", df["station"].nunique(), level_dir)
 
         run_stats["process"] = processor.process_stats.copy()
 
-        # Build per-station summary from result data
-        result_df = df_raw if not df_raw.empty else df_filt
-        if not result_df.empty and "station" in result_df.columns:
-            for station, grp in result_df.groupby("station"):
+        # Build per-station summary
+        if not df.empty and "station" in df.columns:
+            for station, grp in df.groupby("station"):
                 run_stats["station_summary"][station] = {
                     "records": len(grp),
                     "date_min": grp["datetime"].min().strftime("%Y-%m-%d"),
                     "date_max": grp["datetime"].max().strftime("%Y-%m-%d"),
                 }
 
-    return df_raw, df_filt, run_stats
+    return df, run_stats
 
 
 timestamp = datetime.now().strftime("%Y%m%d")
-JOB_LOG = Path(__file__).parent / f"{timestamp}_job.log"
+JOB_LOG = Path(__file__).parent / f"logs/{timestamp}_job.log"
 
 def write_job_report(
     all_run_stats: list[dict],
@@ -1084,14 +930,14 @@ if __name__ == "__main__":
         logger.info("  %s: %d station(s)", city, len(members))
 
     all_stats = []
-    for product_key in ["deep_blue_noaa20", "deep_blue_noaa20_d3"]:
-        _, _, stats = run_viirs_aod(
+    for product_key in ["deep_blue_snpp"]:
+        _, stats = run_viirs_aod(
             product=product_key,
-            start="2022-01-01",
+            start="2020-01-01",
             base_dir="/home/slow_data/Air_Quality/VIIRS",
-            actions=["process"],
+            actions=["download", "process"],
+            threshold=25.0,
         )
         all_stats.append(stats)
 
     write_job_report(all_stats, STATIONS)
-

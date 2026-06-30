@@ -47,7 +47,7 @@ LIST_URL = (
 DETAIL_URL = "https://tedp.vn/api/data_hour/{}"
 
 STATION_CSV = Path("/home/work1/projects/Air_Quality/Masterdata/envisoft_station_map.csv")
-OUTPUT_DIR = Path("/home/slow_data/Air_Quality/AQI")
+OUTPUT_DIR = Path("/home/slow_data/Air_Quality/AQI/raw")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (aqi-crawl)"}
 

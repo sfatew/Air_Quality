@@ -23,7 +23,7 @@ import gc
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -49,7 +49,7 @@ except ImportError:
 
 from config import (
     LATS, LONS, NLAT, NLON,
-    RF_OUTPUT_DIR, MODELS_DIR,
+    RF_OUTPUT_DIR, RF_PRED_DIR, MODELS_DIR,
     RF_FEATURES,
     RF_N_ESTIMATORS, RF_MAX_DEPTH, RF_MIN_SAMPLES_LEAF,
     RF_N_JOBS, RF_RANDOM_STATE, RF_GRID,
@@ -63,6 +63,7 @@ from config import (
     RF_AOD_DECILES,
     RMSE_CONSISTENCY_TOLERANCE,
     TRAIN_START, TRAIN_END,
+    SLOT_MINUTES,
 )
 from features import build_feature_grid, stack_features, build_training_table
 from slots import (
@@ -747,3 +748,158 @@ def fill_range(start: date, end: date, bundle: Optional[RFBundle] = None,
             except FileNotFoundError:
                 pass
     return n
+
+
+# ── Full-grid RF prediction tree (regression-kriging drift term) ─────────────
+# The `rf` product keeps *observations* at observed cells (rf_gapfill.fill_slot,
+# `final = where(is_observed, obs, pred)`), so it can't supply ŷ_rf there.
+# Regression kriging needs ŷ_rf at *every* cell — at observed cells to form the
+# residual (actual − ŷ_rf) that gets kriged, and at gap cells as the drift the
+# kriged residual is added to.  This tree stores the raw full-grid prediction,
+# computed once per slot so the ±B1_W_TIME_H kriging window can re-read it
+# instead of re-running build_feature_grid ~20-40× per neighbourhood overlap.
+
+def rf_pred_path(slot_utc: datetime) -> Path:
+    return (RF_PRED_DIR
+            / f'{slot_utc.year:04d}'
+            / f'{slot_utc.month:02d}'
+            / f'{slot_utc.day:02d}'
+            / f'pred_{slot_utc:%Y%m%d_%H%M}.nc')
+
+
+def write_pred_slot(slot_utc: datetime, bundle: RFBundle) -> Path:
+    """Compute and persist the full-grid RF prediction ŷ_rf for one slot.
+
+    Single variable `rf_pred` (AOD units, NaN where the RF can't predict — e.g.
+    a slot with no CAMS drift).  No is_observed mask and no pass-through: this
+    is the pure drift field, deliberately including observed cells.
+    """
+    pred, _ = predict_slot_grid(slot_utc, bundle, with_uncertainty=False)
+
+    out = rf_pred_path(slot_utc)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with nc.Dataset(out, 'w', format='NETCDF4') as ds:
+        ds.title          = 'Vietnam Stage B — full-grid RF prediction (RK drift term)'
+        ds.slot_utc       = slot_utc.replace(tzinfo=timezone.utc).isoformat()
+        ds.slot_index     = slot_index(slot_utc)
+        ds.training_window = ' to '.join(bundle.training_window)
+        ds.created_at     = datetime.now(timezone.utc).isoformat()
+        ds.Conventions    = 'CF-1.8'
+        ds.createDimension('lat', NLAT)
+        ds.createDimension('lon', NLON)
+        ds.createVariable('lat', 'f4', ('lat',))[:] = LATS.astype(np.float32)
+        ds.createVariable('lon', 'f4', ('lon',))[:] = LONS.astype(np.float32)
+        v = ds.createVariable('rf_pred', 'f4', ('lat', 'lon'),
+                              fill_value=-9999.0, zlib=True, complevel=4)
+        v.long_name = 'Full-grid RF AOD prediction (drift for regression kriging)'
+        v.units = '1'
+        v[:] = np.where(np.isfinite(pred), pred, -9999.0)
+    return out
+
+
+def predict_range(start: date, end: date, bundle: Optional[RFBundle] = None,
+                  overwrite: bool = False,
+                  progress: Optional[Callable] = None) -> int:
+    """Precompute the full-grid RF prediction tree over [start, end].
+
+    Callers should pass a ±1-day margin around the kriging target window so the
+    ±B1_W_TIME_H temporal neighbourhood at the window edges is covered.
+    """
+    bundle = bundle or load_bundle()
+    days = list(iter_local_days(start, end))
+    iterator = progress(days, desc='RF pred') if progress is not None else days
+    n = 0
+    for d in iterator:
+        for slot_utc in iter_window_slots(d):
+            out = rf_pred_path(slot_utc)
+            if out.exists() and not overwrite:
+                continue
+            try:
+                write_pred_slot(slot_utc, bundle=bundle)
+                n += 1
+            except FileNotFoundError:
+                pass
+    return n
+
+
+# ── Out-of-fold residuals for the regression-kriging variogram ───────────────
+# The RK variogram must describe the spatial structure of the RF's *out-of-
+# sample* error — fitting it on in-sample train residuals gives a degenerate
+# variogram (memorised bias: shrunken sill, zero nugget) that makes kriging
+# under-correct.  Fitting on the test window would be honest but leaks test.
+# So: a temporal holdout *inside* the train window.  Train an RF on the earlier
+# (1 − holdout_fraction) of train, predict the held-out tail, and return those
+# residuals — honest out-of-sample structure, test never touched.
+
+def collect_oof_residual_pairs(
+    start: date = TRAIN_START,
+    end:   date = TRAIN_END,
+    holdout_fraction: float = RF_INTERNAL_TEST_FRACTION,
+    hp: Optional[dict] = None,
+    target_rows: int = RF_TRAIN_TARGET_ROWS,
+    target_kind: str = RF_TARGET_KIND,
+    progress: Optional[Callable] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Single-holdout OOF RF residuals for `kriging.fit_variogram`.
+
+    Returns (lat, lon, t_hours, residual) at the held-out train cells, where
+    residual = actual_AOD − ŷ_oof.  For target_kind='aod_minus_cams' the CAMS
+    term cancels, so this equals (y_resid − pred_resid) directly.
+
+    `hp` should be the production bundle's hyperparams so the holdout model's
+    error structure matches the model actually shipped as the RK drift.
+    """
+    X_df, y_ser, meta = build_training_table(
+        start, end, target_rows=target_rows, progress=progress,
+    )
+    if X_df.empty:
+        raise RuntimeError(f'No training rows in [{start}, {end}].')
+    X_df, y_ser, meta = _apply_target_kind(X_df, y_ser, meta, target_kind)
+
+    feature_columns = list(X_df.columns)
+    X = X_df.to_numpy(dtype=np.float32)
+    y = y_ser.to_numpy(dtype=np.float32)   # residual-space if aod_minus_cams
+    rows_ij  = meta['row'].to_numpy(dtype=int)
+    cols_ij  = meta['col'].to_numpy(dtype=int)
+    slot_idx = meta['slot_idx'].to_numpy(dtype=int)
+    dates    = meta['date'].to_numpy()
+    del X_df, y_ser, meta
+    gc.collect()
+
+    # Temporal holdout: earliest (1 − frac) fits, latest frac is held out.
+    days_sorted = np.array(sorted(pd.unique(dates)))
+    if len(days_sorted) < 2:
+        raise RuntimeError('Need ≥2 distinct train days for a temporal holdout.')
+    cut       = int(len(days_sorted) * (1 - holdout_fraction))
+    hold_days = set(days_sorted[cut:].tolist())
+    is_hold   = np.isin(dates, list(hold_days))
+    fit_idx   = np.where(~is_hold)[0]
+    oof_idx   = np.where( is_hold)[0]
+    if fit_idx.size == 0 or oof_idx.size == 0:
+        raise RuntimeError('Temporal holdout produced an empty split.')
+
+    medians = np.nanmedian(X[fit_idx], axis=0).astype(np.float32)
+    medians = np.where(np.isfinite(medians), medians, 0.0).astype(np.float32)
+    X_fit = _impute(X[fit_idx], medians)
+    X_oof = _impute(X[oof_idx], medians)
+
+    hp = hp or {
+        'n_estimators':     RF_N_ESTIMATORS,
+        'max_depth':        RF_MAX_DEPTH,
+        'min_samples_leaf': RF_MIN_SAMPLES_LEAF,
+        'max_features':     'sqrt',
+    }
+    print(f'  OOF holdout: fit={fit_idx.size} rows, predict={oof_idx.size} rows '
+          f'({len(hold_days)} held-out days)', flush=True)
+    rf = _fit_model(X_fit, y[fit_idx], hp)
+    pred = rf.predict(X_oof)
+    # residual-space error == AOD-space full-model residual (CAMS cancels).
+    resid = (y[oof_idx] - pred).astype(np.float64)
+
+    lat = LATS[rows_ij[oof_idx]].astype(np.float64)
+    lon = LONS[cols_ij[oof_idx]].astype(np.float64)
+    epoch = pd.Timestamp(datetime(start.year, start.month, start.day))
+    dts = (pd.to_datetime(pd.Series(dates[oof_idx]))
+           + pd.to_timedelta(slot_idx[oof_idx] * SLOT_MINUTES, unit='m'))
+    t_h = ((dts - epoch).dt.total_seconds().to_numpy() / 3600.0)
+    return lat, lon, t_h, resid

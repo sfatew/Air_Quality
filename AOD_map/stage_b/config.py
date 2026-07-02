@@ -64,6 +64,12 @@ WINDOW_MIN_SLOTS_PRESENT = 10  # < this triggers the 7-day median fallback
 STAGE_B_DIR     = DATA_ROOT / 'Stage_B'
 ST_KRIGING_DIR  = STAGE_B_DIR / 'output' / 'st_kriging'   # parallel product tree
 RF_OUTPUT_DIR   = STAGE_B_DIR / 'output' / 'rf'           # parallel product tree
+# Regression-kriging (B3): RF drift + kriged RF-residual.  RF_PRED_DIR holds the
+# full-grid RF prediction ŷ_rf per slot (drift term, needed at observed cells to
+# form residuals — the `rf` product only keeps observations there).  RF_RK_DIR is
+# the final RK product tree.
+RF_PRED_DIR     = STAGE_B_DIR / 'output' / 'rf_pred'      # full-grid ŷ_rf per slot
+RF_RK_DIR       = STAGE_B_DIR / 'output' / 'rf_rk'        # RK product tree
 MODELS_DIR      = STAGE_B_DIR / 'models'
 VALIDATION_DIR  = STAGE_B_DIR / 'validation'
 
@@ -207,18 +213,24 @@ RF_FEATURES_DYNAMIC = [
     'blh', 'tcc', 'tcwv', 'ssrd', 'fal',
     'precip_6h', 'precip_24h', 'hours_since_rain_0p1mm',
     'hour_sin', 'hour_cos', 'month_sin', 'month_cos',
-    # ── ST-AOD-context — temporal only:
-    'persistence_decay', 'slots_since_obs',
-    # ── Dropped after the first ST-context retrain (rf_residual_stctx_tau6):
-    # 'obs_aod_mean_5x5', 'obs_aod_count_5x5' — the spatial neighbour mean took
-    #   38 % Gini importance but is informationally dead at the gaps we fill:
-    #   clouds are spatially contagious, so at a real gap the 5x5 is mostly
-    #   missing (→ imputed to the constant 0.266) or survivor-biased toward the
-    #   clear plume edges.  Result was a regression-to-the-mean collapse:
-    #   +0.29 clean-air bias, −1.4 at AOD>1.5, constant positive rf_added in
-    #   every (site, season) stratum, blind AERONET R² 0.52→0.43.  The grids
-    #   stay in features.py (`_obs_neighborhood_grids`) for the gap-simulated-
-    #   training experiment that would make the feature honest.
+    # ── ST-AOD-context features — REVERTED to the OG covariate-only set.
+    # Both the spatial mean and the temporal persistence share one fatal flaw:
+    # they are near-oracle on TRAINING rows (observed cells with dense/recent
+    # obs) but collapse to a median-imputed constant at the real gaps we fill
+    # (clouds are spatially and temporally contagious).  Net effect on blind
+    # AERONET:
+    #   - obs_aod_mean_5x5 / obs_aod_count_5x5 (28-feat run rf_residual_stctx):
+    #       38 % importance, regression-to-mean collapse, R² 0.52→0.43.
+    #   - persistence_decay / slots_since_obs (26-feat run rf_residual_persist):
+    #       milder same disease — still #1 at 30 % importance, +0.20 clean-air
+    #       bias, positive rf_added in every stratum, within-site R WORSE at
+    #       every Bac_Lieu stratum (pooled R² only ticked up via Simpson's
+    #       paradox across the two sites' different AOD ranges).
+    # Both helper grids stay in features.py (`_obs_neighborhood_grids`,
+    # `_persistence_lookback_grids`) for the leave-one-out kriging-as-feature
+    # / gap-simulated-training experiments that would make ST context honest.
+    #   'obs_aod_mean_5x5', 'obs_aod_count_5x5',
+    #   'persistence_decay', 'slots_since_obs',
     # ── Dropped post-validation (§8.2.4c follow-up):
     # 'fire_frp_log_24h' — 99 % zero in the training table, importance 0.008,
     #   no movement on the AOD>1.5 envelope.  Per-pixel coincidence of MODIS

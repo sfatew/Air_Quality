@@ -201,7 +201,8 @@ def aggregate_sigma2_per_sensor(
 
             {
                 'members': ('himawari_l2', 'modis_maiac', 'merra2'),
-                'sigma2':  {member_name: float, ...},   # per-sensor σ²
+                'sigma2':  {member_name: float, ...},   # per-sensor σ² (Stoffelen)
+                'rho':     {member_name: float, ...},   # per-sensor ρ_{i,t} (McColl Eq. 9)
                 'n':       int,                          # collocations used
             }
 
@@ -219,28 +220,43 @@ def aggregate_sigma2_per_sensor(
     dict keyed by sensor name with::
 
         {
-            'sigma2':       float (NaN if below min_triplets or all NaN),
-            'n_triplets':   int,
+            'sigma2':         float (NaN if below min_triplets or all NaN),
+            'rho_t':          float (McColl ρ_{i,t} median across valid triplets;
+                                     NaN if below min_triplets or all Eq.-9 signs failed),
+            'n_triplets':     int,   # triplets contributing a finite σ²
+            'n_rho_triplets': int,   # triplets contributing a finite ρ (may differ:
+                                     # McColl's radicand can fail even when σ² is fine)
             'n_collocations': int (total across triplets used),
         }
     """
     # Accumulators for valid data per sensor
     sensor_sigma_arrays = defaultdict(list)
+    sensor_rho_arrays   = defaultdict(list)
     sensor_collocation_counts = defaultdict(int)
 
     # 1. Pivot and Filter
     for triplet in triplet_results:
         collocations = triplet.get('n', 0)
-        
+        rho_map = triplet.get('rho', {})
+
         for sensor, sig2 in triplet.get('sigma2', {}).items():
             # Drop negatives (independence violation) and explicitly check for NaNs
             if sig2 is not None and not math.isnan(sig2) and sig2 >= 0:
                 sensor_sigma_arrays[sensor].append(sig2)
                 sensor_collocation_counts[sensor] += collocations
+            # ρ_{i,t} is NaN-guarded upstream (McColl Eq. 9 negative radicand).
+            # Aggregated independently: a triplet with usable σ² may have NaN ρ
+            # if the sign check failed, and vice versa.
+            rho = rho_map.get(sensor)
+            if rho is not None and math.isfinite(rho):
+                sensor_rho_arrays[sensor].append(float(rho))
 
     # 2. Aggregate
     aggregated_results = {}
-    for sensor, sig2_list in sensor_sigma_arrays.items():
+    all_sensors = set(sensor_sigma_arrays) | set(sensor_rho_arrays)
+    for sensor in all_sensors:
+        sig2_list = sensor_sigma_arrays.get(sensor, [])
+        rho_list  = sensor_rho_arrays.get(sensor, [])
         n_triplets = len(sig2_list)
         n_colloc   = sensor_collocation_counts[sensor]
 
@@ -249,9 +265,18 @@ def aggregate_sigma2_per_sensor(
         else:
             final_sigma2 = float('nan')
 
+        # ρ shares the min_triplets / min_collocations gate — a median over
+        # <TC_MIN_TRIPLETS values is not the honest §7.4.2 estimate.
+        if len(rho_list) >= min_triplets and n_colloc >= min_collocations:
+            final_rho = float(np.median(rho_list))
+        else:
+            final_rho = float('nan')
+
         aggregated_results[sensor] = {
             'sigma2': final_sigma2,
+            'rho_t': final_rho,
             'n_triplets': n_triplets,
+            'n_rho_triplets': len(rho_list),
             'n_collocations': n_colloc,
         }
 

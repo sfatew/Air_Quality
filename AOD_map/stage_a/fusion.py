@@ -72,7 +72,9 @@ def load_tc_variance(path: Path = TC_VARIANCE_FILE) -> dict:
 
         {
           "himawari_l2": {
-              "north|dry":   {"sigma2": 0.21, "n_triplets": 87, "n_collocations": 412345},
+              "north|dry":   {"sigma2": 0.21, "rho_t": 0.83,
+                              "n_triplets": 87, "n_rho_triplets": 84,
+                              "n_collocations": 412345},
               ...
           },
           "himawari_l3": { ... },
@@ -316,10 +318,15 @@ def save_tc_variance(
 
     `table` schema mirrors what load_tc_variance reads back::
 
-        { sensor: { 'region|season': {'sigma2': ..., 'n_triplets': ...,
+        { sensor: { 'region|season': {'sigma2': ..., 'rho_t': ...,
+                                      'n_triplets': ..., 'n_rho_triplets': ...,
                                       'n_collocations': ...},
                     ... },
           ... }
+
+    `rho_t` is McColl 2014 Eq. 9 ρ_{i,t} (correlation-with-truth), aggregated
+    as the median across valid triplets in the stratum.  It is a diagnostic
+    only — load_tc_variance ignores it, so fusion behaviour is unchanged.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(table, indent=2, sort_keys=True))

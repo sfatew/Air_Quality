@@ -15,6 +15,11 @@ Examples
     # Only B2 (RF tune + fill_range), reusing the existing variogram
     python run_stage_b.py --b2
 
+    # B3 regression kriging (RF drift + kriged RF residual → output/rf_rk).
+    # Fits the variogram on out-of-fold RF residuals; does NOT retrain the RF.
+    # Assumes the RF bundle already exists (from a prior --b2 run).
+    python run_stage_b.py --rk
+
     # Only the validation block (assumes B1+B2 already produced NC files)
     python run_stage_b.py --validate
 
@@ -32,7 +37,7 @@ import json
 import os
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
@@ -105,6 +110,57 @@ def run_b1(overwrite: bool, run_start, run_end, infer_only: bool = False) -> Non
     n = kg.run(run_start, run_end, vgm=vgm,
                overwrite=overwrite, progress=tqdm)
     print(f'  B1 wrote {n} NC files in {time.time() - t0:.1f}s.')
+
+
+def run_b3(model_name: str, overwrite: bool, run_start, run_end,
+           infer_only: bool = False,
+           holdout_fraction: float = cfg.RF_INTERNAL_TEST_FRACTION) -> None:
+    """B3 — regression kriging: RF drift + kriged RF residual (→ output/rf_rk).
+
+    Three stages: (1) fit the RK variogram on OUT-OF-FOLD RF residuals (honest
+    out-of-sample error structure; never touches test), (2) precompute the
+    full-grid RF drift ŷ_rf over the apply window ±1 day, (3) krige the residual
+    and add the drift back.  The production RF bundle is never retrained.
+    """
+    rk_vgm_path = kg._vgm_path('aod_minus_rf')
+
+    # ── Stage 1: RK variogram from OOF residuals ────────────────────────────
+    if infer_only:
+        print(f'\n=== B3: Regression kriging  (reuse saved RK variogram, '
+              f'{run_start} → {run_end} apply) ===')
+        vgm = kg.load_variogram(rk_vgm_path)
+        print(f'  loaded RK variogram from {rk_vgm_path}')
+    else:
+        print(f'\n=== B3: Regression kriging  '
+              f'(OOF variogram fit on {cfg.TRAIN_START} → {cfg.TRAIN_END}, '
+              f'{run_start} → {run_end} apply) ===')
+        print(f'  bundle (drift)    : {model_name}')
+        print(f'  OOF holdout frac  : {holdout_fraction}')
+        vgm = kg.fit_and_save_rk_variogram_oof(
+            bundle_name=model_name, holdout_fraction=holdout_fraction,
+            progress=tqdm,
+        )
+    print(f'  metric var          : {vgm.metric.var:.4f}')
+    print(f'  metric range_km     : {vgm.metric.len_scale:.2f}')
+    print(f'  metric nugget       : {vgm.metric.nugget:.4f}  '
+          f'(nugget/sill={vgm.metric.nugget / (vgm.metric.var + vgm.metric.nugget):.2f})')
+    print(f'  anisotropy k (km/h) : {vgm.k_km_per_hour:.3f}')
+
+    # ── Stage 2: precompute RF drift ŷ_rf over apply window ±1 day ───────────
+    bundle = rf.load_bundle(model_name)
+    pred_start = run_start - timedelta(days=1)   # ±1 day covers the ±B1_W_TIME_H
+    pred_end   = run_end   + timedelta(days=1)   # kriging window at the edges
+    print(f'  precomputing RF drift over {pred_start} → {pred_end} …')
+    t0 = time.time()
+    n_pred = rf.predict_range(pred_start, pred_end, bundle=bundle,
+                              overwrite=overwrite, progress=tqdm)
+    print(f'  wrote {n_pred} rf_pred slots in {time.time() - t0:.1f}s.')
+
+    # ── Stage 3: krige the residual, add drift back ─────────────────────────
+    t0 = time.time()
+    n = kg.run(run_start, run_end, vgm=vgm, overwrite=overwrite,
+               target_kind='aod_minus_rf', progress=tqdm)
+    print(f'  B3 wrote {n} NC files to {cfg.RF_RK_DIR} in {time.time() - t0:.1f}s.')
 
 
 def run_b2(model_name: str, overwrite: bool, run_start, run_end,
@@ -221,6 +277,10 @@ def main() -> None:
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--b1',       action='store_true', help='run B1 (ST kriging)')
     ap.add_argument('--b2',       action='store_true', help='run B2 (RF gap-fill)')
+    ap.add_argument('--rk',       action='store_true',
+                    help='run B3 (regression kriging: RF drift + kriged RF '
+                         'residual → output/rf_rk). Fits the variogram on '
+                         'out-of-fold RF residuals; does not retrain the RF.')
     ap.add_argument('--validate', action='store_true', help='run validation block')
     ap.add_argument('--all',      action='store_true', help='run B1 + B2 + validation')
     ap.add_argument('--overwrite', action='store_true',
@@ -261,14 +321,14 @@ def main() -> None:
                          'max_features). Mutually exclusive with --infer-only.')
     args = ap.parse_args()
 
-    if not (args.b1 or args.b2 or args.validate or args.all):
-        ap.error('pick at least one of --b1 --b2 --validate --all')
+    if not (args.b1 or args.b2 or args.rk or args.validate or args.all):
+        ap.error('pick at least one of --b1 --b2 --rk --validate --all')
 
     if args.no_tune and args.infer_only:
         ap.error('--no-tune and --infer-only are mutually exclusive')
 
-    for d in (cfg.ST_KRIGING_DIR, cfg.RF_OUTPUT_DIR, cfg.MODELS_DIR,
-              cfg.VALIDATION_DIR):
+    for d in (cfg.ST_KRIGING_DIR, cfg.RF_OUTPUT_DIR, cfg.RF_PRED_DIR,
+              cfg.RF_RK_DIR, cfg.MODELS_DIR, cfg.VALIDATION_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
     run_start = args.start if args.start is not None else cfg.TEST_START
@@ -286,6 +346,9 @@ def main() -> None:
                report_train_rmse=args.train_rmse,
                infer_only=args.infer_only,
                no_tune=args.no_tune)
+    if args.rk:
+        run_b3(args.model_name, args.overwrite, run_start, run_end,
+               infer_only=args.infer_only)
     if args.all or args.validate:
         run_validation(args.model_name, run_start, run_end)
 

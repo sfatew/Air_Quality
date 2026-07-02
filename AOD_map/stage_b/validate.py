@@ -22,7 +22,7 @@ from scipy import stats
 from config import (
     LATS, LONS, NLAT, NLON, LAT_MAX, LON_MIN, GRID_RES,
     AERONET_SITES, DRY_MONTHS,
-    ST_KRIGING_DIR, RF_OUTPUT_DIR, VALIDATION_DIR,
+    ST_KRIGING_DIR, RF_OUTPUT_DIR, RF_RK_DIR, VALIDATION_DIR,
     TRAIN_START, TRAIN_END, TEST_START, TEST_END,
     RMSE_CONSISTENCY_TOLERANCE,
     SSO_BINS, SSO_LABELS,
@@ -100,6 +100,10 @@ def _candidate_path(slot_utc: datetime, candidate: str) -> Path:
         return kriged_path(slot_utc)
     if candidate == 'rf':
         return gapfilled_path(slot_utc)
+    if candidate == 'rf_rk':
+        # Regression-kriging product (RF drift + kriged residual); same NC
+        # schema as st_kriging, different tree.
+        return kriged_path(slot_utc, out_dir=RF_RK_DIR)
     raise ValueError(f'Unknown candidate {candidate!r}')
 
 

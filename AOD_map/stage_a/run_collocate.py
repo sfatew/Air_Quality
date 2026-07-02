@@ -364,6 +364,11 @@ def cmd_tc_variance(args: argparse.Namespace) -> None:
                     triple[1]: res['sigma2_y'],
                     triple[2]: res['sigma2_z'],
                 },
+                'rho':     {
+                    triple[0]: res['rho_x'],
+                    triple[1]: res['rho_y'],
+                    triple[2]: res['rho_z'],
+                },
                 'n': res['n'],
             })
 
@@ -384,9 +389,12 @@ def cmd_tc_variance(args: argparse.Namespace) -> None:
                 sigma2 = ee
             else:
                 sigma2 = max(float(sigma2), ee)
+            rho_t = entry.get('rho_t', float('nan'))
             sensor_table.setdefault(sensor, {})[f'{region}|{season}'] = {
                 'sigma2':          float(sigma2),
+                'rho_t':           float(rho_t),   # McColl 2014 ρ_{i,t}; NaN if under-sampled
                 'n_triplets':      int(entry.get('n_triplets', 0)),
+                'n_rho_triplets':  int(entry.get('n_rho_triplets', 0)),
                 'n_collocations':  int(entry.get('n_collocations', 0)),
             }
 

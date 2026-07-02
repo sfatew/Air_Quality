@@ -31,6 +31,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Callable, Optional
@@ -42,7 +43,7 @@ from scipy.spatial import cKDTree
 
 from config import (
     LATS, LONS, NLAT, NLON,
-    ST_KRIGING_DIR, MODELS_DIR,
+    ST_KRIGING_DIR, RF_PRED_DIR, RF_RK_DIR, MODELS_DIR,
     B1_W_SPACE_KM, B1_W_TIME_H,
     B1_MAX_NEIGHBOURS, B1_MIN_NEIGHBOURS,
     B1_VARIOGRAM_SUBSAMPLE,
@@ -66,6 +67,52 @@ METHOD_TAG = 'st_kriging'
 METHOD_VERSION = 'v2.0'   # metric variogram on (AOD − CAMS) residual
 
 LAT_2D, LON_2D = np.meshgrid(LATS, LONS, indexing='ij')
+
+
+# ── Drift / trend provider ───────────────────────────────────────────────────
+# Kriging here is regression kriging: krige a residual (AOD − trend) and add the
+# trend back at the target.  `target_kind` selects the trend field:
+#   'aod'             — no trend (ordinary kriging of raw AOD).
+#   'aod_minus_cams'  — trend = CAMS reanalysis (the existing B1 baseline).
+#   'aod_minus_rf'    — trend = full-grid RF prediction ŷ_rf (regression kriging
+#                       B3); reads the precomputed RF_PRED_DIR tree so the ±time
+#                       window doesn't re-run the RF.  Better drift than CAMS →
+#                       smaller, more stationary residual → refit the variogram.
+_TREND_KINDS = ('aod_minus_cams', 'aod_minus_rf')
+
+
+@lru_cache(maxsize=192)
+def _rf_pred_slot(slot_utc: datetime) -> Optional[np.ndarray]:
+    """Read the precomputed full-grid RF prediction ŷ_rf for one slot, or None
+    if it hasn't been generated (run rf_gapfill.predict_range first)."""
+    path = (RF_PRED_DIR / f'{slot_utc.year:04d}' / f'{slot_utc.month:02d}'
+            / f'{slot_utc.day:02d}' / f'pred_{slot_utc:%Y%m%d_%H%M}.nc')
+    if not path.exists():
+        return None
+    try:
+        with nc.Dataset(path) as ds:
+            arr = np.ma.filled(ds.variables['rf_pred'][:].astype(np.float32), np.nan)
+    except (OSError, KeyError):
+        return None
+    arr = np.where(arr <= -9990.0, np.nan, arr)
+    return arr
+
+
+def _trend_field(slot_utc: datetime, target_kind: str) -> Optional[np.ndarray]:
+    """Trend grid to subtract before kriging / add back after, or None to skip
+    this slot (trend unavailable).  `target_kind='aod'` returns None by design
+    (no trend), which callers treat as 'no subtraction'."""
+    if target_kind == 'aod_minus_cams':
+        return cams_aod_slot(slot_utc)
+    if target_kind == 'aod_minus_rf':
+        return _rf_pred_slot(slot_utc)
+    return None
+
+
+def _product_dir(target_kind: str) -> Path:
+    """Output tree for a given trend kind — RK writes to its own tree so it sits
+    alongside `st_kriging` and `rf` for the intercomparison notebook."""
+    return RF_RK_DIR if target_kind == 'aod_minus_rf' else ST_KRIGING_DIR
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -291,13 +338,22 @@ def fit_variogram(obs_lat, obs_lon, obs_time_h, obs_val) -> MetricVariogram:
 _VGM_PATH = MODELS_DIR / 'st_variogram.json'
 
 
-def save_variogram(vgm: MetricVariogram, path: Optional[Path] = None) -> Path:
-    path = path or _VGM_PATH
+def _vgm_path(target_kind: str = B1_VARIOGRAM_TARGET) -> Path:
+    """Variogram file for a trend kind.  RK keeps its own so the RF-residual
+    variogram never clobbers the CAMS-residual baseline."""
+    if target_kind == 'aod_minus_rf':
+        return MODELS_DIR / 'st_variogram_rf.json'
+    return _VGM_PATH
+
+
+def save_variogram(vgm: MetricVariogram, path: Optional[Path] = None,
+                   target_kind: str = B1_VARIOGRAM_TARGET) -> Path:
+    path = path or _vgm_path(target_kind)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         'kind':   'metric',
         'spec':   B1_VARIOGRAM_SPEC,
-        'target': B1_VARIOGRAM_TARGET,
+        'target': target_kind,
         'metric': {'var': vgm.metric.var,
                    'len_scale': vgm.metric.len_scale,
                    'nugget': vgm.metric.nugget},
@@ -339,8 +395,10 @@ def collect_training_pairs(
       'aod'             — returns Stage A AOD directly.
       'aod_minus_cams'  — returns (Stage A − CAMS) residual; slots without
                           CAMS coverage are skipped entirely.
+      'aod_minus_rf'    — returns (Stage A − ŷ_rf) residual; slots without a
+                          precomputed RF prediction are skipped entirely.
     """
-    if target_kind not in ('aod', 'aod_minus_cams'):
+    if target_kind not in ('aod', *_TREND_KINDS):
         raise ValueError(f'Unknown target_kind={target_kind!r}')
     rng = np.random.default_rng(rng_seed)
     epoch = datetime(start.year, start.month, start.day)
@@ -357,12 +415,12 @@ def collect_training_pairs(
                 continue
             valid = np.isfinite(payload['aod']) & (payload['aod'] >= 0)
 
-            cams_field = None
-            if target_kind == 'aod_minus_cams':
-                cams_field = cams_aod_slot(slot_utc)
-                if cams_field is None:
+            trend_field = None
+            if target_kind in _TREND_KINDS:
+                trend_field = _trend_field(slot_utc, target_kind)
+                if trend_field is None:
                     continue
-                valid &= np.isfinite(cams_field)
+                valid &= np.isfinite(trend_field)
 
             rows, cols = np.where(valid)
             if rows.size == 0:
@@ -371,8 +429,8 @@ def collect_training_pairs(
             pick = rng.choice(rows.size, size=n_take, replace=False)
             r = rows[pick]; c = cols[pick]
             aod = payload['aod'][r, c].astype(np.float64)
-            if target_kind == 'aod_minus_cams':
-                aod = aod - cams_field[r, c].astype(np.float64)
+            if target_kind in _TREND_KINDS:
+                aod = aod - trend_field[r, c].astype(np.float64)
             lats.append(LATS[r])
             lons.append(LONS[c])
             t_hours = (slot_utc - epoch).total_seconds() / 3600.0
@@ -393,7 +451,33 @@ def fit_and_save_variogram(start: date = TRAIN_START,
         start, end, target_kind=target_kind, progress=progress,
     )
     vgm = fit_variogram(lat, lon, t_h, val)
-    save_variogram(vgm)
+    save_variogram(vgm, target_kind=target_kind)
+    return vgm
+
+
+def fit_and_save_rk_variogram_oof(
+    bundle_name: str = 'rf_default_residual',
+    holdout_fraction: float = 0.20,
+    progress: Optional[Callable] = None,
+) -> MetricVariogram:
+    """Fit the regression-kriging variogram on OUT-OF-FOLD RF residuals.
+
+    This is the correct RK variogram: in-sample train residuals are degenerate
+    (memorised bias), and the test window is off-limits.  A single temporal
+    holdout inside train yields honest out-of-sample residual structure.  Uses
+    the production bundle's hyperparams so the holdout model matches the drift
+    model actually shipped.  Saves to the RK variogram slot (`aod_minus_rf`).
+    """
+    from rf_gapfill import collect_oof_residual_pairs, load_bundle  # lazy: heavy deps
+    bundle = load_bundle(bundle_name)
+    lat, lon, t_h, resid = collect_oof_residual_pairs(
+        holdout_fraction=holdout_fraction,
+        hp=bundle.hyperparams,
+        target_kind=bundle.target_kind,
+        progress=progress,
+    )
+    vgm = fit_variogram(lat, lon, t_h, resid)
+    save_variogram(vgm, path=_vgm_path('aod_minus_rf'), target_kind='aod_minus_rf')
     return vgm
 
 
@@ -422,19 +506,19 @@ def _gather_window_observations(target_utc: datetime,
                 continue
             valid = np.isfinite(payload['aod']) & (payload['aod'] >= 0)
 
-            cams_field = None
-            if target_kind == 'aod_minus_cams':
-                cams_field = cams_aod_slot(s_utc)
-                if cams_field is None:
+            trend_field = None
+            if target_kind in _TREND_KINDS:
+                trend_field = _trend_field(s_utc, target_kind)
+                if trend_field is None:
                     continue
-                valid &= np.isfinite(cams_field)
+                valid &= np.isfinite(trend_field)
 
             r, c = np.where(valid)
             if r.size == 0:
                 continue
             aod = payload['aod'][r, c].astype(np.float64)
-            if target_kind == 'aod_minus_cams':
-                aod = aod - cams_field[r, c].astype(np.float64)
+            if target_kind in _TREND_KINDS:
+                aod = aod - trend_field[r, c].astype(np.float64)
             pool_lat.append(LATS[r])
             pool_lon.append(LONS[c])
             pool_t.append(np.full(r.size, dt_h, dtype=np.float64))
@@ -526,8 +610,8 @@ def _krige_target(tgt_lat: float, tgt_lon: float,
 
 # ── Output file path + writer ────────────────────────────────────────────────
 
-def kriged_path(slot_utc: datetime) -> Path:
-    return (ST_KRIGING_DIR
+def kriged_path(slot_utc: datetime, out_dir: Path = ST_KRIGING_DIR) -> Path:
+    return (out_dir
             / f'{slot_utc.year:04d}'
             / f'{slot_utc.month:02d}'
             / f'{slot_utc.day:02d}'
@@ -539,8 +623,9 @@ def _write_slot(slot_utc: datetime,
                  is_observed: np.ndarray,
                  uncertainty: np.ndarray,
                  weight_sum: np.ndarray,
-                 training_window: str = '') -> Path:
-    out = kriged_path(slot_utc)
+                 training_window: str = '',
+                 out_dir: Path = ST_KRIGING_DIR) -> Path:
+    out = kriged_path(slot_utc, out_dir=out_dir)
     out.parent.mkdir(parents=True, exist_ok=True)
     s_idx = slot_index(slot_utc)
     with nc.Dataset(out, 'w', format='NETCDF4') as ds:
@@ -589,6 +674,13 @@ def krige_slot(slot_utc: datetime, vgm: MetricVariogram,
     target_kind='aod_minus_cams' (default): the kriger predicts a residual and
     CAMS is added back at the target cell.  Cells where CAMS is unavailable at
     the target slot are left as NaN.
+
+    target_kind='aod_minus_rf' (regression kriging B3): identical machinery, but
+    the drift added back at the target is the precomputed RF prediction ŷ_rf.
+    Cells where ŷ_rf is unavailable stay NaN.  Falls back to ŷ_rf wherever the
+    residual pool is empty (kriged residual → not written, cell left NaN); to
+    keep the graceful RF fallback, unfilled gap cells are backfilled with ŷ_rf
+    below.
     """
     payload = load_slot(slot_utc)
     if payload is not None:
@@ -605,10 +697,10 @@ def krige_slot(slot_utc: datetime, vgm: MetricVariogram,
 
     missing = np.argwhere(~is_observed)
     if missing.size > 0:
-        cams_target = None
-        if target_kind == 'aod_minus_cams':
-            cams_target = cams_aod_slot(slot_utc)
-            # Cells with no CAMS coverage stay NaN — handled per-pixel below.
+        trend_target = None
+        if target_kind in _TREND_KINDS:
+            trend_target = _trend_field(slot_utc, target_kind)
+            # Cells with no trend coverage stay NaN — handled per-pixel below.
 
         pool = _gather_window_observations(slot_utc, B1_W_TIME_H,
                                             target_kind=target_kind)
@@ -619,15 +711,24 @@ def krige_slot(slot_utc: datetime, vgm: MetricVariogram,
                                           pool, tree, vgm)
                 if not np.isfinite(est):
                     continue
-                if target_kind == 'aod_minus_cams':
-                    if cams_target is None or not np.isfinite(cams_target[r, c]):
+                if target_kind in _TREND_KINDS:
+                    if trend_target is None or not np.isfinite(trend_target[r, c]):
                         continue
-                    est = est + float(cams_target[r, c])
+                    est = est + float(trend_target[r, c])
                 final[r, c]       = np.float32(np.clip(est, 0.0, 5.0))
                 uncertainty[r, c] = np.float32(var)
 
+        # Regression-kriging graceful fallback: any gap cell the residual pool
+        # couldn't reach (no neighbours in the ±time window) falls back to the
+        # pure RF drift ŷ_rf — i.e. kriged residual r̂ → 0, ŷ = ŷ_rf.  This is
+        # the whole point of RK: never worse than the RF baseline in a gap.
+        if target_kind == 'aod_minus_rf' and trend_target is not None:
+            gap = ~is_observed & ~np.isfinite(final) & np.isfinite(trend_target)
+            final[gap] = np.clip(trend_target[gap], 0.0, 5.0).astype(np.float32)
+
+    out_dir = _product_dir(target_kind)
     return _write_slot(slot_utc, final, is_observed, uncertainty, weight_sum,
-                        training_window=training_window)
+                        training_window=training_window, out_dir=out_dir)
 
 
 # ── End-to-end driver ───────────────────────────────────────────────────────
@@ -636,18 +737,21 @@ def krige_slot(slot_utc: datetime, vgm: MetricVariogram,
 # in its initializer, then re-uses it across all slots it processes.  This is
 # more robust than pickling gstools CovModel instances across the pipe.
 _WORKER_VGM: Optional[MetricVariogram] = None
+_WORKER_TARGET_KIND: str = B1_VARIOGRAM_TARGET
 
 
-def _init_worker():
-    global _WORKER_VGM
+def _init_worker(vgm_path_str: str, target_kind: str):
+    global _WORKER_VGM, _WORKER_TARGET_KIND
     os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
-    _WORKER_VGM = load_variogram()
+    _WORKER_VGM = load_variogram(Path(vgm_path_str))
+    _WORKER_TARGET_KIND = target_kind
 
 
 def _worker_krige_slot(args: tuple[datetime, str]) -> bool:
     slot_utc, training_window = args
     try:
-        krige_slot(slot_utc, _WORKER_VGM, training_window=training_window)
+        krige_slot(slot_utc, _WORKER_VGM, training_window=training_window,
+                   target_kind=_WORKER_TARGET_KIND)
         return True
     except Exception:
         return False
@@ -659,32 +763,39 @@ def run(start: date,
         training_window: Optional[str] = None,
         overwrite: bool = False,
         refit_variogram: bool = False,
+        target_kind: str = B1_VARIOGRAM_TARGET,
         progress: Optional[Callable] = None,
         n_workers: Optional[int] = None) -> int:
-    """B1 over [start, end].  Optionally fits the variogram first.
+    """Kriging over [start, end].  Optionally fits the variogram first.
 
-    Writes one NC per slot under `ST_KRIGING_DIR/YYYY/MM/DD/aod_*.nc`.
-    Cells the kriger cannot estimate are left as NaN (Yang & Hu 2018).
+    `target_kind` selects the drift (see the module-level trend-provider note):
+    the default CAMS-residual baseline writes to `ST_KRIGING_DIR`; 'aod_minus_rf'
+    is regression kriging (B3) and writes to `RF_RK_DIR` — run
+    `rf_gapfill.predict_range` first so the RF drift tree exists.
+    Cells the kriger cannot estimate are left as NaN (Yang & Hu 2018), except RK
+    gap cells with no neighbours, which fall back to ŷ_rf (see krige_slot).
 
     Parallelism: by default uses `os.cpu_count() - 1` worker processes.  Pass
     `n_workers=1` for a serial (debuggable) run, or any positive int to cap.
     """
+    vgm_path = _vgm_path(target_kind)
     if vgm is None:
-        if _VGM_PATH.exists() and not refit_variogram:
-            vgm = load_variogram()
+        if vgm_path.exists() and not refit_variogram:
+            vgm = load_variogram(vgm_path)
         else:
-            vgm = fit_and_save_variogram(progress=progress)
+            vgm = fit_and_save_variogram(target_kind=target_kind, progress=progress)
     # Workers load the variogram from disk; make sure it's there.
-    if not _VGM_PATH.exists():
-        save_variogram(vgm)
+    if not vgm_path.exists():
+        save_variogram(vgm, path=vgm_path, target_kind=target_kind)
 
     if training_window is None:
         training_window = f'{TRAIN_START.isoformat()} to {TRAIN_END.isoformat()}'
 
+    out_dir = _product_dir(target_kind)
     slots: list[datetime] = []
     for d in iter_local_days(start, end):
         for slot_utc in iter_window_slots(d):
-            if kriged_path(slot_utc).exists() and not overwrite:
+            if kriged_path(slot_utc, out_dir=out_dir).exists() and not overwrite:
                 continue
             slots.append(slot_utc)
     if not slots:
@@ -694,19 +805,21 @@ def run(start: date,
         n_workers = max(1, (os.cpu_count() or 2) - 1)
 
     if n_workers <= 1:
-        iterator = progress(slots, desc='B1 ST-krige') if progress is not None else slots
+        iterator = progress(slots, desc='ST-krige') if progress is not None else slots
         n_written = 0
         for slot_utc in iterator:
-            krige_slot(slot_utc, vgm, training_window=training_window)
+            krige_slot(slot_utc, vgm, training_window=training_window,
+                       target_kind=target_kind)
             n_written += 1
         return n_written
 
     args_iter = [(s, training_window) for s in slots]
     n_written = 0
-    with Pool(processes=n_workers, initializer=_init_worker) as pool:
+    with Pool(processes=n_workers, initializer=_init_worker,
+              initargs=(str(vgm_path), target_kind)) as pool:
         result_iter = pool.imap_unordered(_worker_krige_slot, args_iter, chunksize=1)
         if progress is not None:
-            result_iter = progress(result_iter, total=len(slots), desc='B1 ST-krige')
+            result_iter = progress(result_iter, total=len(slots), desc='ST-krige')
         for ok in result_iter:
             if ok:
                 n_written += 1

@@ -1,0 +1,25 @@
+variant,cv,fold,status,lcs_weight,beta,a,b,pair_hours,inner,reason
+C,site,fold_0,done,0.25,,,,,"none,none,none,none,none",
+C,site,fold_1,done,0.5,,,,,"none,none,none,none,none",
+C,site,fold_2,done,0.25,,,,,"none,none,none,none,none",
+C,site,fold_3,done,0.5,,,,,"none,none,none,none,none",
+C,site,fold_4,done,0.5,,,,,"none,none,none,none,none",
+C,temporal,fold_0,done,0.5,,,,,"none,none,none,none,none",
+D,site,fold_0,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+D,site,fold_1,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+D,site,fold_2,skipped_not_identifiable,,,,,,,no collocated LCS–KK pair available in the training data
+D,site,fold_3,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+D,site,fold_4,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+D,temporal,fold_0,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+D_all,site,fold_0,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+D_all,site,fold_1,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+D_all,site,fold_2,skipped_not_identifiable,,,,,,,no collocated LCS–KK pair available in the training data
+D_all,site,fold_3,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+D_all,site,fold_4,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+D_all,temporal,fold_0,done,1.0,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+E,site,fold_0,done,0.5,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+E,site,fold_1,done,0.1,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+E,site,fold_2,skipped_not_identifiable,,,,,,,no collocated LCS–KK pair available in the training data
+E,site,fold_3,done,0.5,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+E,site,fold_4,done,0.5,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",
+E,temporal,fold_0,done,0.5,0.0752356058822274,1.0222325844593079,-5.78278263901366,977.0,"not_identifiable,fitted,fitted,fitted,fitted",

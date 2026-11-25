@@ -1,0 +1,33 @@
+{('Bac_Giang', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Bac_Giang', '20'): Empty DataFrame
+Columns: []
+Index: [], ('Bac_Lieu', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Bac_Lieu', '20'): Empty DataFrame
+Columns: []
+Index: [], ('Bach_Long_Vy', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Bach_Long_Vy', '20'): Empty DataFrame
+Columns: []
+Index: [], ('NGHIA_DO', '10'): Empty DataFrame
+Columns: []
+Index: [], ('NGHIA_DO', '20'): Empty DataFrame
+Columns: []
+Index: [], ('NhaTrang', '10'): Empty DataFrame
+Columns: []
+Index: [], ('NhaTrang', '20'): Empty DataFrame
+Columns: []
+Index: [], ('Red_River_Delta', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Red_River_Delta', '20'): Empty DataFrame
+Columns: []
+Index: [], ('Son_La', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Son_La', '20'): Empty DataFrame
+Columns: []
+Index: [], ('Yen_Bai', '10'): Empty DataFrame
+Columns: []
+Index: [], ('Yen_Bai', '20'): Empty DataFrame
+Columns: []
+Index: []}

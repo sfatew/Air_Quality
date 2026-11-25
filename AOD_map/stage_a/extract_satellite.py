@@ -50,7 +50,7 @@ def _make_bar(iterable, **kwargs):
 from config import (
     AERONET_SITES,
     EXTRACT_DIR,
-    NLAT, NLON, SLOT_MINUTES,
+    NLAT, NLON, SLOT_MINUTES, SLOTS_PER_DAY,
     COLLOCATE_SPATIAL_FLAG_EXACT, COLLOCATE_SPATIAL_FLAG_3X3, COLLOCATE_SPATIAL_FLAG_5X5,
     BOX_STD_ABS_FLOOR, BOX_STD_SLOPE,
 )
@@ -58,7 +58,7 @@ from gridder import station_cell
 from grid    import read_gridded_slot, ALL_SENSORS
 
 
-_SLOTS_PER_DAY = (24 * 60) // SLOT_MINUTES
+_SLOTS_PER_DAY = SLOTS_PER_DAY
 
 
 # ── Grid-cell neighbourhood sampling ─────────────────────────────────────────

@@ -7,9 +7,10 @@ Window discovery follows stage_b_fixes §0:
   3. If ≥ WINDOW_MIN_SLOTS_PRESENT: window = [min(HHMM), max(HHMM)].
   4. Else: 7-day median fallback over ±WINDOW_MEDIAN_HALF_DAYS.
 
-All slot indexing uses **slot_idx ∈ [0, 47]** (every 30-min slot in a day),
-not a hard-coded daytime range — Vietnam's daytime varies with latitude and
-season and the early-draft 00:00–09:30 UTC cap was too narrow.
+All slot indexing uses **slot_idx ∈ [0, SLOTS_PER_DAY)** (every
+SLOT_MINUTES-wide slot in a day), not a hard-coded daytime range —
+Vietnam's daytime varies with latitude and season and the early-draft
+00:00–09:30 UTC cap was too narrow.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import numpy as np
 import netCDF4 as nc
 
 from config import (
-    NLAT, NLON, MERGED_DIR, SLOTS_PER_DAY,
+    NLAT, NLON, MERGED_DIR, SLOT_MINUTES, SLOTS_PER_DAY,
     WINDOW_MEDIAN_HALF_DAYS, WINDOW_MIN_SLOTS_PRESENT,
 )
 
@@ -33,14 +34,15 @@ _FNAME_RE = re.compile(r'merged_\d{8}_(\d{4})\.nc$')
 
 
 def slot_idx_from_hhmm(hhmm: int) -> int:
-    """Map HHMM int (e.g. 0730) → slot_idx in [0, 47]."""
+    """Map HHMM int (e.g. 0730) → slot_idx in [0, SLOTS_PER_DAY)."""
     h, m = divmod(hhmm, 100)
-    return h * 2 + (m // 30)
+    return (h * 60 + m) // SLOT_MINUTES
 
 
 def hhmm_from_slot_idx(slot_idx: int) -> int:
-    h, half = divmod(slot_idx, 2)
-    return h * 100 + half * 30
+    minutes = slot_idx * SLOT_MINUTES
+    h, m = divmod(minutes, 60)
+    return h * 100 + m
 
 
 def slot_utc_from_idx(day: date, slot_idx: int) -> datetime:
@@ -156,8 +158,8 @@ def load_slot(slot_utc: datetime) -> Optional[dict]:
 
 
 def slot_index(slot_utc: datetime) -> int:
-    """Slot index 0..47 for a slot timestamp (no daytime restriction)."""
-    return slot_utc.hour * 2 + (slot_utc.minute // 30)
+    """Slot index 0..SLOTS_PER_DAY-1 for a slot timestamp (no daytime restriction)."""
+    return (slot_utc.hour * 60 + slot_utc.minute) // SLOT_MINUTES
 
 
 # ── Iteration helpers ───────────────────────────────────────────────────────

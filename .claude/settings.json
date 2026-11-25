@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p /home/work1/projects/Air_Quality/pm25_map/aqi_features/figures *)",
+      "Bash(awk -F',' 'NR==1 {print $1; next} {print $1; if \\(NR>20\\) exit}' \"/home/slow_data/Air_Quality/Himawari/stations_aod_v4/L2/Bắc Giang: Số 1 đ. Hùng Vương - P. Lê Lợi - TP. Bắc Giang \\(KK\\).csv\")",
+      "Bash(awk -F',' 'NR==1 {print \"header:\", $1; next} {h=substr\\($1,12,2\\); count[h]++} END {for \\(h in count\\) print h, count[h]}' \"/home/slow_data/Air_Quality/Himawari/stations_aod_v4/L2/Bắc Giang: Số 1 đ. Hùng Vương - P. Lê Lợi - TP. Bắc Giang \\(KK\\).csv\")",
+      "Bash(awk -F',' 'NR==1 {next} {h=substr\\($1,12,2\\); count[h]++} END {for \\(h in count\\) print h, count[h]}' \"/home/slow_data/Air_Quality/AQI/process/Bắc Giang Số 1 đ. Hùng Vương - P. Lê Lợi - TP. Bắc Giang \\(KK\\).csv\")",
+      "Bash(rm -f aqi_features.ipynb _build_features_notebook.py merged_daily.pkl correlation_summary.csv feature_summary.csv)",
+      "Bash(mkdir -p .cache figures)",
+      "Bash(tee /tmp/hima_exec.log)",
+      "Bash(pwdx 1620906)",
+      "Bash(ps --ppid 1620906 -o pid,cmd)",
+      "Bash(tee /tmp/modis_exec.log)",
+      "Bash(tee /tmp/viirs_exec.log)",
+      "Bash(awk -F',' 'NR>1 {print $5}' /home/work1/projects/Air_Quality/Masterdata/station_pop_landscan.csv)",
+      "Bash(pip install *)",
+      "Bash(tee /tmp/model_quick.log)",
+      "Bash(tee /tmp/model_full.log)",
+      "Bash(kill 1667278 1667298)",
+      "Bash(rm -fv /home/work1/projects/Air_Quality/pm25_map/aqi_features/.cache/*.pkl)",
+      "Bash(tee /tmp/modis_re.log)",
+      "Bash(tee /tmp/viirs_re.log)",
+      "Bash(tee /tmp/hima_re.log)",
+      "Bash(tee /tmp/modis_re2.log)",
+      "Bash(tee /tmp/viirs_re2.log)",
+      "Bash(pandoc --version)",
+      "Bash(pip3 install *)",
+      "Bash(/home/work1/anaconda3/envs/Airqua_env/bin/python pm25_map/features/aod/process_aod.py --provider viirs --dry-run)",
+      "Bash(bc)",
+      "Bash(rm /home/work1/projects/Air_Quality/pm25_map/model/train.py && ls /home/work1/projects/Air_Quality/pm25_map/model/train*.py 2>/dev/null; echo \"---\"; python -c \"import train_v2; print\\('still importable, OK'\\)\")",
+      "Bash(rm /home/work1/projects/Air_Quality/pm25_map/features/aqi/merge_historical_pre2022.py && cd /home/work1/projects/Air_Quality/pm25_map/features/aqi && python -c \"import ast; ast.parse\\(open\\('add_spatial_tempo.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\" && python add_spatial_tempo.py --help 2>&1 | head -25)",
+      "Bash(xargs -I{} basename {})"
+    ],
+    "additionalDirectories": [
+      "/home/work1/projects/Air_Quality/pm25_map/aqi_features",
+      "/tmp",
+      "/home/work1/projects/Air_Quality/pm25_map/model/output",
+      "/home/work1/projects/Air_Quality/pm25_map/aqi_features/.cache",
+      "/home/work1/projects/Air_Quality/pm25_map/model"
+    ]
+  }
+}

@@ -97,7 +97,7 @@ from config import (
     AERONET_SITES,
     NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
     NLAT, NLON, LATS, LONS,
-    SLOT_MINUTES,
+    SLOT_MINUTES, SLOTS_PER_DAY,
     SOFT_CAL_FILE,
     SOFT_CAL_ALPHA_MIN, SOFT_CAL_ALPHA_MAX,
     SOFT_CAL_BETA_ABSMAX,
@@ -199,13 +199,13 @@ class SoftCal:
 # ── Training-pair collection from gridded slots ──────────────────────────────
 
 def _enumerate_train_slots(train_start: date, train_end: date) -> list[datetime]:
-    """All 30-min UTC slot centres in [train_start, train_end] inclusive."""
+    """All UTC slot centres in [train_start, train_end] inclusive."""
     out: list[datetime] = []
     d = train_start
     end = train_end
     while d <= end:
         base = datetime(d.year, d.month, d.day)
-        for i in range(48):
+        for i in range(SLOTS_PER_DAY):
             out.append(base + timedelta(minutes=i * SLOT_MINUTES))
         d += timedelta(days=1)
     return out

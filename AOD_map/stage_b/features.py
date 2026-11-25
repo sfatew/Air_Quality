@@ -42,6 +42,7 @@ from config import (
 import ancillary as anc
 from slots import (
     load_slot, iter_local_days, iter_window_slots, slot_index,
+    slot_utc_from_idx,
 )
 
 
@@ -277,10 +278,11 @@ def build_feature_grid(
     if 'lon_rad' in legacy_needed:
         grids['lon_rad'] = _LEGACY_LON_RAD
     if 'tp' in legacy_needed:
-        # Hit the IMERG LRU rather than the uncached public reader — the
-        # 6 h / 24 h / hours_since_rain calls above just populated it for
-        # this slot, so this is a cache hit.
-        imerg = anc._imerg_slot_cached(slot_utc)
+        # Sum the SLOT_MINUTES/30 native IMERG tiles that fall in the slot,
+        # so `tp` represents rainfall over the full slot duration at both
+        # 30-min (one tile) and hourly (two tiles) cadences.  The underlying
+        # tiles are LRU-cached by the 6h/24h walks above, so this is cheap.
+        imerg = anc.imerg_slot_total(slot_utc)
         grids['tp'] = imerg if imerg is not None else _nan_grid()
 
     for feat in columns:
@@ -529,8 +531,7 @@ def build_training_table(
     X_rows, y_vals = [], []
     meta = {'date': [], 'slot_idx': [], 'row': [], 'col': [], 'aod_decile': []}
     for d, s_idx in iterator2:
-        slot_utc = datetime(d.year, d.month, d.day,
-                            (s_idx // 2), (s_idx % 2) * 30)
+        slot_utc = slot_utc_from_idx(d, s_idx)
         payload = load_slot(slot_utc)
         if payload is None:
             continue

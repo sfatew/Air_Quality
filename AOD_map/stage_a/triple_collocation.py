@@ -328,7 +328,7 @@ def collect_stratum_triplets(
     # the math (e.g. notebooks).
     from datetime import datetime, timedelta
     from config import (
-        SLOT_MINUTES, DRY_MONTHS,
+        SLOT_MINUTES, SLOTS_PER_DAY, DRY_MONTHS,
         NORTH_CENTRAL_LAT, CENTRAL_SOUTH_LAT,
         LATS, REGIONS, SEASONS,
         TC_INPUT_SPACE,
@@ -374,7 +374,7 @@ def collect_stratum_triplets(
     d = train_start
     while d <= train_end:
         base = datetime(d.year, d.month, d.day)
-        for i in range(48):
+        for i in range(SLOTS_PER_DAY):
             slots.append(base + timedelta(minutes=i * SLOT_MINUTES))
         d += timedelta(days=1)
     if sample_every_n_slots > 1:

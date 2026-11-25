@@ -1,9 +1,25 @@
 {
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
     "python-envs.pythonProjects": [
         {
-            "path": "",
+            "path": "pm25_map/paper",
             "envManager": "ms-python.python:conda",
             "packageManager": "ms-python.python:conda"
         }
     ],
+    // manuscript/: biên dịch bằng Tectonic (~/.local/bin), xem PDF ở tab bên cạnh
+    "latex-workshop.latex.tools": [
+        {
+            "name": "tectonic",
+            "command": "/home/work1/.local/bin/tectonic",
+            "args": ["--synctex", "--keep-logs", "--keep-intermediates", "%DOC%.tex"]
+        }
+    ],
+    "latex-workshop.latex.recipes": [
+        { "name": "tectonic", "tools": ["tectonic"] }
+    ],
+    "latex-workshop.latex.recipe.default": "first",
+    "latex-workshop.latex.autoBuild.run": "onSave",
+    "latex-workshop.view.pdf.viewer": "tab",
 }

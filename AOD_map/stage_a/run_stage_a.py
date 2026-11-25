@@ -63,7 +63,7 @@ except ImportError:
 from config import (
     LATS, LONS, NLAT, NLON,
     MERGED_DIR,
-    SLOT_MINUTES,
+    SLOT_MINUTES, SLOTS_PER_DAY,
 )
 from grid            import read_gridded_slot
 from physics         import apply_physics_correction, close_era5
@@ -80,9 +80,6 @@ _SENSOR_KEYS = {
     'viirs':    ['viirs_snpp', 'viirs_noaa20'],
     'modis':    ['modis_maiac'],
 }
-
-SLOTS_PER_DAY = 48
-
 
 # ── Environment banner ────────────────────────────────────────────────────────
 
@@ -282,7 +279,7 @@ def run_day(
     dry_run: bool = False,
     show_slot_bar: bool = False,
 ) -> tuple[int, int]:
-    """Process all 48 slots for one calendar day.  Returns (n_written, n_errors)."""
+    """Process every slot in one calendar day.  Returns (n_written, n_errors)."""
     written = 0
     errors  = 0
     skipped = 0

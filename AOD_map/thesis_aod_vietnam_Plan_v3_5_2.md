@@ -1,0 +1,1017 @@
+# High spatiotemporal AOD Mapping of Vietnam: Multi-Source Satellite Fusion with Bias Correction and Spatiotemporal Gap-Filling
+
+### Thesis Framework & Methodology — Draft 3.5.2
+
+> **What moved from v3.5.1 → v3.5.2 (physics-normalisation relocation, 2026-06-25).** Step A3 (physics normalisation, `AOD_phys = AOD_merged × (1 − RH/100)^γ / PBLH`) has been **removed from Stage A** and reframed as a post-processing transform applied to the Stage B per-slot outputs before the §8.2.6 / RQ4 PM2.5 R² comparison. Rationale: (a) physics normalisation does not feed back into Stage A bias correction or fusion (this was already explicit in v3.5.1 §7.3's ordering note — calibration and fusion operate on raw column AOD because AERONET measures raw column AOD); (b) the lift from the correction (r = 0.110 → 0.162 hourly, per §5.2 #7) materialises only in the PM2.5 coupling step, not in the column-AOD product itself; (c) keeping the merged Stage A and gap-filled Stage B outputs as pure column-AOD fields means they remain directly comparable to AERONET, MERRA-2, CAMS, and Gupta 2024 / Ahn 2021 baselines without an extra dimensional adjustment. The physics-normalisation methodology itself (γ = 0.6 Kotchenruther & Hobbs 1998, PBLH ≥ 50 m floor, ERA5 RH/PBLH bilinearly interpolated to 0.05° and nearest-hour matched to slot centre) is unchanged; only its placement in the pipeline moves. Stage A NetCDF outputs no longer carry `AOD_phys_corrected` or the ERA5 RH/PBLH provenance fields; the post-processing tree at `STAGE_B_DIR/output_aggregated/{st_kriging,rf}_phys_daily/` carries them instead. Sections touched: §4.4 (ERA5 row), §5.2 #7, §6 (overview diagram), §7.3 (removed; placeholder forwards to §8.2.6), §7.5 (output schema), §8.2.6 (post-processing chain described), §10 #14, §11 (scope), §12 (timeline). RQ1–RQ4 wording is unchanged; the Stage A architectural pivot (MERRA-2 anchor + TC σ² fusion) is unchanged; Stage B B1/B2 methodology is unchanged.
+>
+> **What moved from v3.4.0 → v3.5.0.** This revision absorbs `stage_b_fixes.md` and reconciles the plan with the implementation actually living in `stage_a/` and `stage_b/`. The architectural pivot of v3.4.0 (AERONET-independent bias correction via MERRA-2 and AERONET-independent fusion weights via triple collocation) is unchanged. Stage B has been substantially rewritten: the v3.4 daily aggregation (old §7.6) is **deleted**, and Stage B now runs end-to-end at 30-min cadence as **two parallel products** — B1 spatiotemporal kriging and B2 Random Forest gap-fill (Youn 2024 / Chen 2023 SIM at 30-min). The Chen 2023 TIM upsampler and the old v3.4 §7.8.2 RF + DNN "Candidate 2" are dropped. The output schema becomes two parallel product trees. Validation is re-cut for slot-level head-to-head comparison.
+>
+> **What moved from v3.5.0 → v3.5.1 (code-reconciliation refresh, 2026-06-23).** v3.5.0 was written against the design captured by `stage_b_fixes.md`; the live code in `stage_a/` and `stage_b/` has since drifted in five load-bearing places. v3.5.1 promotes those drifts from the §14 register into the body. None of them touch Stage A's architectural pivot (MERRA-2 anchor + TC σ² fusion); the gap-fill methodology pivots are inside B1 and B2.
+>
+> 1. **Sum-metric → single-component metric variogram (§7.7.2).** The §4 empirical-variogram diagnostic showed the data cannot constrain three components — most (h_s, h_t) bins held < 30 pairs and the temporal axis has a structural day-night hole. Replaced with one CovModel + anisotropy `k` (four fitted parameters, not seven). Live: `B1_VARIOGRAM_SPEC = {'metric': 'Exponential'}`.
+> 2. **Residual target for both B1 and B2 (§7.7.2, §7.8.3).** Both gap-fillers now predict the **(AOD − CAMS) residual** by default and add CAMS back at the target cell. For B1 this gives a more stationary, smaller-range field with a sill that matches its variance. For B2 this kills the ≈66 % CAMS feature-importance domination observed in the original `rf_tuned` bundle and flattens the regression-to-the-mean envelope on AOD > 1.5 events. Live: `B1_VARIOGRAM_TARGET = 'aod_minus_cams'`, `RF_TARGET_KIND = 'aod_minus_cams'`. The legacy direct-AOD RF bundle (`rf_tuned.joblib`) is preserved for the §8 A/B comparison; production bundle name flips to `rf_tuned_residual.joblib`.
+> 3. **RF feature pool rebuilt — 19 → 24 predictors (§7.8.1).** Dropped: `lat_rad`, `lon_rad` (RF was using them as a thinly-veiled lookup table), `tp` (a single-slot precip snapshot carries no aerosol-washout memory). Added: `precip_6h`, `precip_24h`, `hours_since_rain_0p1mm` (antecedent precipitation with dry-spell clock), `hour_sin`, `hour_cos`, `month_sin`, `month_cos` (cyclical temporal context — without these the RF re-derives the diurnal cycle through ssrd + t2m proxies), `cams_aod_lag_3h` (3 h CAMS transport lag matching CAMS native 3-hourly cadence). Final count: 20 dynamic + 3 static + 1 quasi-static = 24 predictors.
+> 4. **AERONET-anchored fallback uses k-fold CV, not a temporal sub-split (§7.4.1.1).** A diagnostic on Himawari `north|dry` showed the temporal split was rejecting fits that random-fold validates by wide margins (Δ-drop ≈ +0.16 / +0.19), because partial-dry-season holdouts collapse to a single year's haze events and over-penalise normal inter-annual variability. The §8 held-out window remains the temporal-generalisation test; the fallback gate's job is fit-quality. Wider α/β bounds (`α ∈ [0.3, 3.0]`, `|β| ≤ 0.4`) pair with a stricter RMSE-drop requirement (`0.05`, vs `0.02` on the MERRA-2 anchor) to admit the strong scale biases AERONET reveals in wet-season monsoon strata without letting in noise.
+> 5. **Cosine-taper region blending at apply time (§7.5).** Hard region masks stamp visible step discontinuities into the merged AOD across 11.5°N and 16°N. `SOFTCAL_BLEND_HALF_WIDTH = 0.5°` blends `(α, β)` in calibration space across each boundary; `'none'`-routed strata contribute identity (`α=1, β=0`) so a 'none' neighbour acts like a soft pass-through rather than a hard wall.
+>
+> Two smaller TC-table thresholds also moved (`TC_MIN_TRIPLETS = 3`, `TC_MIN_COLLOCATIONS = 500`) and are documented in §7.4.2 below. The **§14 Implementation drift register** is rewritten in v3.5.1 to retire the items now promoted into the body and to log the new smaller as-built knobs (variogram structured-pair sampler, ST kriging without climatology backstop, RF stratification axis adding `aod_decile`).
+
+---
+
+## 1. Context, Motivation, and Research Questions
+
+### 1.1 The problem
+
+Vietnam is among the most air-pollution-affected countries in Southeast Asia, with Hanoi consistently ranking among the most polluted cities globally. A reliable, high-resolution, high spatiotemporal aerosol optical depth (AOD) map is the essential upstream input for any operational PM2.5 estimation system over Vietnam. No such product currently exists at operational quality specifically for Vietnam.
+
+Two recent products come closest to what is needed and define the gap this thesis fills:
+
+- **Gupta et al. (2024)** produced a global merged Dark Target AOD product at 0.25°/30-min from six LEO and GEO sensors. It applies one retrieval algorithm uniformly to every sensor, uses equal-weight averaging across sensors with no AERONET correction, and serves a global audience. Over Vietnam this resolution is too coarse (~28 km), and Dark Target is not the best algorithm for every sensor over Vietnam's surface and aerosol types.
+- **Ahn et al. (2021)** produced an hourly composite AOD over Northeast Asia by CDF-matching each sensor to AERONET, extending the per-site corrections spatially via Inverse Distance Weighting (IDW), and merging sensors via Inverse Composite Weighting (1/RMSE², "ICW"). Their domain includes two Vietnamese AERONET sites (Nghia Do, Son La). It is the methodological template closest to this thesis. However, their domain centres on Korea/Japan/China, their product is hourly (not 30-min), and they did not address dense gap-filling for the cloud-prone tropics.
+
+This thesis adapts and extends those approaches for Vietnam's specific conditions, addressing four characteristics of the Vietnam domain that distinguish it from the regions where those products were developed:
+
+1. **Himawari operates at very high viewing zenith angle (VZA) over northern Vietnam** (Vietnam is on the edge of the AHI disk), elongating the atmospheric path and enlarging pixel footprints by 2–5× over Hanoi (Gupta et al., 2024).
+2. **Monsoon cloud cover is severe.** Valid Himawari L2 retrievals exist for only **10.3% of all hourly observations** across Vietnam, dropping to 6.9% in July (Nguyen et al., 2025). This means gap-filling is not optional — it is the dominant component of any usable product.
+3. **Only two AERONET stations** (Nghia Do in the north, Bac Lieu in the south) are available, with no station in Central Vietnam. Bias correction must therefore be region-aware but spatially extrapolated where ground truth is absent.
+4. **Aerosol regimes differ sharply between regions.** The north is dominated by anthropogenic + transboundary biomass burning, with shallow boundary layers and dry-season inversions; the south is influenced by marine aerosols and convective mixing; the centre has mixed orographic/maritime regimes. A single sensor or single bias correction cannot serve all three.
+
+### 1.2 Research questions
+
+- **RQ1.** per-sensor baseline characterisation across the five Stage A streams
+- **RQ2.** Can region- and season-aware bias correction against MERRA-2, combined with inverse-variance fusion derived from triple collocation, produce a fused AOD product that is more accurate over Vietnam than either an equal-weight merge (Gupta 2024 style) or a single best sensor?
+- **RQ3.** How effectively can ML-aided spatiotemporal gap-filling (RF with reanalysis covariates) and spatiotemporal kriging (Yang & Hu 2018) recover usable AOD on slots/regions where satellites see nothing, and how do those two methods compare to each other?
+- **RQ4.** Does the resulting merged + gap-filled product, aggregated to daily means as a post-processing step, improve daily AOD–PM2.5 coupling over Vietnam compared to the Himawari-only baseline of R² = 0.293 established by Nguyen et al. (2025)?
+
+### 1.3 Claimed contributions
+
+1. The first published Vietnam-specific multi-sensor merged AOD product at 0.05°/30-min covering Sep 2022 – Apr 2026, **delivered as a gap-filled dense product within each day's observation window** (Stage B) rather than only as the sparse Stage A merge.
+2. A regional/seasonal **soft-calibration table** (linear α, β per sensor primarily against MERRA-2, with a documented AERONET-anchored fallback on a temporal sub-split of the training window for strata where the MERRA-2 anchor fails — §7.4.1.1) and an **AERONET-independent triple-collocation error-variance table** per sensor. Both are reusable by future studies; the §8 held-out window (Jan 2025 – Apr 2026) is preserved for validation, untouched by either calibration step.
+3. An empirical, slot-level **head-to-head comparison** over Vietnam of two gap-fill strategies: spatiotemporal kriging (Yang & Hu 2018 framework, adapted to a single-component metric variogram on the AOD−CAMS residual) and Random Forest with reanalysis + meteorology covariates (Youn 2024 / Chen 2023 SIM, at 30-min cadence, also on the AOD−CAMS residual by default) — the first such comparison for this domain.
+4. An evidence-based set of recommendations for upstream PM2.5 mapping in Vietnam, including the central-Vietnam AERONET gap.
+
+---
+
+## 2. Related Work and Methodological Positioning
+
+The thesis builds directly on three product/methodology families. Section 7 maps each methodological choice to its source.
+
+| Predecessor                                | Domain                         | Spatial / Temporal | Bias correction                                       | Sensor fusion      | Gap-filling                             | Why insufficient for Vietnam                                                     |
+| ------------------------------------------ | ------------------------------ | ------------------ | ----------------------------------------------------- | ------------------ | --------------------------------------- | -------------------------------------------------------------------------------- |
+| **Gupta et al. 2024** (NASA LEO-GEO DT)    | Global                         | 0.25° / 30-min     | None                                                  | Equal-weight mean  | None                                    | Coarse; single algorithm not optimised per sensor for Vietnam; no AERONET tuning |
+| **Ahn et al. 2021** (NE Asia composite)    | NE Asia incl. Nghia Do, Son La | ~5 km / hourly     | Per-site CDF cubic polynomial → IDW spatial extension | ICW (1/RMSE²)      | None                                    | Centred on Korea; no dense gap-filling; hourly not 30-min                        |
+| **Chen et al. 2023** (Himawari ML gap-fill)| BTH/YRD/PRD China              | 0.05° / 10-min     | None (uses raw AHI)                                   | Single sensor      | SIM (RF, per slot) + TIM (DNN upsampler)| Single sensor; trained on temperate China not tropical monsoon                   |
+| **Youn et al. 2024** (RF Himawari gap-fill)| South Korea                    | 0.05° / hourly     | None                                                  | Single sensor      | RF + CAMS + ERA5 met (12 vars)          | Single sensor; temperate climate                                                 |
+| **Yang & Hu 2018** (ST kriging AOD)        | Beijing                        | 1 km / daily       | None                                                  | Single sensor      | Sum-metric ST kriging                   | Single sensor, daily, mid-latitude                                               |
+| **Nguyen et al. 2025** (this team)         | Vietnam                        | Point sites        | Validation only                                       | None               | None                                    | Validation study only — no gridded product produced                              |
+
+**This thesis = Ahn 2021's inverse-variance fusion framework adapted to Vietnam with region/season strata, with per-sensor bias correction anchored against spatially complete MERRA-2 reanalysis (not per-AERONET-site CDFs), fusion weights derived from triple-collocation σ² (not AERONET-RMSE), and a Stage B gap-filling step that ships two parallel products — Yang & Hu 2018 framework ST kriging (single-component metric variogram on the AOD−CAMS residual) as the geostatistical baseline, and Youn 2024 / Chen 2023 SIM-style RF on the same AOD−CAMS residual as the ML candidate — both running at 30-min cadence and compared head-to-head. The empirical anchors come from Nguyen et al. 2025.**
+
+What is genuinely new:
+
+- **Vietnam-specific sensor algorithm selection per region**, not a single retrieval algorithm everywhere (departure from Gupta 2024).
+- **Region- and season-stratified bias correction anchored against spatially complete MERRA-2 reanalysis** rather than discrete AERONET sites, eliminating the central-Vietnam ground-truth gap that constrained Ahn 2021 (and that earlier drafts of this plan tried to patch with a LEO-anchored offset map).
+- **AERONET-independent fusion weights** derived from triple-collocation σ² (Stoffelen 1998; McColl 2014), so AERONET is preserved entirely for held-out validation.
+- **Two-stage product design with two parallel Stage B methods**: a bias-corrected fused product (analogous to Ahn 2021) followed by two ML/geostatistics gap-fillers (analogous to Chen 2023 SIM and Yang & Hu 2018 respectively) producing complete 30-min dense products within each day's observation window. The literature evaluates one gap-fill method at a time; doing two side-by-side over the same domain is uncommon.
+- **Validation tied to the downstream PM2.5 application** with documented RANSAC-based daily-aggregate metrics from Nguyen et al. 2025 as the baseline to beat.
+
+---
+
+## 3. Study Domain, Period, and Output Specification
+
+| Parameter                  | Value                                                                                |
+| -------------------------- | ------------------------------------------------------------------------------------ |
+| Spatial domain             | Vietnam + ~2° buffer (8°N–23.5°N, 102°E–110°E)                                         |
+| Output grid                | 0.05° × 0.05° (~5.5 km); `LATS` × `LONS` = **310 × 160**                              |
+| Native output cadence      | 30-min slots; per-day daytime window is **data-driven** from Stage A filenames (§7.6.0), typical ~20–22 slots/day |
+| Optional downstream aggregations | Daily / monthly / seasonal (post-processing; used only for the §8 RQ4 PM2.5 comparison, with the §8.2.6 physics-normalisation transform applied before the daily roll-up) |
+| Study period               | Sep 2022 – Apr 2026 (~3.7 years, matching AERONET availability at Nghia Do/Bac Lieu) |
+| Training partition         | Sep 2022 – Dec 2024 (~28 months) — used by §7.4 calibration and §7.7/§7.8 model fitting |
+| Held-out partition         | Jan 2025 – Apr 2026 (~16 months) — never touched until §8                            |
+| Validation sites           | AERONET: Nghia Do (Hanoi, 21.048°N) and Bac Lieu (9.28°N)                            |
+| Indirect validation        | 27 Envisoft PM2.5 stations (10 north / 8 central / 9 south, ≥85% completeness)       |
+
+The domain extends ~2° beyond Vietnam's borders because key aerosol sources (mainland-SEA biomass burning, southern Chinese dust/industrial transport) are transboundary. Cutting at the border would corrupt edge retrievals and edge-weighted gap-fills.
+
+---
+
+## 4. Data Sources
+
+### 4.1 Satellite AOD products (kept)
+
+| Sensor           | Algorithm                                    | λ      | Native res. | Temporal           | Role in fusion                                           |
+| ---------------- | -------------------------------------------- | ------ | ----------- | ------------------ | -------------------------------------------------------- |
+| Himawari-8/9 AHI | JAXA Standard V3 (L2 + L3)                   | 500 nm | 0.05°       | 10 min continuous  | **Temporal backbone** — only source during most LEO gaps |
+| MODIS Terra+Aqua | MAIAC (MCD19A2, combined Terra+Aqua product) | 550 nm | 1 km        | ~10:30 & ~13:30 LT | Mid-morning / afternoon LEO accuracy anchor              |
+| VIIRS SNPP       | Deep Blue L2 (AERDB_L2_VIIRS_SNPP)           | 550 nm | 6 km        | ~13:30 LT          | High-accuracy afternoon anchor                           |
+| VIIRS NOAA-20    | Deep Blue L2 (AERDB_L2_VIIRS_NOAA20)         | 550 nm | 6 km        | ~13:30 LT (offset) | Second afternoon pass; increases LEO coverage            |
+
+Empirical notes carried over from v3.4 are unchanged: Himawari 8 → 9 transition treated as one record; Himawari 500 nm not Ångström-harmonised (negligible accuracy gain per Nguyen 2025); Himawari L2 vs L3 soft-calibrated independently and merged per-pixel by σ²_TC (§7.4.1, §7.5); MAIAC kept (1 km coverage); MODIS Deep Blue rejected (too sparse over Vietnam); VIIRS L3 daily 1° rejected (destroys spatial structure).
+
+### 4.2 Ground truth — AERONET V3 L2.0
+
+| Site             | Lat / Lon           | Period covered      | N observations | Mean AOD₅₅₀ |
+| ---------------- | ------------------- | ------------------- | -------------- | ----------- |
+| Nghia Do (Hanoi) | 21.048°N, 105.800°E | Feb 2022 – Apr 2026 | 13,172         | 0.699       |
+| Bac Lieu         | 9.28°N, 105.73°E    | Feb 2022 – Apr 2026 | 15,690         | 0.212       |
+
+AERONET is interpolated from 500/675 nm to 550 nm using the site-specific Ångström exponent, matching the LEO retrieval wavelength.
+
+### 4.3 Ground PM2.5 — Envisoft (validation context only)
+
+27 stations selected from 63 available on a ≥85% completeness threshold over the full Nguyen 2025 study window (10/8/9 across north/central/south). Hourly PM2.5, 451,082 records, 91.4% overall completeness. Used here only to validate that the merged AOD product captures pollution episodes visible in the PM2.5 record (§8.4); the actual AOD → PM2.5 regression is a downstream project.
+
+**Validation-window completeness relaxation.** No Envisoft station meets the ≥85% bar across the held-out validation window alone (Jan 2025 – Apr 2026 ≈ 510 days). The §8.1.6 case-study analysis therefore relaxes the per-station completeness threshold to ≥50% for that window only; the ≥85% bar still applies to the headline 27-station figure quoted above. This relaxation is flagged in §10.
+
+### 4.4 Ancillary data (covariates for bias correction and gap-filling)
+
+| Dataset                                           | Stage A role                              | Stage B role                                                  |
+| ------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------- |
+| ERA5 reanalysis (0.25°, hourly)                   | —                                         | 11 ERA5 variables (T2m, Td2m, RH, SP, U10, V10, PBLH, total cloud cover, TCWV, surface solar, albedo) bilinearly resampled to 0.05° and linearly interpolated in time to the 30-min slot centre — RF features (§7.8.1). RH and PBLH additionally feed the §8.2.6 post-processing physics normalisation applied before the RQ4 PM2.5 R² comparison. |
+| CAMS global reanalysis AOD (0.4° × 0.4°, 3-hourly)| —                                         | Bilinear → 0.05°, linear time interp → 30-min — RF feature `cams_aod`. Sole reanalysis-AOD predictor in Stage B (MERRA-2 excluded — already consumed by Stage A; §7.8.1)                            |
+| MERRA-2 AOD (0.5° × 0.625°, hourly, TOTEXTTAU)    | Soft-calibration anchor (§7.4.1) and TC triplet member (§7.4.2) | **Excluded** as a predictor (would double-dip the Stage A anchor) |
+| GPM IMERG precipitation (0.1°, 30-min)            | Wet-flag validation diagnostic            | Bilinear → 0.05° (native cadence) — RF feature `tp`             |
+| MODIS NDVI (MOD13Q1, 0.05°, 16-day composite)     | —                                         | Nearest-on-or-before in time, cached per (year, DOY) — RF feature `ndvi` (quasi-static) |
+| Copernicus GLO-30 DEM (30 m → 0.05° mean)         | —                                         | Static RF feature `elevation`                                  |
+| MODIS Land Cover (MCD12Q1)                        | Surface-type stratification (informational) | Annual, nearest year ≤ slot year — RF feature `land_cover`     |
+| LandScan Global population (~1 km, annual)        | —                                         | Annual — RF feature `population`                                |
+| FIRMS active fire                                 | Validation flag for extreme burning days  | Not a model input                                              |
+
+Choice of ancillary predictors mirrors Chen et al. 2023 and Youn et al. 2024 (their RF gap-fill validated this set on AHI) with two Vietnam-specific substitutions documented in §7.8.1.
+
+---
+
+## 5. Empirical Baseline (from Nguyen et al. 2025)
+
+### 5.1 Per-sensor validation against AERONET
+
+| Source        | Station  | N      | R     | Bias   | RMSE  | %EE   |
+| ------------- | -------- | ------ | ----- | ------ | ----- | ----- |
+| Himawari L2   | Nghia Do | 9,756  | 0.701 | −0.117 | 0.481 | 34.5% |
+| Himawari L3   | Nghia Do | 182    | 0.869 | −0.316 | 0.444 | 24.7% |
+| MODIS MAIAC   | Nghia Do | 239    | 0.856 | −0.146 | 0.295 | 56.9% |
+| VIIRS NOAA-20 | Nghia Do | 103    | 0.915 | +0.022 | 0.271 | 65.0% |
+| Himawari L2   | Bac Lieu | 14,092 | 0.733 | −0.021 | 0.150 | 53.6% |
+| Himawari L3   | Bac Lieu | 295    | 0.824 | +0.005 | 0.120 | 67.8% |
+| MODIS MAIAC   | Bac Lieu | 413    | 0.411 | +0.013 | 0.155 | 42.4% |
+| VIIRS NOAA-20 | Bac Lieu | 207    | 0.845 | +0.085 | 0.143 | 45.4% |
+
+### 5.2 Empirical findings that shape the methodology
+
+1. **VIIRS is the most accurate L2 product** at both stations.
+2. **Himawari has a strongly asymmetric regional bias** — large negative in the north, near-zero in the south. Single-coefficient correction will not work.
+3. **The optimal Himawari product level is region-dependent**: L2 in the high-AOD north preserves events; L3 in the low-AOD south reduces scan noise. Both levels are soft-calibrated against MERRA-2 independently (§7.4.1) and merged per-pixel by σ²_TC into one Himawari fusion input.
+4. **MAIAC fails at Bac Lieu against AERONET** (R = 0.411) over reflective Mekong agricultural surfaces. v3.4 removed the v3.3 hand-set 0.1× MAIAC-south down-weight; the §7.4.2 σ²_TC for MAIAC-south now sets its weight automatically.
+5. **Inter-sensor agreement degrades north → south** for MODIS–VIIRS but is U-shaped for VIIRS–Himawari; central Vietnam is the weakest spot for sensor consistency.
+6. **AOD availability is only 10.3% of hourly slots** (6.9% in July, 16.7% in April). Stage B gap-filling is dominant, not auxiliary, and runs at 30-min cadence throughout (§7.6.0).
+7. **Physics correction** (RH, PBLH) lifts hourly Himawari–PM2.5 correlation from r = 0.110 to r = 0.162 — applied as a post-processing transform on the Stage B per-slot output before the §8.2.6 / RQ4 PM2.5 R² comparison (not as a Stage A step; the merged column-AOD product itself is unmodified).
+8. **Fine-mode (Rf ≥ 0.5) + uncertainty (≤ 0.5) filters help Himawari**, no measurable improvement for MAIAC (preprocessing already favours fine-mode). Filter Himawari only.
+9. **RANSAC robust regression** lifts daily Himawari–PM2.5 R² from 0.065 (OLS) to 0.293 — diagnostic, not a product filter.
+
+---
+
+## 6. Methodology Overview
+
+```
+       L2 Granules                         Reanalysis & ancillary
+[Himawari, MAIAC, VIIRS-SNPP,                  [CAMS, MERRA-2, ERA5,
+ VIIRS-NOAA20]                                  IMERG, NDVI, elev, land cover]
+       │                                            │
+       ▼                                            │
+[Step A1: QA Filtering]                             │
+       ▼                                            │
+[Step A2: Regrid to 0.05°, 30-min slots]            │
+       │   (persisted intermediate, shared)         │
+       ├──────────────────────────────────┐         │
+       ▼                                  ▼         │
+  ┌─ CALIBRATION TRACK ─┐         ┌─ PRODUCTION TRACK ──────────┐
+  │ (offline, once)     │         │ (per slot)                  │
+  │ collocate sat ↔     │         │ read A2 grids               │
+  │ MERRA-2 per         │         │      ▼                      │
+  │ (sensor, region,    │         │ [Step A4: Soft calibration  │
+  │  season) (§7.4.1)   │         │   linear α·sat + β]         │
+  │      ▼              │         │      ▲                      │
+  │ fit linear (α, β) ──┼────────►│      └── (α, β) from train  │
+  │      ▼              │         │      ▼                      │
+  │ triple-collocation  │         │ [Step A5: TC-weighted       │
+  │ σ²_TC per stratum  ─┼────────►│   fusion (1/σ²_TC)]         │
+  │ (§7.4.2)            │         │      ▲                      │
+  │                     │         │      └── σ²_TC from train   │
+  └─────────────────────┘         └─────────────────────────────┘
+                                              ▼
+                              ═══ Stage A complete: 30-min merged ═══
+                                              ▼
+                                ┌────────────┴───────────┐
+                                ▼                        ▼
+                  [Step B1: ST kriging,        [Step B2: Random Forest
+                   Yang & Hu 2018 framework,    per 30-min slot, on
+                   metric variogram on the      the AOD−CAMS residual,
+                   AOD−CAMS residual,           parallel product tree]
+                   parallel product tree]
+                                │                        │
+                                └────────────┬───────────┘
+                                             ▼
+                       ═══ Stage B complete: two 30-min gap-filled products ═══
+                                             ▼
+                  [Step C: head-to-head validation against held-out AERONET +
+                   coverage / SSO audit + Envisoft case studies]
+                                             ▼
+                  [Optional post-processing for §8.2.6 RQ4 PM2.5 R² comparison:
+                   (i) physics normalisation per slot — AOD_phys = AOD ×
+                       (1−RH/100)^γ / PBLH, ERA5 RH & PBLH (γ = 0.6,
+                       Kotchenruther & Hobbs 1998);
+                   (ii) daily roll-up of each product;
+                   (iii) AOD–PM2.5 R² regression vs Nguyen 2025 baseline]
+```
+
+Stage A is split into a one-time **calibration / training track** and a per-slot **production track**. Both tracks consume the same persisted Stage A2 intermediate (one NetCDF per 30-min slot containing raw 0.05° gridded AOD per sensor) so gridding runs exactly once per slot per dataset.
+
+Stage B is split into two **parallel product trees** (`output/st_kriging/` and `output/rf/`) at 30-min cadence within each day's data-driven observation window (§7.6.0). Daily aggregation is **not** part of Stage B; the §8.2.6 / RQ4 PM2.5 comparison performs a post-processing daily roll-up.
+
+Calibration runs once in a linear chain (§7.4.4): grid → soft-calibrate vs MERRA-2 → triple-collocation σ² → production. No cyclic bootstrap is needed because neither anchor depends on a prior Stage A pass.
+
+---
+
+## 7. Methodology Detail
+
+### 7.0 AERONET-cell extraction for validation
+
+Under the v3.4/v3.5 architecture, satellite training pairs are constructed against MERRA-2 (§7.4.1) and inter-sensor triplets (§7.4.2), neither of which touches AERONET. AERONET is therefore reserved entirely for held-out validation (§8). The AERONET-cell extraction described in this section is a **validation** workflow, not a training workflow.
+
+Three stages run independently from a shared intermediate: (1) **Stage A2 grid** writes one NetCDF per 30-min slot containing the raw per-sensor 0.05° gridded AOD before any bias correction (`MERGED_DIR` per-sensor variant); (2) **extract** reads that gridded slot and samples each sensor at the AERONET station's 0.05° cell using the tiered 1 / 3×3 / 5×5 cell-neighbourhood fallback; (3) **match** temporally aligns the station-cell extracts to AERONET observations within ±30 min of the slot centre (Himawari L2, VIIRS, MAIAC) or to the day (Himawari L3, kept as a daily comparator). Stages 2 and 3 feed §8.1.1's held-out AERONET metric panel.
+
+These stages are exposed as CLI verbs in `run_collocate.py`: `grid`, `extract`, `match` (plus a `collocate` shortcut). The training-time calibration verbs are `soft_cal` (§7.4.1) and `tc_variance` (§7.4.2), neither of which consumes AERONET.
+
+#### 7.0.1 Spatial matching
+
+Every sensor is sampled from the Stage A2 0.05° gridded slot using the same tiered cell-neighbourhood fallback (Ichoku et al. 2002; Levy et al. 2010 scaled to the production grid):
+
+1. **Exact cell (primary):** the 0.05° cell whose centre is closest to the AERONET station.
+2. **3×3 cell neighbourhood (Fallback 1):** mean of all valid cells within one config-grid cell of the station cell.
+3. **5×5 cell neighbourhood (Fallback 2):** half-width 2, side ≈ 25 km — used only when the inner tiers are empty.
+
+Each matchup records which tier was used and the within-neighbourhood AOD standard deviation. The scene-homogeneity gate `box_std_max(mean) = max(BOX_STD_ABS_FLOOR=0.05, BOX_STD_SLOPE[sensor] × mean)` is computed at collocation time but **production fusion does not enforce it** — the §7.5 TC-weighted fusion absorbs heterogeneity via the cross-sensor std term and per-stratum σ²_TC. The per-cell `aod_std` and `cv` fields are written to the Stage A2 intermediate (§7.2.1) and exposed for downstream consumers to apply their own `cv ≤ CV_MAX` filter if a use case calls for it.
+
+#### 7.0.2 Temporal matching
+
+**Strategy: satellite-centric.** One record per Stage A2 30-min slot grid. For each snapshot, all AERONET measurements within the matching window are averaged.
+
+| Sensor | Snapshot unit | Matched to | Time window |
+|--------|---------------|------------|-------------|
+| Himawari L2 | One row per 30-min slot (multiple 10-min files averaged at Stage A2) | AERONET near slot centre | ±30 min |
+| Himawari L3 | One row per 30-min slot → aggregated to a daily satellite mean before matching | AERONET daily mean (UTC) | Whole day |
+| VIIRS SNPP / NOAA-20 | One row per 30-min slot — Stage A2 pools all granules whose timestamp falls in ±30 min | AERONET near slot centre | ±30 min |
+| MODIS MAIAC | One row per 30-min slot — per-orbit UTC timestamp from the HDF global attribute decides slot eligibility | AERONET near slot centre | ±30 min |
+
+Days whose MAIAC HDF lacks a readable orbit-timestamp attribute are skipped entirely; the daily-mean broadcast fallback used by earlier drafts is not applied (see §10 #19).
+
+### 7.1 Step A1 — Quality filtering
+
+**Himawari AHI** — strict JAXA bit-mask gate on the L2 `QA_flag` (Band 4) / L3 `QA_flag_Merged` (Band 8), plus three product-level gates:
+
+- **JAXA strict QA bit-mask** — a pixel passes only when every one of these bits is clean: `data_avail`, `cloud`, `retrieval_ok`, `AOT confidence = 00` ("very good", bits 4–5), `additional_cloud`, `Solz/Satz > 70°` (bit 10), `surface_refl_bad`, `snow/ice`, `turbid_water`. L3 zeroes the snow/ice and turbid-water bits by design.
+- **Strict-zero AOT gate**: AOT > `HIMAWARI_AOT_MIN` (= 0.0).
+- **Fine-mode fraction** Rf ≥ `HIMAWARI_RF_MIN` (= 0.5, Band 6, L2 only).
+- **Retrieval uncertainty** |Uncertainty| ≤ `HIMAWARI_UNC_MAX` (= 0.5).
+
+**MODIS MAIAC (MCD19A2):**
+
+- Valid AOD range: 0 ≤ AOD ≤ 5.
+- `AOD_QA` bitmask: bits 8–11 ≤ `MODIS_QA_BITS_MAX` (= 4 — "Best" through "Marginal").
+- Terra and Aqua orbits separated by per-file UTC timestamp from the HDF metadata; each orbit's pixels are placed in the Stage A2 slots whose ±30 min window overlaps that orbit's overpass time.
+
+**VIIRS Deep Blue (SNPP + NOAA-20):**
+
+- Uniform QA gate: `QA_Flag_Land ≥ VIIRS_QA_MIN` (= 2) OR `QA_Flag_Ocean ≥ VIIRS_QA_MIN`.
+- Valid AOD range: 0 ≤ AOD ≤ 5. SNPP and NOAA-20 treated as separate sensors throughout.
+
+### 7.2 Step A2 — Regridding to 0.05° × 30-min
+
+#### 7.2.1 Spatial aggregation
+
+Box-averaging per Gupta et al. 2020: only pixels whose centre falls inside a 0.05° cell contribute. Output per sensor per slot: mean AOD, within-cell std, coefficient of variation `cv = std / max(mean, 0.02)`, valid-pixel count, theoretical maximum, mean VZA, mean SZA. Stage A2 itself does not apply a heterogeneity rejection.
+
+**Persistence.** Steps A1+A2 are computed once per slot per sensor and written to a per-slot NetCDF in `GRIDDED_DIR`. AERONET validation extraction (§7.0), MERRA-2 soft-calibration (§7.4.1), TC σ² estimation (§7.4.2), and the production fusion driver (§7.5) all read from this intermediate.
+
+#### 7.2.2 Temporal slot assignment per sensor
+
+The 30-min slot cadence (48 slots/day, centred at 00:00, 00:30, …, 23:30 UTC) is a common reference frame the four sensors reach by different paths:
+
+| Sensor | Native cadence | Slot strategy | Window |
+|--------|----------------|---------------|--------|
+| Himawari L2 | 10-min snapshots | All snapshots within ±15 min of slot centre averaged pixel-wise | ±15 min (~3 files/slot) |
+| Himawari L3 | 1-hour composites | Nearest L3 composite within ±30 min used as-is | ±30 min |
+| VIIRS SNPP / NOAA-20 | ~6-min granules | All granules within ±30 min pooled, then box-averaged | ±30 min |
+| MODIS MAIAC | Multi-orbit daily HDF | Per-orbit UTC timestamps extracted; each orbit included only in slots whose ±30-min window overlaps the overpass | ±30 min per orbit |
+
+Carry-over consequences (Himawari L2 no slot duplication; Himawari L3 consecutive slots share one composite; VIIRS may contribute to two adjacent slots near a granule boundary; MAIAC contributes to at most one or two slot pairs per day) are unchanged from v3.4 and recorded in §10 #18, #19.
+
+### 7.3 Step A3 — Physics normalisation (relocated to §8.2.6 post-processing in v3.5.2)
+
+In v3.5.1 and earlier this section described a physics-normalisation transform `AOD_phys = AOD_merged × (1 − RH/100)^γ / PBLH` (γ = 0.6 Kotchenruther & Hobbs 1998; PBLH constrained ≥ 50 m; ERA5 RH and PBLH bilinearly interpolated to 0.05° and nearest-hour matched to the slot centre) applied to the fused `AOD_merged` and stored as a separate `AOD_phys_corrected` field in each Stage A NetCDF.
+
+In v3.5.2 the transform is **removed from Stage A** and applied as part of the §8.2.6 / RQ4 post-processing chain instead. Stage A's role is now strictly column-AOD bias correction and fusion, which keeps the Stage A and Stage B per-slot outputs directly comparable to AERONET, MERRA-2, CAMS, and the published Gupta 2024 / Ahn 2021 baselines without an extra dimensional adjustment. The physics-correction lift documented in §5.2 #7 materialises only in the AOD↔PM2.5 coupling, so its natural home is the §8.2.6 post-processing chain that already exists for that comparison. The numerical recipe (formula, γ, PBLH floor, ERA5 collocation conventions) is unchanged — see §8.2.6.
+
+The numbering A1–A5 is retained for traceability across versions; A3 is now a no-op inside Stage A.
+
+### 7.4 Step A4 — MERRA-2-anchored bias correction + triple-collocation error variance
+
+**Strategy.** Bias correction and fusion weights are both anchored against domain-wide reference data — MERRA-2 reanalysis for bias correction, inter-sensor triple collocation for fusion weights. AERONET is reserved for held-out validation (§8) with one documented exception: §7.4.1.1 defines a per-stratum AERONET-anchored fallback that fires only when the MERRA-2 anchor fails its §8.1.2 gate A, and that fallback is fit and validated entirely inside the training window (the Jan 2025 – Apr 2026 held-out window is never touched). With only two AERONET stations and none in central Vietnam, this is the only design that can deliver a defensible central-region calibration without consuming the validation pool.
+
+Two architectural changes do the work: (1) bias correction is anchored against spatially complete MERRA-2 (Randles 2017; Buchard 2017) using the Ding et al. 2025 linear form; (2) fusion weights are computed by triple collocation (Stoffelen 1998; McColl 2014; Gruber 2016) — no ground-truth reference needed. MERRA-2 is used **only as a training-time anchor**; it does not enter the production merge.
+
+#### 7.4.1 Soft calibration against MERRA-2
+
+For each (sensor, region, season) stratum:
+
+1. At the satellite's 0.05° grid and slot (post-§7.2), collocate every valid satellite pixel with MERRA-2's hourly AOD550 (`TOTEXTTAU`) bilinearly resampled to 0.05° and nearest-hour matched.
+2. Fit a linear regression `MERRA-2 = α · sat + β` over the training window (Sep 2022 – Dec 2024). The transfer function is `sat_corrected = α · sat + β`. Linear (rather than full PCHIP CDF) is chosen because MERRA-2 at 0.5° is structurally smoother than satellite AOD at 0.05°.
+3. **CV-time guard rail.** 5-fold cross-validated α and β are computed. The stratum routes to `'apply'` when N ≥ `SOFT_CAL_MIN_PAIRS` (= 100), `α_CV ∈ [0.5, 2.0]`, and `|β_CV| ≤ 0.2`. Otherwise route to `'none'`: the satellite enters fusion uncorrected and receives `NONE_PENALTY_FACTOR × σ²_prior` (= 2.0, weight drops ~4×). Output is clipped to `[SOFT_CAL_OUTPUT_MIN=0.0, SOFT_CAL_OUTPUT_MAX=5.0]`.
+
+Strata: **Region** — North (lat ≥ `NORTH_CENTRAL_LAT = 16.0`), Central (`CENTRAL_SOUTH_LAT = 11.5` ≤ lat < 16.0), South (lat < 11.5). **Season** — Dry (Oct–Apr) / Wet (May–Sep). **Himawari level** — L2 and L3 are soft-calibrated independently; the §7.5 stratum-aware per-pixel merge preserves the per-level treatment before fusion.
+
+The trained `(α, β)` per stratum are persisted to `BIASC_DIR/soft_calibration.json` and reloaded at run time. The persisted schema also carries `alpha_cv`, `beta_cv`, `n_pairs`, `rmse_before`, `rmse_after`, `rmse_after_cv`, and the `route` flag for the §8.1.2 pre/post-correction comparison.
+
+#### 7.4.1.1 AERONET-anchored fallback for 'none'-routed strata
+
+The §7.4.1 validation in `validate_bias_correction.ipynb` (§8.1.2 gate A on the held-out summary) revealed that the MERRA-2 anchor clears the gate-A RMSE-drop threshold in only **5 of 14 apply-routed strata** at first pass, with the remaining 9 strata being **re-routed to `'none'`** (notably across `himawari_l3`, `modis_maiac` north/central/south dry, and `viirs_noaa20` north wet). The root cause is MERRA-2's coarser native grid (0.5° × 0.625°) and smoother aerosol field: the linear `MERRA-2 = α · sat + β` regression has no residual signal to lock onto in strata where MERRA-2 is structurally close to satellite already.
+
+To recover usable corrections in those strata without consuming the §8 held-out window, the design is extended with **one documented fallback**:
+
+For any (sensor, region, season) stratum whose MERRA-2 anchor routes to `'none'` AND has at least one AERONET station inside the region (north → Nghia Do, south → Bac Lieu; **central Vietnam has no station, so central strata cannot use the fallback and stay `'none'`**), attempt a second fit `AERONET = α · sat + β` on every AERONET–satellite pair from the full training window `[TRAIN_START, TRAIN_END]`, gated on **k-fold cross-validation** that mirrors the MERRA-2 anchor's CV gate:
+
+* **Fit window.** Sep 2022 – Dec 2024 (the same training window; the §8 hold-out from Jan 2025 onward is never touched).
+* **CV gate (mean across k folds).** `α_aer_cv ∈ [AERONET_FALLBACK_ALPHA_MIN, AERONET_FALLBACK_ALPHA_MAX]` = `[0.3, 3.0]`, `|β_aer_cv| ≤ AERONET_FALLBACK_BETA_ABSMAX` = `0.4`, and `rmse_aer_after_cv ≤ rmse_aer_before − AERONET_FALLBACK_RMSE_DROP_MIN` = `0.05`. The sample minimum `AERONET_FALLBACK_MIN_PAIRS = 40` provides headroom of `≥ CV_FOLDS × 2`.
+
+**Why k-fold CV, not a temporal sub-split.** v3.5.0 proposed a Sep 2022–Jun 2024 fit + Jul–Dec 2024 in-train holdout. A diagnostic on Himawari `north|dry` showed the temporal split was rejecting fits that random-fold CV validates by wide margins (Δ-drop ≈ +0.16 / +0.19). Cause: partial-dry-season holdouts collapse to a single year's haze events and over-penalise normal inter-annual variability. The §8 held-out window (Jan 2025 – Apr 2026) is the *true* temporal-generalisation test for the AERONET fit, so the fallback gate's job is fit quality, not temporal generalisation a second time. k-fold CV measures fit quality more faithfully on the small AERONET pool and frees the late-2024 months for fitting.
+
+**Why widened α/β with a stricter drop.** The MERRA-2-anchor guard rail (`α ∈ [0.5, 2.0]`, `|β| ≤ 0.2`) rejects tropical monsoon strata where AERONET ground truth tells us the true correction is severe — e.g. wet-season south where satellites over-retrieve by 2.5–5× and `α ≈ 0.3–0.4` is real, not noise. Widening the box to `[0.3, 3.0]` admits these legitimate corrections; coupling the wider box with a stricter `0.05` RMSE-drop requirement (vs `0.02` on the MERRA-2 anchor) is the price of admission — a wider parameter box demands more evidence the correction is actually helping.
+
+When the fallback passes, the persisted `SoftCal` record swaps `alpha`/`beta` to the AERONET-anchored in-sample fit (the production fit is in-sample on all training-window pairs; CV α/β are the *gate*, not the deployed coefficients) and records `anchor: 'aeronet'`; the `route` flag flips to `'apply'`. When it fails (or AERONET coverage doesn't exist — central Vietnam), the stratum stays `'none'` and inherits the `NONE_PENALTY_FACTOR × σ²_TC` fusion penalty unchanged. The implementation records both fits' diagnostics in the JSON: `alpha_aer`, `beta_aer`, `alpha_aer_cv`, `beta_aer_cv`, `n_aeronet_pairs`, `rmse_aer_before`, `rmse_aer_after`, `rmse_aer_after_cv`, plus the `anchor` field (`'merra2' | 'aeronet' | 'none'`) and a `fail_reason` carrying which side failed last.
+
+**Limits of the fallback.** This is the only place AERONET enters a *training* step, and it is a deliberate, scoped exception to the §7.0 / §7.4 "AERONET = held-out only" principle. The bend is contained to a stratum-by-stratum guard-rail recovery — most strata that pass §7.4.1 never see the fallback at all. Central-Vietnam strata cannot benefit (no station), so the central calibration story is unchanged from §7.4.1: MERRA-2 anchor where it clears the gate, `'none'` otherwise. The thesis defense becomes: **MERRA-2 anchor works in a majority of strata; the design includes a documented AERONET-anchored fallback for strata where it doesn't, validated by k-fold CV on the training window with the held-out Jan 2025 – Apr 2026 reserved for §8.**
+
+#### 7.4.2 Triple-collocation error variance
+
+For each (sensor, region, season) stratum, the post-soft-calibration error variance `σ²_i` is estimated using triple collocation (Stoffelen 1998 Eq. 5; Gruber 2016 §2.1). McColl 2014 extended-TC additionally recovers the additive bias and a correlation-with-truth metric per sensor; both are computed and persisted alongside σ² for §8.1.3.
+
+**Triplet construction.** Six "sensors" are eligible: {Himawari L2 (soft-calibrated), Himawari L3 (soft-calibrated), MAIAC, VIIRS-SNPP, VIIRS-NOAA20, MERRA-2}. All algorithm-distinct triplets are enumerated; pure-satellite triplets are enumerated when overlap exists. The σ² for each sensor is the **median across all valid triplets containing it**, per (region, season). Negative single-triplet σ² (Stoffelen 1998 §4 — independence violation) are dropped from the aggregate. Two gates control trust: `TC_MIN_TRIPLETS = 3` (distinct 3-sensor combinations the sensor participates in within the stratum; bounded above by C(N_sensors-1, 2) = 10 with the 6 members above, so any value beyond ≈ 6 is effectively unreachable) and `TC_MIN_COLLOCATIONS = 500` (total per-cell-per-slot samples summed across those triplets; ensures each triplet's σ² rests on a real sample size). Below either gate the stratum returns NaN and the caller falls back to the per-sensor EE-envelope floor.
+
+**Independence rule.** A triplet is rejected when two members share the **retrieval algorithm**. Specifically:
+
+1. VIIRS-SNPP + VIIRS-NOAA20 share Deep Blue (Sayer 2020) → rejected.
+2. MERRA-2 + MAIAC is allowed: MERRA-2's GOCART assimilates MODIS Dark Target NNR (Randles 2017 §3.1), not MAIAC.
+3. Himawari L2 + L3 is allowed: JAXA L3 V3 `merged_aot` is a composite of land+ocean retrievals, not an hourly mean of L2 pixels.
+
+**Sensitivity check.** σ²_TC is computed under both rules above (permissive) and a **strict** variant that additionally rejects all pairs sharing the underlying instrument (MERRA-2 + MAIAC, Himawari L2 + L3). The `is_independent_triplet(strict=True|False)` toggle in `triple_collocation.py` produces both tables; if rankings differ between variants, the strict ranking becomes the headline.
+
+**Floor against the Sayer/Levy EE envelope.** When a stratum has no TC entry in the table (either of the two gates above failed), σ²_i defaults to a per-sensor EE floor `(EE_OFFSET + slope_sensor · AOD_ref)²` with `EE_OFFSET = 0.05`, `AOD_ref = 0.3`, and per-sensor slopes (`SENSOR_EE_SLOPE` in `config.py`): `0.20` for Himawari and VIIRS, `0.10` for MAIAC (Lyapustin 2018; Falah 2021), `0.17` for MERRA-2 (Randles 2017). TC values that *did* pass the gates are not re-clamped — the gates are the trust check.
+
+**Sanity benchmark.** The TC-derived σ² is cross-checked once against AERONET–satellite RMSE on training-window pairs at the two AERONET cells (post soft-calibration). Agreement within a factor of 2 is expected; larger gaps trigger a triplet-set audit (usually reveals an undetected error-correlation pair). The benchmark uses training-window AERONET only as a one-time sanity check — AERONET is not used to adjust the weights and the §8 held-out window is not touched.
+
+The TC σ² table is persisted to `BIASC_DIR/tc_error_variance.json`.
+
+#### 7.4.3 Per-sensor correction summary
+
+| Sensor | Soft calibration | TC error variance source |
+| --- | --- | --- |
+| Himawari L2 | Linear vs MERRA-2 per region+season | Triplets with MAIAC, VIIRS-*, and/or MERRA-2; merged-Himawari σ² is `min(σ²_L2, σ²_L3)` per the §7.5 stratum-aware merge |
+| Himawari L3 | Linear vs MERRA-2 per region+season | Same; rolled up via min |
+| MAIAC | Linear vs MERRA-2 per region+season | Triplets with Himawari-L2/L3, VIIRS-*, and/or MERRA-2 |
+| VIIRS SNPP | Linear vs MERRA-2 per region+season | Triplets with Himawari, MAIAC; not paired with VIIRS-NOAA20 |
+| VIIRS NOAA-20 | Linear vs MERRA-2 per region+season | Same; not paired with VIIRS-SNPP |
+| MERRA-2 | (not corrected; serves as anchor) | σ² reported from MERRA-2-containing triplets for diagnostics; **not used** in §7.5 |
+
+#### 7.4.4 Calibration ordering (single-pass)
+
+Calibration runs once in a linear chain:
+
+1. **Grid (A1+A2).** `python run_collocate.py grid …` over the full study period — persists per-slot NetCDFs every subsequent step reads.
+2. **Soft-calibrate.** `python run_collocate.py soft_cal …` — regresses each (sensor, region, season) against MERRA-2 over the training window; persists `soft_calibration.json`.
+3. **TC σ² table.** `python run_collocate.py tc_variance …` — applies soft calibrations, then runs triple collocation per stratum; persists `tc_error_variance.json`.
+4. **Production Stage A.** `python run_stage_a.py …` over the full study period; loads both JSON tables and emits 30-min `MERGED_DIR` NetCDFs.
+
+Steps 2 and 3 must be re-run together whenever gridding or QA filters change.
+
+### 7.5 Step A5 — TC-weighted fusion
+
+For each 0.05° cell and 30-min slot:
+
+```
+w_i = 1 / σ²_TC,i(region, season, sensor)
+AOD_merged = Σ(w_i · AOD_i_corrected) / Σ(w_i)
+```
+
+floored at the Sayer/Levy EE envelope. This is identical in form to Ahn 2021's ICW; the variance source is AERONET-independent triplet statistics.
+
+**Cosine-taper region blending at apply time.** The §7.4.1 (α, β) lookup is indexed by hard region masks at 11.5°N (central↔south) and 16.0°N (north↔central), and a hard mask stamps a step discontinuity into the bias-corrected `α · sat + β` field whenever the two neighbouring strata's coefficients differ. `bias_correction.apply_softcal_grid(...)` therefore blends `(α, β)` in calibration space across a ±`SOFTCAL_BLEND_HALF_WIDTH = 0.5°` band on either side of each boundary using a cosine taper. Strata routed to `'none'` (or missing entirely) contribute identity coefficients `(α=1, β=0)` to the blend, so a `'none'` neighbour acts like a soft pass-through rather than a hard wall. The two boundary bands `[11.0, 12.0]` and `[15.5, 16.5]` are non-overlapping, so the blends act independently. The blend operates on `(α, β)` not on the corrected AOD field directly — applying the blend in coefficient space keeps the §7.4.1 fit's linear-correction interpretation intact at every cell, even cells inside the taper band.
+
+**MERRA-2 inclusion rule.** MERRA-2 does NOT enter the production merge sum. Slots with zero satellite retrievals stay as gaps and are forwarded to Stage B.
+
+**Himawari L2/L3 stratum-aware per-pixel merge.** L2 and L3 are soft-calibrated independently and merged per pixel before fusion: the level having the lower σ²_TC for the (region, season) supplies the primary pixel value, the other fills its gaps. The fusion then sees a single Himawari channel.
+
+**Sensor inclusion rule.** Every available sensor in the slot enters the merge weighted by 1/σ²_TC; if exactly one sensor is present the cell is flagged as low-confidence; if no sensor is present the cell is a gap (forwarded to Stage B). **No hand-set multipliers** — every weight decision flows through `tc_error_variance.json`.
+
+**Stage A output (per 30-min NetCDF in `MERGED_DIR/YYYY/MM/DD/merged_YYYYMMDD_HHMM.nc`):**
+
+- `AOD_merged` — TC-weighted mean of soft-calibrated sensors
+- `AOD_std` — cross-sensor weighted spread
+- `n_sensors`, `dominant_sensor`, `confidence_flag`
+- Per-sensor soft-calibrated grids (diagnostic; written only when data are available)
+- `weight_sum` — Σw_i (provenance / confidence proxy carried forward to Stage B)
+
+The `AOD_phys_corrected`, `era5_rh`, and `era5_pblh` fields that lived in v3.5.1 Stage A outputs are no longer written here. The physics-normalisation transform now happens in §8.2.6 post-processing on the Stage B per-slot output instead, with its own dedicated output tree.
+
+`dominant_sensor` codes: **1 = Himawari (merged L2/L3), 3 = MODIS MAIAC, 4 = VIIRS SNPP, 5 = VIIRS NOAA-20**. `confidence_flag` codes: **0 = no data, 1 = Himawari only, 2 = LEO only, 3 = Himawari + LEO, 4 = multi-LEO + Himawari**.
+
+---
+
+## Stage B — Gap Filling (30-min cadence, two parallel products)
+
+Stage B runs at 30-min cadence end-to-end and produces **two parallel product trees**, one per gap-fill method. Daily aggregation is **not** part of Stage B — the §8.2.6 / RQ4 comparison vs Nguyen 2025 performs an optional daily roll-up as a downstream post-processing step.
+
+### 7.6 Step B0 — Day-window discovery and shared protocol
+
+#### 7.6.0 Daytime window per UTC day (data-driven)
+
+Stage A writes one NetCDF per slot only if that slot has at least one valid Stage A pixel anywhere in Vietnam (`merged_YYYYMMDD_HHMM.nc`). The HHMM in the filename is the source of truth for which slots are observable on a given day.
+
+For UTC day `D`:
+
+1. List `MERGED_DIR/YYYY/MM/DD/*.nc` and parse the HHMM substring of each filename to a slot index in `[0, 47]`.
+2. If day `D` has ≥ `WINDOW_MIN_SLOTS_PRESENT` (= 10) observed slots, `slot_first = min(slot_idx)`, `slot_last = max(slot_idx)`, and the inference window is every 30-min slot in `[slot_first, slot_last]` inclusive.
+3. Otherwise, fall back to a 7-day median window: the per-day-median of `(slot_first, slot_last)` over the seven days `D ± WINDOW_MEDIAN_HALF_DAYS` (= ±3), restricted to neighbour days that themselves clear the 10-slot bar. When the target day has *some* but < 10 observations, the median window is widened to include them.
+4. At dataset edges (first/last few days), the one-sided median window is used.
+5. If neither path yields a window, the day has no inference window and is skipped.
+
+The implementation lives in `stage_b/slots.py::discover_day_window`. Typical Vietnam window size is ~20–22 slots/day (varies with latitude and season). Vietnam spans 9°N–23°N, so the actual window varies from ~23:30 UTC (previous day) in summer to ~10:30 UTC; a hard-coded 00:00–09:30 UTC range was provably too narrow. Roughly **~1,330 days × ~21 slots/day × ~13,500 cells ≈ 3.8 × 10⁸ (cell, slot) records per product**, or **~28,000 NetCDF files per method**.
+
+**Inference target.** For each method (B1 ST kriging, B2 RF), the product is dense within each day's discovered window: every (cell, slot) where `slot ∈ [slot_first, slot_last](D)` carries exactly one AOD value. Observed cells pass through unchanged from Stage A; missing cells are filled by the model. Night-time slots and slots outside the window are not produced.
+
+#### 7.6.1 Shared training / validation / test protocol (both methods)
+
+Both B1 ST kriging and B2 RF use the same temporal partition and the same intra-train validation strategy, so their §8.2 metrics are directly comparable.
+
+| Partition | Range               | Span                  | Use                                    |
+| --------- | ------------------- | --------------------- | -------------------------------------- |
+| Train     | Sep 2022 – Dec 2024 | ~28 months, ~840 days | Model fitting + intra-train CV         |
+| Test      | Jan 2025 – Apr 2026 | ~16 months, ~490 days | §8.2 head-to-head evaluation only      |
+
+**Intra-train validation: 5-fold contiguous temporal CV.**
+
+- **Fold assignment by UTC date** — all slots of a given day fall in the same fold (prevents within-day leakage). Implemented as `RF_CV_FOLDS = 5` in `stage_b/config.py` and via `temporal_block_folds(meta_dates, k)` in `rf_gapfill.py`.
+- **RF use of CV** — hyperparameter grid search over `RF_GRID` (`n_estimators ∈ {100, 200, 500}`, `max_depth ∈ {15, 20, 25, None}`, `min_samples_leaf ∈ {1, 5, 10}`, `max_features ∈ {sqrt, 0.5, 1.0}`). Selection criterion is **mean CV-R²** across the 5 folds. The final RF is retrained on the full train partition (after a temporal 80/20 internal-test split also taken by date).
+- **ST kriging use of CV** — variogram parameters are fit on a stratified sub-sample of the train partition (§7.7). CV serves as a sanity check that fitted ranges/anisotropy don't drift across folds.
+
+**⚠ Do not use OOB-R² for RF.** `RF_OOB_SCORE = False` is enforced in `config.py` and passed explicitly to every `RandomForestRegressor`. OOB sampling is IID bootstrap; AOD has strong temporal autocorrelation; OOB-R² would be systematically optimistic. This departs from Youn 2024's reporting convention but is principled given AOD's autocorrelation structure.
+
+**Inference.** Both methods produce predictions for every (cell, slot, day) inside each day's observation window across Sep 2022 – Apr 2026. Train-partition predictions are produced too (for §8.2 consistency checks and uncertainty-field calibration). The §8 headline metrics are computed on the **test** partition only.
+
+### 7.7 Step B1 — Spatiotemporal kriging (Yang & Hu 2018 framework; single-component metric variogram on the AOD−CAMS residual)
+
+#### 7.7.1 Why ST kriging, not per-slot spatial kriging
+
+At 30-min cadence many monsoon slots have zero in-domain valid observations. Yang & Hu (2018, *Sci. Total Environ.* 633, 677–683) show explicitly that "days with no valid AOD data cannot be interpolated by spatial kriging, while ST kriging may work because it can borrow data from adjacent days." That single observation forces the move from per-slot spatial kriging to spatiotemporal kriging at 30-min cadence in Vietnam.
+
+#### 7.7.2 Single-component metric variogram on the (AOD − CAMS) residual
+
+**Family.** Yang & Hu compared four ST covariance families (metric, product, separable, sum-metric) and selected sum-metric on minimum variogram-fit MSE on a Beijing 1 km × daily grid. v3.5.1 dropped sum-metric for Vietnam after a §4 empirical-variogram diagnostic on 30-min data: most (h_s, h_t) bins contained < 30 pairs and the temporal axis has a structural day-night hole (Stage A writes daytime slots only, so cross-day lags cluster near 13–15 h with no support in between). Three sub-components could not be jointly constrained on that surface. The live form is therefore single-component metric:
+
+```
+γ_ST(h_s, h_t) = γ_metric( √(h_s² + (k · h_t)²) )
+```
+
+— one CovModel `γ_metric` evaluated on the space-time metric distance, with anisotropy `k` (km/hour) converting time to an equivalent spatial distance. Four fitted parameters (`var`, `len_scale`, `nugget`, `k`) rather than seven. The CovModel family is configurable in `B1_VARIOGRAM_SPEC`; the current production setting is:
+
+| Element | Family / value | Initial guess |
+|---------|----------------|---------------|
+| Metric  | `Exponential` | var = 0.05, len_scale = 80 km, nugget = 0.005 |
+| `k`     | —             | 0.6 km/hour |
+
+`gstools` provides the CovModel. Empirical fit sets the ranges; the family is a structural prior, not a fitted parameter. `Spherical`/`Matern` are evaluated only if the §8.2.1 cross-fold variogram-parameter drift is large. The fitted parameters are persisted to `MODELS_DIR/st_variogram.json`.
+
+**Target: residual `AOD − CAMS`, not raw AOD.** `B1_VARIOGRAM_TARGET = 'aod_minus_cams'` switches the variogram fit and the kriger's predictand to `Stage A AOD − CAMS reanalysis AOD` at the same slot. CAMS already absorbs the large-scale spatial trend (synoptic transport, dust corridors), so kriging the residual gives a more stationary, smaller-range field whose sill matches its variance. CAMS is added back at the target cell after the kriging solve, then clipped to `[0, 5]`. Slots where CAMS coverage is unavailable at the target cell are left as NaN at that cell — there's no way to add back a missing prior. The legacy `target_kind='aod'` path is preserved in `kriging.py::krige_slot` for the §8 A/B comparison.
+
+#### 7.7.3 Variogram fitting — structured pair sampling
+
+Fit once on the training partition (Sep 2022 – Dec 2024). The implementation (`kriging.py::fit_variogram`) takes `B1_VARIOGRAM_SUBSAMPLE = 100 000` pair-distances, but **uniform random pairs over a (cell × slot × day) cube are dominated combinatorially by far-in-space AND far-in-time combinations**, leaving short-lag bins under-populated. The fitter therefore concatenates three structured samplers (`kriging._structured_pair_indices`):
+
+1. **Same-cell sampler** — up to `B1_VARIOGRAM_PAIRS_PER_CELL = 200` pairs per (lat, lon) cell, populating the `h_s ≈ 0` axis.
+2. **Same-slot sampler** — up to `B1_VARIOGRAM_PAIRS_PER_SLOT = 200` pairs per UTC slot, populating the `h_t ≈ 0` axis.
+3. **Mixed sampler** — uniform random pairs to fill the joint (h_s, h_t) interior, capped at `B1_VARIOGRAM_SUBSAMPLE`.
+
+The fitter then bins on a `B1_VARIOGRAM_N_BINS_S × B1_VARIOGRAM_N_BINS_T = 12 × 12` grid up to `B1_W_SPACE_KM × 1.5 = 150` km and `B1_VARIOGRAM_T_BAND_H = 10` h, drops bins with fewer than `B1_VARIOGRAM_MIN_BIN_PAIRS = 30` pairs (kills the cross-day-hotspot outliers), and runs `scipy.optimize.least_squares` against `√(pair_count)`-weighted residuals so bins backed by more observations carry more weight. Time is stored as real UTC hours, so the temporal-axis cap at 10 h **deliberately excludes cross-day lags** — that structural day-night gap holds no useful variogram information and was warping the fit. The temporal axis used by the variogram is therefore intra-day only.
+
+#### 7.7.4 Inference window
+
+A full ST kriging system over (~13 500 cells × ~1 330 days × ~21 slots) is computationally infeasible — the covariance matrix would have ~10¹⁴ entries. Inference uses a moving window per target (cell, slot):
+
+| Knob | Live value | Rationale |
+|------|------------|-----------|
+| `B1_W_SPACE_KM`        | 100 km   | ~2× the expected spatial range; large enough that fitted variogram down-weighting (not window clipping) determines the influence radius |
+| `B1_W_TIME_H`          | 12 h     | Covers same-day daytime neighbours; **does not bridge the full nighttime gap** between two adjacent days (~13–15 h). This is a deliberate trade-off — see §14 drift register |
+| `B1_MAX_NEIGHBOURS`    | 40       | Per-target neighbour cap to bound per-prediction wall time |
+| `B1_MIN_NEIGHBOURS`    | 8        | Below this, the cell falls back to climatology/local mean |
+
+The fix-doc target was `W_t = 24 h` and `MAX_NEIGHBOURS ≈ 150`, intended to ensure every target slot sees both the previous day's afternoon and the next day's morning. The live implementation uses 12 h and 40 neighbours; the design rationale and the empirical sensitivity test that justifies the choice are documented in §14. If wet-season case-study coherence (§8.2.5) shows discontinuities at day boundaries, `B1_W_TIME_H` is the first knob to widen.
+
+#### 7.7.5 Inference loop and edge handling
+
+For each UTC day `D` in the run window:
+
+1. Determine `[slot_first, slot_last]` from Stage A filenames (`discover_day_window`).
+2. Gather the spatiotemporal pool from the target's surrounding `(D-1, D, D+1)` window slots whose centres lie within `±B1_W_TIME_H` of the target slot. Each pool observation is `(lat, lon, t_h, AOD − CAMS)` when `target_kind='aod_minus_cams'`, else `(lat, lon, t_h, AOD)`.
+3. For each (cell, slot, D) with `slot ∈ [slot_first, slot_last]`:
+   - If Stage A has an observed value at this cell, pass it through unchanged (`is_observed = True`, `uncertainty = NaN`, `aod_550nm = Stage A AOD`).
+   - Otherwise, project the cell onto the unit sphere, query a `scipy.spatial.cKDTree` over the pool with a chord-distance radius corresponding to `B1_W_SPACE_KM = 100` km on the great circle, take the `B1_MAX_NEIGHBOURS = 40` nearest under the metric distance `√(h_s² + (k·h_t)²)`, solve the ordinary-kriging system, add CAMS back at the cell (for residual mode), and clip to `[0, 5]`.
+4. **No climatology backstop.** Per Yang & Hu (2018), cells where the spatiotemporal pool is empty (fewer than `B1_MIN_NEIGHBOURS = 8` neighbours), where the kriging linear solve fails (`np.linalg.LinAlgError`), or — in residual mode — where CAMS is unavailable at the target cell, are left as **NaN** in the output. This is a deliberate departure from the v3.5.0 "same-slot-of-day same-month mean" backstop: cells the kriger cannot honestly estimate are flagged via NaN rather than smeared with a smoothed climatology that downstream consumers cannot tell apart from a real prediction. RF (B2) then provides the second-opinion prediction at those cells through the parallel product tree.
+
+ST kriging variance is shipped as the `uncertainty` field (AOD² units; the `uncertainty_units` global attribute documents this). For residual-target mode the kriging variance is the variance of the residual; CAMS itself is treated as deterministic at apply time, so the residual variance is the AOD variance after CAMS-add-back. The variance does not, by construction, account for CAMS-side error — that is part of the §10 caveat list.
+
+#### 7.7.6 Coverage expectations
+
+Yang & Hu reported 67.73% mean pixel-level completeness from ST kriging alone (Beijing, daily). At 30-min cadence in Vietnam, **40–60% slot-level completeness from B1 alone** is the working prior, with the remaining gaps closed by B2 (RF). Re-evaluated after the first end-to-end run via the §8.2.3 coverage audit.
+
+### 7.8 Step B2 — Random Forest gap-fill per 30-min slot (Youn 2024 / Chen 2023 SIM, 30-min)
+
+#### 7.8.1 Predictor vector (24 features)
+
+The feature list is fixed in `stage_b/config.py::RF_FEATURES` (`RF_FEATURES_DYNAMIC + RF_FEATURES_STATIC + RF_FEATURES_QUASISTATIC`). All dynamic predictors are resampled to **0.05° × 30-min** before training; ERA5 (hourly) and CAMS (3-hourly) are linearly interpolated in time to the slot centre; IMERG (native 30-min) is bilinearly resampled in space only.
+
+| #   | Predictor                  | Source                       | Native res.     | Pre-processed to                                              |
+| --- | -------------------------- | ---------------------------- | --------------- | ------------------------------------------------------------- |
+| 1   | `cams_aod`                 | CAMS global forecasts        | 0.4° / 3-hourly | 0.05° / 30-min (bilinear space + linear time)                 |
+| 2   | `cams_aod_lag_3h`          | CAMS, lagged by `CAMS_LAG_HOURS = 3.0` | 0.4° / 3-hourly | 0.05° / 30-min — captures transport dynamics at CAMS's native cadence |
+| 3   | `t2m`                      | ERA5 T2m                     | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 4   | `dpt`                      | ERA5 Td2m                    | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 5   | `rh`                       | ERA5 RH                      | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 6   | `sp`                       | ERA5 surface pressure        | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 7   | `u10`                      | ERA5 U10                     | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 8   | `v10`                      | ERA5 V10                     | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 9   | `blh`                      | ERA5 PBLH                    | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 10  | `tcc`                      | ERA5 total cloud cover       | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 11  | `tcwv`                     | ERA5 total column water vapour | 0.25° / hourly | 0.05° / 30-min                                                |
+| 12  | `ssrd`                     | ERA5 surface downward solar  | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 13  | `fal`                      | ERA5 forecast albedo         | 0.25° / hourly  | 0.05° / 30-min                                                |
+| 14  | `precip_6h`                | GPM IMERG, 6 h backward sum  | 0.1° / 30-min   | 0.05° / 30-min — antecedent wet-scavenging memory             |
+| 15  | `precip_24h`               | GPM IMERG, 24 h backward sum | 0.1° / 30-min   | 0.05° / 30-min — synoptic-scale washout memory                |
+| 16  | `hours_since_rain_0p1mm`   | GPM IMERG, dry-spell clock since last rain ≥ `ANTECEDENT_RAIN_THRESHOLD_MM = 0.1` mm (capped at `ANTECEDENT_RAIN_LOOKBACK_H = 72` h) | 0.1° / 30-min | 0.05° / 30-min |
+| 17  | `hour_sin`                 | sin(2π · local-hour / 24)    | —               | per-slot scalar (UTC + `TZ_OFFSET_HOURS = 7`); **local time, not UTC**, because the diurnal cycle the RF needs to learn (sunrise, traffic peaks, boundary-layer growth) is anchored to local time |
+| 18  | `hour_cos`                 | cos(2π · local-hour / 24)    | —               | per-slot scalar                                               |
+| 19  | `month_sin`                | sin(2π · (month - 1) / 12)   | —               | per-slot scalar                                               |
+| 20  | `month_cos`                | cos(2π · (month - 1) / 12)   | —               | per-slot scalar                                               |
+| 21  | `elevation`                | Copernicus GLO-30 DEM        | 30 m → 0.05° mean | static                                                      |
+| 22  | `land_cover`               | MCD12Q1                      | annual          | static (refreshed by year)                                    |
+| 23  | `population`               | LandScan                     | annual          | static (refreshed by year)                                    |
+| 24  | `ndvi`                     | MOD13Q1 16-day composite     | 0.05°           | nearest-on-or-before in time (quasi-static)                   |
+
+**Total: 20 dynamic + 3 static + 1 quasi-static = 24 predictors.**
+
+**Drops vs the v3.5.0 / Youn 2024 derivative list.** v3.5.0's `lat_rad` and `lon_rad` were operating as a thinly-veiled spatial lookup table (RF latches onto coordinate splits) and were dropped — spatial structure is now carried only by `elevation`, `land_cover`, `population`, `ndvi` (real surface properties) and by ERA5/CAMS spatial gradients. v3.5.0's single-slot `tp` was dropped because a 30-min precip snapshot at the slot centre carries no information about aerosols that were washed out 6 h ago; antecedent precipitation (rows 14–16) replaces it with three windowed views of the rain history.
+
+**Adds and why.** Rows 14–16 (antecedent precip) replace `tp` with rolling 6 h / 24 h sums plus a dry-spell clock — direct aerosol-washout memory the RF would otherwise have to re-derive from `rh × ssrd` interactions. Rows 17–20 (cyclical hour-of-day + month-of-year, computed in *local* time using `TZ_OFFSET_HOURS = 7`) give the RF an explicit diurnal-and-seasonal coordinate it would otherwise re-derive from ssrd + t2m proxies; a regression-tree node on `hour_sin × hour_cos` partitions the diurnal cycle cleanly without an implicit time bias. Row 2 (`cams_aod_lag_3h`) provides the 3 h CAMS transport prior that matches CAMS's native 3-hourly cadence — useful when transient transport plumes lead the satellite by one CAMS time step.
+
+**Reconciliation with Youn 2024's 12-var set:**
+
+- ✔ Kept (semantically equivalent): CAMS (rows 1–2), T2m, Td2m, RH, U10, V10, PBLH, surface solar, surface pressure.
+- ⚠ Substituted: Youn used `HCDC` (high cloud cover); we use ERA5 `CloudCover` (total). Total is broader; Youn's HCDC was the lowest-importance variable at 2.55 % relative importance.
+- ✘ Missing: `LHFL` (surface latent heat flux). Not in the available ERA5 collection; the dominant signal (boundary-layer stability) is partially carried by PBLH and Td2m.
+- ➕ Added vs Youn: `tcwv` (hygroscopic-growth proxy), `fal` (albedo — Chen 2023 used it), `cams_aod_lag_3h`, antecedent precip, cyclical temporal context.
+
+**MERRA-2 deliberately excluded** as a Stage B predictor. MERRA-2 already underlies the Stage A bias correction (§7.4.1); using it again in Stage B would double-dip the same reanalysis signal and risk circular validation. CAMS is the sole reanalysis-AOD predictor (different model core, different aerosol species, separately assimilated chemistry).
+
+#### 7.8.2 Training-data construction
+
+Training pairs (X, y) come from the Stage A 30-min merged product on the train partition (Sep 2022 – Dec 2024), daytime slots only (per the per-day window discovery of §7.6.0). For each (cell, slot, day) where Stage A `AOD_merged` is finite and ≥ 0, `y = AOD_merged` (direct target) or `y = AOD_merged − cams_aod` (residual target, §7.8.3), and `X` is the 24-feature vector at that cell and slot.
+
+**Stratified subsampling — three-axis (month × slot_idx × aod_decile).** A full pass would produce ~2.4 × 10⁷ rows. `build_training_table` subsamples to `RF_TRAIN_TARGET_ROWS = 2 000 000` rows, stratified by `RF_STRATIFY_BINS = ('month', 'slot_idx', 'aod_decile')` with `RF_AOD_DECILES = 10`. AOD-decile is the v3.5.1 addition to the v3.5.0 (`month`, `slot_idx`) axis. Decile edges are learned from a first-pass histogram of the full training window's AOD values (no hard-coded thresholds — the policy travels intact across seasons and sensors), and the per-stratum budget is **equal across deciles within a given (month, slot_idx)** with a per-stratum floor of `max(50, target_rows / n_strata)`.
+
+The mechanic this is correcting: without the decile axis, the top AOD decile (~AOD > p90) gets crowded out roughly 50:1 by the bottom decile under uniform random sampling, because low-AOD cells outnumber high-AOD cells by that ratio. The RF then under-fits exactly the AOD > 1.5 haze events Vietnam most needs to characterise. With equal per-decile budgets, the top decile goes from ~10 % of the budget (proportional) to ~10 / n_strata of it (equal × availability cap), and the RF residual envelope on high-AOD events flattens. This is the §10 #21 mechanism.
+
+Median imputation is applied at training time to features that occasionally lack values (e.g., NDVI on no-composite cells, CAMS at the very edge of the domain). Imputation medians are computed on the train fold and persisted in the saved bundle.
+
+#### 7.8.3 Hyperparameter selection and residual target
+
+Selection criterion is **mean 5-fold temporal-CV R²** (§7.6.1), as enforced in `rf_gapfill.py::tune_rf`. Initial defaults (used when no tuning is run):
+
+```
+RF_N_ESTIMATORS     = 100
+RF_MAX_DEPTH        = 20
+RF_MIN_SAMPLES_LEAF = 5
+RF_N_JOBS           = -1
+RF_RANDOM_STATE     = 42
+RF_OOB_SCORE        = False  # never use OOB-R²
+```
+
+The `RF_GRID` swept by `tune_rf` is deliberately narrower than v3.5.0 prescribed, to keep the §12 timeline tractable in the residual-target regime:
+
+```
+n_estimators     ∈ {100, 200}
+max_depth        ∈ {15, 20}
+min_samples_leaf ∈ {5, 10}
+max_features     ∈ {'sqrt', 0.5}
+```
+
+— 16 combinations × 5 folds = 80 fits. v3.5.0's wider grid (n_est ∈ {100, 200, 500}, depth ∈ {15, 20, 25, None}, leaf ∈ {1, 5, 10}, max_features ∈ {sqrt, 0.5, 1.0} = 108 combinations × 5 folds = 540 fits) is recovered as a §11 stretch sweep if the bracketed grid's best point lies on a boundary.
+
+**Target: residual `AOD − CAMS` by default.** `RF_TARGET_KIND = 'aod_minus_cams'` shifts the RF to learn the residual rather than reproducing CAMS in tree-leaf form. `_apply_target_kind` rewrites `y` to `AOD − cams_aod` and drops rows where `cams_aod` is NaN (no way to define a residual against a missing prior). `cams_aod` stays in the feature matrix so the RF can condition on CAMS magnitude when shaping the residual. The legacy direct-target behaviour is preserved (`RF_TARGET_KIND = 'aod'`) for the §8 A/B comparison. The production bundle name is therefore `RF_RESIDUAL_BUNDLE_NAME = 'rf_tuned_residual'` (residual mode) or `rf_tuned` (direct mode); `run_stage_b.py --model-name` defaults from `RF_TARGET_KIND`.
+
+The tuning loop persists every grid point's `cv_r2_mean` and `cv_r2_std` to `MODELS_DIR/<name>_tune_results.csv`. The selected hyperparameters and the final bundle (model, feature column order, median-impute vector, training-window metadata, `target_kind`, all metrics) are saved with `joblib` to `MODELS_DIR/<name>.joblib`. The `target_kind` field defaults to `'aod'` when unpickling pre-v3.5.1 bundles, preserving backward compatibility.
+
+#### 7.8.4 Internal-consistency check
+
+After training, the bundle reports `rmse_train`, `rmse_cv_mean`, `rmse_cv_std`, `rmse_internal_test`, and per-fold metrics. The consistency check `consistency_check(metrics, tol=RMSE_CONSISTENCY_TOLERANCE = 0.15)` requires `rmse_train` and `rmse_internal_test` to lie within ±15% of `rmse_cv_mean`. Failure indicates either over-fitting (test ≫ CV) or distribution mismatch (train ≪ CV); either signals a re-look at the predictor pool or the subsample stratification before §8.
+
+#### 7.8.5 Inference loop
+
+`fill_range(start, end, bundle)`:
+
+1. For each UTC day `D` in `[start, end]`, iterate slots in `iter_window_slots(D)` (i.e., within the discovered window).
+2. For each slot: load Stage A merged grid (if present), build the feature grid via `build_feature_grid(slot_utc)`, predict with `predict_with_tree_sd` for the per-tree uncertainty, and write the NC file.
+3. Observed cells pass through (`is_observed = True`, RF prediction overridden by the Stage A value, `uncertainty = NaN`). Missing cells get the RF prediction (clipped to `[0, 5]`) and the per-tree-SD uncertainty.
+
+**CAMS add-back in residual mode.** When `target_kind == 'aod_minus_cams'`, `RFBundle.predict(X)` returns `tree_mean + X[:, cams_aod_col]`, i.e. the residual prediction plus the cell's CAMS value. `predict_with_tree_sd(X)` shifts the mean back to AOD space the same way; the per-tree SD is invariant under that additive shift, so the SD reported as `uncertainty` is in AOD units. The bundle records `target_kind` in its metadata so the inference path can branch correctly; older joblibs (pre-v3.5.1) that don't carry the field unpickle with `target_kind = 'aod'` and use the direct path. Cells where `cams_aod` is NaN at the target slot get NaN as the prediction (no add-back possible).
+
+**Per-tree SD as uncertainty.** `RFBundle.predict_with_tree_sd` stacks `tree.predict(X)` over `estimators_` and returns mean + std. This is **not OOB SE** (which would be optimistic under temporal autocorrelation per §7.6.1). Documented in the output NetCDF as `uncertainty_units = "AOD (per-tree SD across the RF ensemble)"`.
+
+#### 7.8.6 Expected performance
+
+Youn 2024 reported cell-blind RMSE 0.064 and AERONET-blind RMSE 0.208 on Korea at hourly cadence. The thesis sets no a-priori bound on Vietnam performance; the first §8.2.1 CV pass establishes the empirical baseline. Comparison vs Youn is reported in §8.2.6.
+
+### 7.9 Output schema (both Stage B products)
+
+Two parallel product trees:
+
+```
+STAGE_B_DIR/output/st_kriging/YYYY/MM/DD/aod_YYYYMMDD_HHMM.nc
+STAGE_B_DIR/output/rf/YYYY/MM/DD/aod_YYYYMMDD_HHMM.nc
+```
+
+~28,000 NC files per method (data-driven slot count per day). Each file is small (310 × 160 = 49 600 cells × 4 variables ≈ tens of KB compressed).
+
+**Per-file contents (single 30-min slot, identical schema both methods):**
+
+| Variable             | Dims       | Meaning                                                                                                  |
+| -------------------- | ---------- | -------------------------------------------------------------------------------------------------------- |
+| `aod_550nm`          | (lat, lon) | Filled AOD value (Stage A observation if available, else model prediction)                              |
+| `is_observed`        | (lat, lon) | Boolean: true = passed through from Stage A; false = model-filled                                         |
+| `uncertainty`        | (lat, lon) | ST kriging variance for `st_kriging/`; RF per-tree SD for `rf/`. NaN on observed cells                   |
+| `stage_a_weight_sum` | (lat, lon) | Stage A ICW weight sum, only on observed cells (NaN elsewhere) — provenance carried forward from Stage A |
+
+**Coordinates:** `lat`, `lon` (Vietnam 0.05° grid). Time is implicit in the filename and stored as a scalar global attribute.
+
+**Global attributes per file:**
+
+```
+slot_utc          = "2022-09-01T00:00:00Z"
+slot_index        = 0          # 0..47 within the day
+method            = "st_kriging" | "rf"
+method_version    = "v1.0"
+training_window   = "2022-09-01 to 2024-12-31"
+created_at        = ISO timestamp
+uncertainty_units = "AOD^2 (kriging variance)" | "AOD (per-tree SD across the RF ensemble)"
+```
+
+**Daily / monthly aggregations for the §8.2.6 RQ4 PM2.5 comparison** are computed as a post-processing step from each method's per-slot NC files independently and written to `STAGE_B_DIR/output_aggregated/{st_kriging,rf}_phys_daily/` (the `_phys_` infix marks the per-slot physics normalisation applied before the roll-up — see §8.2.6 for the chain). The roll-up is *not* a Stage B step.
+
+---
+
+## 8. Validation Strategy
+
+§8.1 (Stage A) and §8.2 (Stage B) follow the structure of the predecessor literature: Ahn 2021 / Gupta 2024 for the merged product, Chen 2023 / Youn 2024 / Yang & Hu 2018 for the gap-fill. The shared protocol below pins what every block uses.
+
+### 8.0 Shared validation protocol
+
+**Temporal split.** Train Sep 2022 – Dec 2024, held-out Jan 2025 – Apr 2026. All §7.4 calibration and §7.7/§7.8 model fitting use only the train partition. The held-out window is never touched until §8.
+
+**Metric panel.** Per Ahn 2021 Table 3 / Gupta 2024 Table 3 / Nguyen 2025 Tables 2–3:
+
+- `N`, `R`, `R²`, `RMSE`, `MAE`, `Bias` (sat − AERONET), `slope`, `intercept`, `%EE` with `EE = ±(0.05 + 0.15 · AOD_AERONET)`.
+
+Panels are computed per station, per season (Dry: Oct–Apr / Wet: May–Sep), and per confidence-flag tier (1–4 from §7.5) where applicable.
+
+**AERONET co-location.** Spatial: the 0.05° cell containing the AERONET station, optionally extended by the §7.0.1 fallback. Temporal: AERONET observations averaged within **±30 min of the slot centre** — for both Stage A (`AOD_merged`) and Stage B (per-slot gap-filled product). AERONET is Ångström-interpolated to 550 nm before any comparison.
+
+### 8.1 Stage A validation — is the merged 30-min product good?
+
+Validation answers: does the merged product agree with AERONET better than any single sensor? Does it agree with itself across sensors? Does it beat the published predecessor merges?
+
+#### 8.1.1 Held-out AERONET validation (headline test)
+
+For each 30-min slot in the held-out window, match `AOD_merged` at the AERONET cell with AERONET observations within ±30 min. Report the full metric panel per station, per season, and per confidence flag. Pass criteria:
+
+- Nghia Do: R ≥ 0.90, RMSE ≤ 0.30 averaged across confidence flags ≥ 2.
+- Bac Lieu: R ≥ 0.85, RMSE ≤ 0.20 averaged across confidence flags ≥ 2.
+- Dry-season bias inside [−0.05, +0.05] at both stations — confirms the §7.4 soft calibration removed the §5.1 baseline biases.
+
+#### 8.1.2 Pre/post-correction comparison
+
+For each (sensor, region, season) stratum: `RMSE_before`, `RMSE_after`, `RMSE_after_CV` from `soft_calibration.json`, plus held-out RMSE on training-window scatter. Per-stratum pass criterion: `RMSE_after ≤ RMSE_before − 0.02` or the stratum is routed to `'none'` (carrying the σ² penalty in §7.5). Held-out RMSE must lie within 1.5× CV RMSE — `> 2×` → overfit → routed to `'none'`.
+
+#### 8.1.3 Inter-sensor consistency (internal uncertainty)
+
+Where two or more sensors observe the same cell in the same slot, the across-sensor spread is an internal uncertainty estimate that doesn't require AERONET. Report inter-sensor R² per region for each sensor pair, before and after §7.4 soft calibration. Pass criterion: post-correction R² lifts by ≥ +0.10 in every region for at least one sensor pair. This is the only AERONET-comparable validation pathway for central Vietnam.
+
+#### 8.1.4 Comparison against baselines
+
+Four baselines, each validated on the held-out window with the same panel at both stations:
+
+- **B1 — best-single-sensor.** Bias-corrected VIIRS-only.
+- **B2 — Gupta 2024 equal-weight DT merge.** Same input grids, equal weights, no §7.4 calibration.
+- **B3 — Ahn 2021 NE Asia composite** where its publication overlaps Vietnam.
+- **B4 — Nguyen 2025 daily Himawari RANSAC.** The thesis daily product is fed into the same downstream regression structure.
+
+Claim being tested: the thesis merged product beats all four on AERONET-validated R, RMSE, %EE at *at least one* station for *at least one* season.
+
+#### 8.1.5 Precipitation-aware validation
+
+Validate the merged product separately for dry intervals (> 24 h since IMERG ≥ 0.1 mm hr⁻¹), post-rain intervals (0–12 h), and recovery intervals (12–24 h). Pass criterion: R ≥ 0.85 in dry intervals at both stations. A wet-interval R that collapses below 0.50 signals that wet-season σ²_TC for Himawari is under-estimated (§10 #13).
+
+#### 8.1.6 Case-study confirmation
+
+Three documented Vietnam aerosol events from the held-out window:
+
+1. Severe Hanoi dry-season haze (AOD > 1.5).
+2. March–April biomass-burning transport from mainland SEA.
+3. Precipitation washout (negative-control).
+
+Qualitative comparison vs MERRA-2 + Worldview imagery; Spearman rank vs Envisoft (≥ 50% completeness in the held-out window, per §4.3 / §10 #16); HYSPLIT overlay for case 2.
+
+---
+
+### 8.2 Stage B validation — head-to-head between ST kriging and RF
+
+Stage B ships two parallel products. §8.2 answers: *which method generalises better to held-out AERONET-blind slots?* and *do they agree spatially?*. The protocol comes from Chen 2023 §2.4 / §3.2, Youn 2024 §2.2.3 / §3.1, and Yang & Hu 2018 §3.
+
+`stage_b/run_stage_b.py::run_validation` and `stage_b/validate.py` implement the workflow; the entry points named below match the function names there for traceability.
+
+#### 8.2.1 Per-method internal cross-validation
+
+Each method reports a CV panel on the train partition (held-out window untouched):
+
+| Method | CV protocol | Source |
+| --- | --- | --- |
+| §7.7 ST kriging | Single-component metric variogram refit per fold on the other 4 folds' (cell, slot) residual `AOD − CAMS` pairs; CV-mean RMSE / R² reported on the back-transformed AOD; sanity on fitted variogram parameter drift across folds | Yang & Hu 2018; §7.6.1 |
+| §7.8 RF | 80/20 temporal-block internal test + 5-fold contiguous temporal-block CV inside the 80%. Selection criterion is mean CV-R². OOB-R² explicitly disabled | Youn 2024 §2.2.3; §7.6.1 |
+
+For RF, `rmse_train`, `rmse_cv_mean`, `rmse_cv_std`, `rmse_internal_test`, `r2_cv_mean`, `r2_cv_std`, `r2_internal_test` are recorded in the saved bundle's `metrics` field. `consistency_check` (±15%) must pass before a candidate moves to §8.2.2.
+
+#### 8.2.2 AERONET-blind validation (the headline comparison)
+
+Implemented in `validate.aeronet_pairs(test_start, test_end, candidate, blind_only=True)`.
+
+The setup:
+
+1. Identify slots in the held-out window where AERONET has a valid observation but the Stage A merged AOD at the AERONET cell was **missing** (cloud-occluded).
+2. Run each method to fill that cell; read the filled `aod_550nm` from the candidate's product tree.
+3. Compare the filled value against AERONET observations within ±30 min of the slot centre.
+
+Report the full metric panel per method, per station, per season. The per-method RMSE on filled-only matchups should lie within ~1.3× the §8.1.1 fused-product RMSE on observed matchups — beyond that, the fill is meaningfully worse than a direct observation.
+
+**Head-to-head:** `validate.compare_candidates({'B2_RF': pairs_rf, 'B1_ST_krig': pairs_krig})` produces a side-by-side panel; `validate.paired_skill(pairs_rf, pairs_krig)` computes paired RMSE difference and a paired t-test on errors over identical (cell, slot, day) keys. Fair because both methods predict the same set of points.
+
+The method with the lower held-out RMSE on filled-only matchups, averaged across both stations and both seasons, becomes the **headline gap-fill recommendation** for downstream PM2.5 users. The other method is *still* shipped (parallel product trees) — Stage C downstream consumers can choose.
+
+#### 8.2.3 Spatial coverage and provenance audit
+
+`validate.coverage_audit(...)`: per-month coverage fraction over Vietnam, pre-fill (Stage A merged) vs post-fill (per method). Per the §9 target, the gap-filled product must reach ≥ 95% slot-level coverage **within the day's observation window**.
+
+`validate.sso_stratified_rmse(...)`: stratify §8.2.2 RMSE by `slots_since_last_observed` (SSO) using the bins in `config.SSO_BINS = [-1, 0, 1, 4, 19, 49, ∞]` (labels: `observed`, `1 slot`, `≤ 2 h`, `≤ 10 h`, `≤ 25 h / one night`, `> 25 h`). The bin where the ML RMSE exceeds the §7.7 climatological-fallback RMSE is the empirical horizon beyond which RF is no better than climatology — reported as a hard cap on the ML recommendation.
+
+#### 8.2.4 Model-diagnostic checks
+
+Robustness, not pass/fail:
+
+- **RF variable importance** (`validate.variable_importance(model_name)`): normalised Gini importance for the 19 predictors. CAMS AOD and ERA5 dew-point temperature are expected to dominate (Youn 2024 reported 27.4% / 8.66% respectively); a different ordering in Vietnam is a finding, not a failure.
+- **Reanalysis-substitution sanity** (CAMS vs MERRA-2). Re-run the RF with MERRA-2 swapped for CAMS at training time. Held-out RMSE must agree within ±0.02 — agreement means the gap-fill is combining many predictors, not slaved to one reanalysis.
+- **Residual envelope vs AERONET AOD.** Mean residual ± 1σ binned at 0.1 AOD intervals, per method.
+- **Daytime variation against AERONET** (Chen 2023 Fig. 6 analogue). Slot-by-slot mean of gap-filled AOD vs AERONET slot-by-slot mean over the held-out window, per station — both methods on the same axes.
+
+#### 8.2.5 Case-study stress test (cloud-occluded windows)
+
+`validate.cloud_period_recovery(...)`: select a monsoon-season multi-day cloud window (48 consecutive missing daytime slots ≈ 2.3 days of complete daytime occlusion, drawn from July–August 2025). For each method:
+
+- Visual coherence of consecutive maps (no day-to-day discontinuities at cloud edges; spatial structure not collapsed to flat climatology).
+- Recovery check: when satellite retrievals resume, the merged value should align with the gap-fill of the prior slot within 1.5× the §8.2.2 filled-cell RMSE. A larger discontinuity means the gap-fill drifted during the occluded period.
+- ST-kriging-specific: variance field inflates monotonically across the occlusion (a good sign that uncertainty propagation is honest).
+- RF-specific: per-tree SD inflates where features depart far from training-distribution support.
+
+#### 8.2.6 Success table and RQ4 PM2.5 comparison
+
+**Post-processing chain (off the critical path of Stages A and B).** The RQ4 comparison vs Nguyen 2025 R² = 0.293 consumes each Stage B method's 30-min output through a three-step post-processing transform that lives outside both stages:
+
+1. **Per-slot physics normalisation** (the v3.5.1 §7.3 transform, relocated here in v3.5.2). For every (cell, slot) in each Stage B product:
+
+```
+AOD_phys = AOD_filled × (1 − RH/100)^γ / PBLH
+```
+
+with γ = 0.6 (Kotchenruther & Hobbs 1998), PBLH constrained ≥ 50 m, RH and PBLH from ERA5 bilinearly interpolated from 0.25° to 0.05° and nearest-hour matched to the 30-min slot centre with a 1 h absolute tolerance. Slots beyond that tolerance leave `AOD_phys = NaN` (the raw filled `AOD_550nm` from Stage B is unaffected). `AOD_filled` is `aod_550nm` from each Stage B NC — i.e. the dense gap-filled field, not the sparse Stage A merge. The transform is applied to **both** parallel products (B1 ST kriging and B2 RF) so the daily roll-up is like-for-like.
+
+2. **Daily roll-up.** Slot-mean across the day's observation window, per the §7.6.0 data-driven `[slot_first, slot_last]`. Both `AOD_550nm` (the raw daily mean) and `AOD_phys_daily` (the physics-normalised daily mean) are written. The slot-count is recorded for each cell so downstream consumers can apply their own floor on per-day completeness.
+
+3. **AOD–PM2.5 R² regression.** At each Envisoft station cell, daily `AOD_phys` is regressed against daily-mean PM2.5 using both OLS and RANSAC robust regression (residual threshold 1.5 × MAD, 50 % minimum sample, 1 000 trials), following Nguyen 2025. The merged AOD product is *not* RANSAC-filtered itself — that would discard real high-AOD events. The headline metric is daily AOD–PM2.5 R² per method (B1 phys / B2 phys), reported both with and without the physics normalisation so the §5.2 #7 lift (r = 0.110 → 0.162 at hourly cadence) is auditable at daily cadence in this domain.
+
+**Output tree.** Daily roll-ups are written to `STAGE_B_DIR/output_aggregated/{st_kriging,rf}_phys_daily/YYYY/MM/DD.nc` with the schema `{AOD_550nm_daily, AOD_phys_daily, ERA5_RH_dailymean, ERA5_PBLH_dailymean, slot_count}`. The roll-ups are produced once per method and consumed by the RQ4 regression. Both the with-physics and without-physics R² values are reported in §9.
+
+The §9 quantitative target table is reproduced per method, with achieved values filled in. The headline RQ4 question — which daily-rolled product gives the better daily PM2.5 R² — is answered on `AOD_phys_daily`; the raw-daily-mean `AOD_550nm_daily` regression is reported alongside as a sensitivity check on the physics transform's contribution.
+
+---
+
+## 9. Expected Outcomes and Deliverables
+
+1. **Vietnam 30-min merged AOD dataset** at 0.05°, Sep 2022 – Apr 2026, NetCDF, with provenance flags. Archived publicly.
+2. **Two Vietnam 30-min gap-filled AOD datasets** at 0.05° — `output/st_kriging/` (Yang & Hu 2018 framework, single-component metric variogram on the AOD−CAMS residual) and `output/rf/` (Youn 2024 / Chen 2023 SIM-style RF at 30-min cadence, residual target by default), with `is_observed`, per-method `uncertainty`, and `stage_a_weight_sum` provenance.
+3. **Bias-correction lookup tables** (linear soft-calibration `(α, β)` per sensor × region × season × product-level, plus the triple-collocation σ² table), distributed as supplementary data.
+4. **Methodological comparison report** of the two gap-filling strategies on the same domain — the first such head-to-head comparison for tropical Southeast Asia.
+5. **Validation against Gupta 2024, Ahn 2021, and best-single-sensor baselines.**
+6. **Recommendation document** for the downstream PM2.5 mapping project.
+
+**Quantitative targets:**
+
+| Metric                                                    | Baseline (best individual sensor / Gupta 2024) | Thesis target                                                                |
+| --------------------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------- |
+| AERONET R at Nghia Do                                     | 0.915 (VIIRS only)                             | ≥ 0.90 with full slot coverage on the AERONET cell                            |
+| AERONET R at Bac Lieu                                     | 0.845 (VIIRS only)                             | ≥ 0.85 with full slot coverage on the AERONET cell                            |
+| AERONET RMSE Nghia Do                                     | 0.271 (VIIRS only)                             | ≤ 0.30 averaged across confidence flags                                        |
+| Slot-level coverage over Vietnam (gap-filled product)     | 10.3% (Himawari L2 raw, hourly proxy)          | ≥ 95% slot-level coverage within each day's observation window               |
+| Daily AOD–PM2.5 R² (after post-processing daily roll-up)  | 0.293 (Himawari RANSAC, Nguyen 2025)           | ≥ 0.35 (either method)                                                        |
+| Daily AOD–PM2.5 R² (MODIS-equivalent ceiling)             | 0.573 (MODIS RANSAC)                           | — (ceiling reference)                                                         |
+
+---
+
+## 10. Limitations and Caveats
+
+1. **AOD availability is fundamentally ~10% before gap-filling.** Gap-filled values dominate ~90% of the 30-min product (and ~50–70% of any daily rollup, depending on the slot-count floor the downstream consumer applies) and must be flagged distinctly throughout the dataset.
+2. **Two AERONET sites only.** Central Vietnam has no in-situ ground truth. Bias correction for central cells is provided by the MERRA-2 anchor (§7.4.1); only the inter-sensor consistency check of §8.1.3 and the case studies of §8.1.6 / §8.2.5 validate central performance.
+3. **Himawari high VZA over northern Vietnam** elongates the atmospheric path; bias correction reduces but does not eliminate this geometric limitation.
+4. **MAIAC fails at Bac Lieu** (R = 0.411). The south is essentially served by Himawari + VIIRS; MAIAC's σ²_TC there is large and its automatic weight small.
+5. **Wet season in the north is unconstrained by LEO** (May–Sep). Compounds with caveat 13.
+6. **Spatially uniform hygroscopic exponent γ = 0.6.** Per-region γ tuning is future work.
+7. **PBLH unavailable at hourly resolution for ~25% of the study period**; replaced by monthly climatology over Jan–Jun 2024.
+8. **Gap-filled values are model estimates.** Flagged via `is_observed` in every Stage B NC file; should not be used for trend analysis or extreme-value statistics without an explicit `is_observed == True` filter.
+9. **ML gap-filling generalises only as far as training data.** Once-per-decade regimes absent from training are extrapolations.
+10. **Spectral harmonisation dropped.** Bounded at ~ΔR² of 0.003 and ΔRMSE of 0.001 (Nguyen 2025).
+11. **MAIAC bitmask filtering** rejects "Poor"-and-worse pixels (bits 8–11 ≤ 4), trading coverage for accuracy.
+12. **MERRA-2 structural smoothness.** Its native 0.5° × 0.625° resolution means the soft calibration learns the seasonal-regional mean shift, not fine-scale spatial structure. The inter-sensor consistency check (§8.1.3) is the only diagnostic that catches this for central Vietnam.
+13. **Wet-season Himawari is weighted automatically by σ²_TC; no hand-set down-weight applies.** The §8.1.1 wet/dry R ratio and the §8.1.5 precipitation-aware metrics are the only safety net.
+14. **Post-processing physics correction (§8.2.6) uses ERA5 RH/PBLH only.** In-situ surface RH is not yet incorporated. The transform is applied at slot cadence to each Stage B product before the daily roll-up that feeds the RQ4 PM2.5 R² regression; it does not modify the Stage A merge or the Stage B per-slot column-AOD fields used in §8.1 / §8.2.1–§8.2.5 validation.
+15. **Soft-calibration guard rails can route whole strata to `'none'`.** Those strata get a 2× σ² penalty (weight ↓ ~4×) at fusion.
+16. **§8.1.6 case studies use a relaxed Envisoft completeness threshold (≥50%) over the held-out window.**
+17. **Himawari L2/L3 merged per-pixel before fusion.** No per-pixel L2-vs-L3 provenance flag in the merged product.
+18. **VIIRS overpasses near a slot boundary contribute to two consecutive slots.** Mild positive temporal autocorrelation between adjacent slots near overpass time.
+19. **MAIAC no-orbit-timestamp days are dropped** (< 1% of MAIAC days).
+20. **ST-kriging temporal window (`B1_W_TIME_H = 12 h`) does not bridge the full nighttime gap.** Slots near the day-window edges may see only same-day neighbours rather than borrowing across the night. See §14 for the design rationale and the test plan that decides whether to widen.
+21. **RF training data is stratified-subsampled to 2 × 10⁶ rows** out of ~2 × 10⁷ available — the sub-sample is randomised within `(month, slot_idx, aod_decile)` strata with equal per-stratum budget, so AOD coverage is balanced across deciles but the effective row count per stratum is bounded. Re-tuning at full coverage is a stretch / future work; see §14.
+22. **Per-slot RF has no inter-slot temporal constraint.** If §8.2.5 reveals visible slot-to-slot noise in filled time series, a 3-slot rolling-mean smoother on the RF output is a v2 refinement.
+23. **ST-kriging warm-up.** Slots in the first ~24 h of Sep 2022 and the last ~24 h of Apr 2026 lack one side of the temporal window; flagged as warm-up / warm-down in any analysis.
+24. **Residual target depends on CAMS coverage at the target cell.** Both B1 (default `B1_VARIOGRAM_TARGET = 'aod_minus_cams'`) and B2 (default `RF_TARGET_KIND = 'aod_minus_cams'`) add CAMS back at apply time. Cells where CAMS is unavailable at the target slot are left as NaN in the residual-target output. CAMS coverage over the Vietnam bbox is effectively 100 % during the study period, so this is a defensive guarantee rather than an expected gap; flag any > 0 % NaN-from-missing-CAMS rate as a CAMS-pipeline regression. The kriging variance does not, by construction, account for CAMS-side error.
+25. **Variogram temporal axis is intra-day only (`T_BAND_H = 10 h`).** The fit deliberately discards cross-day pairs (which cluster near 13–15 h with no support in between), so the fitted temporal range is interpreted as a within-day decorrelation scale, not a cross-day one. Cross-day temporal borrowing happens only through the inference-time pool window (`B1_W_TIME_H = 12 h`), not through fitted variogram structure.
+26. **No climatology backstop in B1.** Cells the ST kriger cannot estimate (empty pool, singular linear solve, missing CAMS in residual mode) are written as NaN rather than smeared with a same-slot-of-day same-month mean. RF (B2) is the explicit second-opinion at those cells.
+
+---
+
+## 11. Scope Management — In / Out / Stretch
+
+**In scope (must complete):**
+
+- Steps A1–A5 (full Stage A: filtering, gridding, bias correction, fusion). Step A3 (physics normalisation) is retained as a label slot for traceability but is a no-op inside Stage A as of v3.5.2; the transform itself runs in §8.2.6 post-processing.
+- Step B1 (ST kriging, parallel product, also serves as ML evaluation baseline).
+- Step B2 (RF gap-fill per 30-min slot, primary ML candidate, parallel product).
+- §8.2.6 post-processing chain (per-slot physics normalisation + daily roll-up) for the RQ4 PM2.5 R² comparison.
+- §8.0, §8.1, §8.2 validation including the head-to-head ST kriging vs RF comparison.
+- §8.1.4 comparison vs Gupta 2024, best-single-sensor, and Nguyen 2025.
+
+**Stretch (do if time permits):**
+
+- §8.1.4 comparison vs Ahn 2021 (geographical overlap is thin).
+- §8.1.6 PM2.5 case studies (3 of 4).
+- RF re-tuning at full row coverage (drop the §10 #21 subsampling).
+- ST kriging `B1_W_TIME_H` sensitivity sweep at 12 h / 18 h / 24 h.
+- 3-slot rolling-mean smoother on RF output if §8.2.5 indicates need.
+
+**Stretch / future work:**
+
+- Per-region γ tuning.
+- Multi-year extension as more AERONET data arrives.
+- AERONET station near Đà Nẵng / Huế (external follow-up).
+
+If the timeline shrinks, Step B2 (RF) is the first thing to drop — Step B1 (ST kriging) alone produces a usable 30-min product (Yang & Hu reported 67% completeness from ST kriging alone at daily cadence; expect 40–60% slot-level completeness at our 30-min cadence).
+
+---
+
+## 12. Proposed Timeline
+
+| Phase                                    | Tasks                                                                | Duration |
+| ---------------------------------------- | -------------------------------------------------------------------- | -------- |
+| 1. Data preparation                      | Download & organise L2 products; AERONET re-processing               | 4 weeks  |
+| 2. Baseline validation extension         | Reproduce/extend per-sensor validation; add SNPP VIIRS               | 3 weeks  |
+| 3. Gridding pipeline (A1+A2)             | 0.05° box-averaging code for all sensors, persistent intermediate    | 3 weeks  |
+| 4. Bias correction (A4)                  | Soft calibration vs MERRA-2 + TC σ² table                            | 5 weeks  |
+| 5. Fusion (A5)                           | TC-weighted merge; produce 30-min files for full period               | 2 weeks  |
+| 6a. ST kriging (B1)                      | Variogram fit, gstools moving-window inference, parallel product     | 3 weeks  |
+| 6b. RF gap-fill (B2)                     | Feature pipeline (ancillary loaders), tuning, fill, parallel product | 4 weeks  |
+| 7. Validation + §8.2.6 post-processing   | Held-out AERONET, head-to-head, SSO bins, case studies; per-slot physics normalisation + daily roll-up; RQ4 PM2.5 R² | 5 weeks  |
+| 8. Writing                               | Thesis document                                                       | 6 weeks  |
+
+Total: ~35 weeks. ~32 weeks without §8.1.4 Ahn 2021 comparison.
+
+---
+
+## 13. Connection to Downstream PM2.5 Project
+
+This thesis produces the AOD input layer. The PM2.5 project will:
+
+- Use 27 Envisoft PM2.5 monitoring stations (10/8/9 north/central/south) as PM2.5 ground truth.
+- Apply physics-based correction (RH, PBLH) plus ML (LightGBM / RF / DL) on top of the thesis's AOD layer.
+- Use ERA5 meteorology + GPM IMERG precipitation as covariates.
+- Deliver near-real-time PM2.5 maps by feeding live Himawari through the same bias-correction + gap-filling pipeline.
+
+**Performance ceiling** (from Nguyen 2025, daily RANSAC):
+
+| Input                  | Daily R² | Notes                          |
+| ---------------------- | -------- | ------------------------------ |
+| Raw Himawari AOD       | 0.028    | Negligible                     |
+| Corrected Himawari AOD | 0.293    | 10× improvement over raw       |
+| Corrected MODIS AOD    | 0.573    | Benefits from midday BL mixing |
+
+The merged product is expected to lie between the Himawari-only and MODIS-only daily numbers. The near-real-time use case specifically depends on Himawari's 10-min cycle, so the Himawari bias correction in §7.4 is the *critical enabling component* of the entire downstream operational system.
+
+---
+
+## 14. Implementation drift register (v3.5.1)
+
+Places where the live code in `stage_a/` and `stage_b/` differs from the body of this plan. Each entry quotes the live value and the design rationale.
+
+**Retired in v3.5.1 (promoted into the body).** The v3.5.0 register's entries about (a) sum-metric vs single-component variogram, (b) RF feature pool, (c) AERONET fallback temporal-split vs k-fold CV, and (d) `TC_MIN_TRIPLETS = 50` vs `3` are no longer drifts — the live values now match the v3.5.1 body. See §7.4.1.1, §7.4.2, §7.7.2, §7.8.1.
+
+**Live drifts remaining in v3.5.1:**
+
+| # | Plan / fix-doc target | Live value (`stage_b/config.py`) | Rationale and re-tune plan |
+|---|----------------------|----------------------------------|-----------------------------|
+| 1 | ST kriging temporal window `W_t = 24 h` (to bridge the nighttime gap and let every target see both flanking days) | `B1_W_TIME_H = 12.0` h | A 24-h window combined with `B1_MAX_NEIGHBOURS` ~150 would multiply per-target kriging cost ~3.5×. 12 h with 40 neighbours runs each (cell, slot) in well under 100 ms, which is what made the full ~28 000-file run tractable for v1. The trade-off: targets near the start or end of a day's observation window can't borrow from the previous-or-next day. This is acceptable in v1 because the same-day spatial structure (now operating on the AOD−CAMS residual) carries most of the predictive power inside a single observation window. **Re-tune trigger:** §8.2.5's case-study cloud-recovery test — widen to 18 h, then 24 h, with `B1_MAX_NEIGHBOURS` adjusted to hold wall time within budget. |
+| 2 | `B1_MAX_NEIGHBOURS ≈ 150` (Yang & Hu 2018 used ~150 neighbours per target) | `B1_MAX_NEIGHBOURS = 40` | Wall-time-bound at the chosen `B1_W_TIME_H`. Beijing's 1 km × daily grid had a much denser neighbour cloud than Vietnam's 0.05° × 30-min grid; 40 neighbours is empirically adequate for the inversion to be well-conditioned with the live (single-component metric) variogram fit. Same re-tune trigger as #1. |
+| 3 | RF training rows: every valid (cell, slot, day) ≈ 2.4 × 10⁷ rows | `RF_TRAIN_TARGET_ROWS = 2 × 10⁶` rows, stratified by `(month, slot_idx, aod_decile)` with per-stratum floor `max(50, target / n_strata)` | A full pass triples the sklearn fit time per hyperparameter point, making the §7.8.3 grid search infeasible in the §12 timeline. The three-axis stratification (decile is the v3.5.1 addition) prevents the top AOD decile from being out-voted ~50:1 by low-AOD slots. **Re-tune plan:** the §11 stretch list includes a full-coverage retraining pass once the head-to-head method choice is settled in §8.2.2. |
+| 4 | RF hyperparameter grid: v3.5.0 wide grid (108 combos × 5 folds = 540 fits) | `RF_GRID` 16 combos × 5 folds = 80 fits (`n_est ∈ {100, 200}`, `depth ∈ {15, 20}`, `leaf ∈ {5, 10}`, `max_features ∈ {sqrt, 0.5}`) | The bracketed grid covers the regions where v3.5.0's 540-fit sweep landed in early diagnostics. If the chosen point lies on a grid boundary, the wider grid is run as a §11 stretch. |
+| 5 | Stage B AERONET temporal match window | ±30 min slot centre, identical to Stage A (see §8.0) | Match. No drift. |
+| 6 | Per-method uncertainty source | ST kriging variance (AOD² units, with CAMS treated as deterministic at apply time); RF per-tree SD across `estimators_` (AOD units, *not* OOB SE) | Match. Per-file `uncertainty_units` global attr documents the distinction. |
+| 7 | `RF_OOB_SCORE` | `False` (enforced) | Match. Documented in §7.6.1 / §7.8.3. |
+| 8 | Variogram empirical sampler (v3.5.0 prose: bin uniform random pairs) | Three concatenated samplers (`same-cell`, `same-slot`, `mixed`), each with its own cap (`B1_VARIOGRAM_PAIRS_PER_CELL/SLOT = 200`), pairs filtered to `h_t ≤ B1_VARIOGRAM_T_BAND_H = 10 h`, bins with `< B1_VARIOGRAM_MIN_BIN_PAIRS = 30` pairs dropped | Uniform random pairs over (cell × slot × day) under-populate short-lag bins because far-in-space + far-in-time combinations dominate combinatorially. Structured sampling restores marginal coverage; the `h_t ≤ 10 h` cap excludes the structural cross-day gap (lags clustering near 13–15 h with nothing in between) that warped the v3.5.0 fit. |
+| 9 | RF predictor lat/lon: implicit-position features | Dropped (`lat_rad`, `lon_rad` retained in `build_feature_grid` for backward compat with pre-§7.8.1 bundles, but not in `RF_FEATURES`) | RF was using them as a thinly-veiled lookup table; spatial structure is carried by real surface properties (`elevation`, `land_cover`, `population`, `ndvi`) and reanalysis gradients. |
+| 10 | ST kriging climatology backstop (v3.5.0 §7.7.5) | Dropped — cells the kriger can't estimate are written as NaN | Per Yang & Hu (2018) discipline: a smoothed-climatology fallback is indistinguishable from a real prediction to downstream consumers and obscures the gap-fill confidence story. RF is the explicit second-opinion at those cells in the parallel-product design. |
+
+Stage A in-code constants reconcile cleanly with the v3.5.1 body: `SOFT_CAL_MIN_PAIRS = 100`, `SOFT_CAL_ALPHA ∈ [0.5, 2.0]`, `|SOFT_CAL_BETA| ≤ 0.2`, `NONE_PENALTY_FACTOR = 2.0`, `TC_MIN_TRIPLETS = 3`, `TC_MIN_COLLOCATIONS = 500`, `SOFTCAL_BLEND_HALF_WIDTH = 0.5°`, `BOX_STD_ABS_FLOOR = 0.05`, `SENSOR_EE_SLOPE` per-sensor table (`himawari/viirs: 0.20`, `modis_maiac: 0.10`, `merra2: 0.17`) — all match the §7.4.1 / §7.4.2 / §7.5 / §7.0.1 prose verbatim. The collocation `BOX_STD_SLOPE` table per sensor is recorded at collocation time but production fusion does not enforce it, as §7.0.1 documents. AERONET-fallback live constants: `AERONET_FALLBACK_MIN_PAIRS = 40`, `AERONET_FALLBACK_ALPHA_MIN/MAX = 0.3/3.0`, `AERONET_FALLBACK_BETA_ABSMAX = 0.4`, `AERONET_FALLBACK_RMSE_DROP_MIN = 0.05` — all match §7.4.1.1.
+
+---
+
+## References
+
+- Ahn, S., Chung, S.-R., Oh, H.-J., Chung, C.-Y. (2021). Composite Aerosol Optical Depth Mapping over Northeast Asia from GEO-LEO Satellite Observations. *Remote Sensing*, 13, 1096. **[Primary methodological predecessor — CDF + IDW + ICW fusion]**
+- Buchard, V., Randles, C. A., da Silva, A. M., Darmenov, A., Colarco, P. R., Govindaraju, R., et al. (2017). The MERRA-2 aerosol reanalysis, 1980 onward. Part II: Evaluation and case studies. *Journal of Climate*, 30, 6851–6872.
+- Chen, A., Yang, J., He, Y., Yuan, Q., Li, Z., Zhu, L. (2023). High spatiotemporal resolution estimation of AOD from Himawari-8 using an ensemble machine learning gap-filling method. *Science of the Total Environment*, 857, 159673. **[RF SIM template — TIM upsampler is not applicable to this 30-min pipeline]**
+- Ding, Y., Li, S., Xing, J., Yang, J., Dong, J., Hu, S., Teng, M., Ni, W., & Jiang, J. (2025). Global hourly seamless AOD through measurement-adjusted machine learning fusion of multi-satellite and reanalysis data. *GIScience & Remote Sensing*, 62(1), 2586203. **[Soft-calibration linear form against MERRA-2; §7.4.1]**
+- Gruber, A., Su, C.-H., Zwieback, S., Crow, W., Dorigo, W., & Wagner, W. (2016). Recent advances in (soil moisture) triple collocation analysis. *International Journal of Applied Earth Observation and Geoinformation*, 45(B), 200–211.
+- Gupta, P. et al. (2024). Increasing aerosol optical depth spatial and temporal availability by merging datasets from geostationary and sun-synchronous satellites. *Atmospheric Measurement Techniques*, 17, 5455–5476. **[Global LEO-GEO DT merged product; the Vietnam-coarse benchmark to beat]**
+- Holben, B. N. et al. (1998). AERONET — A federated instrument network and data archive for aerosol characterization. *Remote Sensing of Environment*, 66, 1–16.
+- Inness, A., Ades, M., Agustí-Panareda, A., Barré, J., Benedictow, A., Blechschmidt, A.-M., et al. (2019). The CAMS reanalysis of atmospheric composition. *Atmospheric Chemistry and Physics*, 19(6), 3515–3556.
+- Kotchenruther, R. A. & Hobbs, P. V. (1998). Humidification factors of aerosols from biomass burning in Brazil. *Journal of Geophysical Research*, 103, 32081–32089.
+- Levy, R. C., Mattoo, S., Munchak, L. A., Remer, L. A., Sayer, A. M., Patadia, F., & Hsu, N. C. (2013). The Collection 6 MODIS aerosol products over land and ocean. *Atmospheric Measurement Techniques*, 6, 2989–3034.
+- Lyapustin, A. et al. (2018). MODIS Collection 6 MAIAC algorithm. *Atmospheric Measurement Techniques*, 11, 5741–5765.
+- McColl, K. A., Vogelzang, J., Konings, A. G., Entekhabi, D., Piles, M., & Stoffelen, A. (2014). Extended triple collocation: Estimating errors and correlation coefficients with respect to an unknown target. *Geophysical Research Letters*, 41(17), 6229–6236.
+- Nguyen, K. T., Trinh, A. H., Bui, C. K. (2025). Assessing the Feasibility of Estimating Air Quality in Vietnam Using Satellite Data. *Student Scientific Research Conference, Hanoi University of Science and Technology*. **[Team paper — empirical anchor for this thesis]**
+- Randles, C. A., da Silva, A. M., Buchard, V., Colarco, P. R., Darmenov, A., Govindaraju, R., et al. (2017). The MERRA-2 aerosol reanalysis, 1980 onward. Part I: System description and data assimilation evaluation. *Journal of Climate*, 30, 6823–6850.
+- Remer, L. A. et al. (2012). Retrieving aerosol in a cloudy environment. *Atmospheric Measurement Techniques*, 5, 1823–1840.
+- Sayer, A. M., Hsu, N. C., Lee, J., Kim, W. V., & Dutcher, S. T. (2020). Validation, stability, and consistency of the VIIRS Deep Blue aerosol data record from 2012–2019. *Journal of Geophysical Research: Atmospheres*, 125, e2019JD031781. **[VIIRS Deep Blue reference]**
+- Stoffelen, A. (1998). Toward the true near-surface wind speed: Error modeling and calibration using triple collocation. *Journal of Geophysical Research: Oceans*, 103(C4), 7755–7766. **[Triple-collocation foundation paper]**
+- van Donkelaar, A. et al. (2010). Global estimates of ambient fine particulate matter concentrations from satellite-based aerosol optical depth. *Environmental Health Perspectives*, 118, 847–855.
+- Yang, Q., & Hu, T. (2018). Spatiotemporal kriging for gap filling of MODIS aerosol optical depth: A case study over Beijing, China. *Science of the Total Environment*, 633, 677–683. **[Stage B Step B1 — sum-metric ST kriging template]**
+- Yoshida, M. et al. (2018). Common retrieval of aerosol properties for imaging satellite sensors. *Journal of the Meteorological Society of Japan*, 96B, 193–209. **[Himawari/AHI retrieval algorithm]**
+- Youn, Y., Kim, S., Kim, S. H., Lee, Y. (2024). Spatial Gap-Filling of Himawari-8 Hourly AOD Products Using Machine Learning with Model-Based AOD and Meteorological Data: A Focus on the Korean Peninsula. *Remote Sensing*, 16, 4400. **[Stage B Step B2 — pure-RF gap-fill reference]**
+
+---
+
+*__Draft v3.5.2 — Step A3 (physics normalisation) relocated from Stage A to §8.2.6 post-processing (2026-06-25).__ The transform `AOD_phys = AOD × (1−RH/100)^γ / PBLH` (γ = 0.6, Kotchenruther & Hobbs 1998; PBLH floor 50 m; ERA5 RH/PBLH bilinearly interpolated to 0.05° and nearest-hour matched ±1 h to the slot centre) is unchanged in numerical recipe. What changes is its place in the pipeline: it now operates on each Stage B product's per-slot gap-filled `aod_550nm` field as the first step of the §8.2.6 / RQ4 PM2.5 R² post-processing chain, ahead of the daily roll-up. Stage A NetCDFs no longer carry `AOD_phys_corrected`, `era5_rh`, or `era5_pblh`; the new post-processing tree at `STAGE_B_DIR/output_aggregated/{st_kriging,rf}_phys_daily/` carries them. Rationale: Stage A's role is bias-corrected column-AOD fusion (raw column AOD is what AERONET measures and what every published baseline reports), and the physics-correction lift documented in §5.2 #7 materialises only in the AOD↔PM2.5 coupling, not in the column-AOD product itself. The numbering A1–A5 is retained for traceability across versions; A3 is now a no-op inside Stage A and §7.3 is a forward-pointer to §8.2.6. Sections touched: §3 spec table, §4.4 (ERA5 row), §5.2 #7, §6 (overview diagram), §7.3 (rewritten as a relocation pointer), §7.5 (output schema), §7.9 (output tree path), §8.2.6 (post-processing chain documented in full), §10 #14, §11 (scope), §12 (timeline). RQ1–RQ4 wording is unchanged; Stage A's MERRA-2 + TC σ² architecture is unchanged; Stage B's B1/B2 methodology is unchanged.*
+
+*__Draft v3.5.1 — Code-reconciliation refresh (2026-06-23).__ Five live-code drifts promoted from §14 into the body — single-component metric variogram (sum-metric dropped), residual `AOD − CAMS` target for both gap-fillers, RF feature pool rebuilt 19 → 24 (lat/lon/tp out; antecedent precip + cyclical time + CAMS lag in), AERONET fallback uses k-fold CV with widened α/β bounds and stricter RMSE drop, cosine-taper region blending at apply time. TC table thresholds also drifted (`TC_MIN_TRIPLETS = 3`, `TC_MIN_COLLOCATIONS = 500`). §10 grows from 23 to 26 caveats (residual-target CAMS dependency, intra-day-only variogram axis, no climatology backstop). §14 drift register rewritten; four prior drifts retired (now in body); two new ones logged (structured-pair sampler, lat/lon retention for backward compat with `rf_tuned.joblib`).*
+
+*__Draft v3.5.0 — Stage B implementation reconciliation: parallel ST kriging + RF products at 30-min cadence, drift register added.__ Stage A architecture is unchanged from v3.4.0 (MERRA-2-anchored bias correction + AERONET-independent TC fusion weights). Key changes vs v3.4.0:*
+
+*__(P1) Stage B daily aggregation deleted.__ Old §7.6 (daily collapse) is gone. Stage B runs at 30-min cadence end-to-end inside each day's data-driven observation window (§7.6.0). Daily roll-ups, where needed for the §8.2.6 RQ4 PM2.5 comparison, are performed downstream as post-processing.*
+
+*__(P2) Stage B is now two parallel product trees.__ `output/st_kriging/` (Yang & Hu 2018 sum-metric ST kriging, §7.7) and `output/rf/` (Youn 2024 / Chen 2023 SIM-style RF at 30-min, §7.8) ship side-by-side, both dense within each day's window, both with the same 4-variable per-file schema. The §8.2 head-to-head comparison decides which is the downstream PM2.5 recommendation; both are archived.*
+
+*__(P3) Chen 2023 TIM and the v3.4 RF + DNN "Candidate 2" are dropped.__ TIM is a temporal upsampler (hourly → 10-min), not a temporal gap-filler; the per-slot RF already provides full spatiotemporal coverage as a side effect of running at every slot. The §11 scope list, §8.2 validation block, and §7.8.x sections are all simplified accordingly.*
+
+*__(P4) Output schema rewritten.__ The v3.4 `gap_fill_method` enum and the co-shipped `aod_kriging_baseline` row are replaced by the two-tree layout described in §7.9. Each tree carries `aod_550nm`, `is_observed`, `uncertainty`, `stage_a_weight_sum` — uniform across methods.*
+
+*__(P5) Predictor list rebuilt against the project's actual ERA5 collection.__ 19 predictors total (§7.8.1): CAMS + 11 ERA5 fields (T2m, Td2m, RH, SP, U10, V10, PBLH, total cloud cover, TCWV, surface solar, albedo) + IMERG precip + 5 static (elevation, land cover, population, lat_rad, lon_rad) + 1 quasi-static (NDVI). MERRA-2 deliberately excluded as a Stage B predictor (already consumed by Stage A; double-dipping risk). Youn 2024's HCDC replaced by ERA5 total cloud cover; LHFL skipped (not in collection); TCWV and albedo added.*
+
+*__(P6) Validation cadence aligned across Stage A and Stage B.__ Both stages now match AERONET within ±30 min of the slot centre (§8.0). The v3.4 "across the local day for Stage B" is gone — Stage B's atomic unit is the slot, not the day.*
+
+*__(P7) Implementation drift register added (§14).__ The live `stage_b/config.py` values for `B1_W_TIME_H = 12 h`, `B1_MAX_NEIGHBOURS = 40`, and `RF_TRAIN_TARGET_ROWS = 2 × 10⁶` are documented with the rationale for each gap vs the fix-doc targets, plus a §8.2.5-triggered re-tune plan. This makes the as-built configuration auditable without burying the deviation inside a config file.*
+
+*__(P8) Caveats consolidated.__ §10 grows from 19 to 23 entries: caveats 20–23 cover the ST-kriging temporal window edge effect (#20), the RF training sub-sample (#21), the per-slot RF temporal-coherence note (#22), and the ST-kriging warm-up at dataset edges (#23). The v3.4 daily-aggregation rationale ("3-slot floor") is removed as no longer applicable.*
+
+*__(P9) References add Yang & Hu (2018)__ as the Stage B Step B1 methodological template.*
+
+*Pre-v3.5.0 history (condensed): v3.3 introduced per-pixel Himawari L2/L3 stratum-aware merge and ICW fusion; v3.4.0 pivoted bias correction to MERRA-2 and fusion weights to triple collocation (both AERONET-independent), preserving AERONET for held-out validation. The v3.5.0 entry above describes the changes vs v3.4.0 in detail.*

@@ -309,9 +309,30 @@ MODIS_QA_BITS_MAX = 4
 
 # ── Temporal parameters ───────────────────────────────────────────────────────
 TZ_OFFSET_HOURS = 7    # Vietnam local time = UTC + 7
-SLOT_MINUTES    = 30   # 30-min merged product cadence
+
+# Product temporal resolution switch — set to 30 for the legacy half-hourly
+# cadence or 60 for an hourly product.  Must divide 1440 evenly.  Every
+# downstream slots-per-day constant is derived from this; hourly produces
+# half as many NetCDFs and halves wall-time end-to-end at the cost of losing
+# the HH:30 Himawari L2 slot resolution.
+# SLOT_MINUTES    = 30
+SLOT_MINUTES    = 60
+assert (24 * 60) % SLOT_MINUTES == 0, 'SLOT_MINUTES must divide 1440 evenly'
+SLOTS_PER_DAY   = (24 * 60) // SLOT_MINUTES
+
 LEO_WINDOW_MIN   = 30   # ±minutes window for Himawari L2 / VIIRS–AERONET co-location
 MODIS_WINDOW_MIN = 30   # ±minutes window for per-orbit MODIS–AERONET co-location
+
+# Himawari file-selection windows — ±minutes around slot centre.  Scale with
+# SLOT_MINUTES so adjacent slots cleanly partition the native 10-min L2 files.
+#   • L2 10-min cadence: window = SLOT_MINUTES/2 keeps 6 files per hourly slot
+#     (3 per 30-min slot), with no overlap between adjacent slots.
+#   • L3 1-hourly cadence: fixed ±30 min — exactly one file per hourly slot;
+#     at 30-min cadence the HH:30 slot averages the flanking HH:00/HH+1:00
+#     files (and HH:00 slots pick up the on-the-hour file alone), preserving
+#     the legacy v3.4 behaviour.
+HIMAWARI_L2_WINDOW_MIN = SLOT_MINUTES // 2
+HIMAWARI_L3_WINDOW_MIN = 30
 
 # ── Collocation spatial sampling (Ichoku et al. 2002; Levy et al. 2010) ───────
 # Flag values written to the spatial_flag column of collocated CSVs
@@ -352,7 +373,8 @@ ERA5_MONTHLY_DIR = DATA_ROOT / 'ERA5' / '_monthly_raw'
 MERRA2_DIR       = DATA_ROOT / 'MERRA2' / 'M2T1NXAER'
 MERRA2_AOD_VAR   = 'TOTEXTTAU'   # total aerosol extinction AOD at 550 nm
 
-OUTPUT_DIR       = DATA_ROOT / 'Stage_A'
+# OUTPUT_DIR       = DATA_ROOT / 'Stage_A'
+OUTPUT_DIR       = DATA_ROOT / 'Stage_A_hourly'
 EXTRACT_DIR      = OUTPUT_DIR / 'extracted'     # satellite AOD time series at stations (validation)
 COLLOCATE_DIR    = OUTPUT_DIR / 'collocated'    # satellite–AERONET matched pairs (validation)
 GRIDDED_DIR      = OUTPUT_DIR / 'gridded'       # per-sensor 30-min A2 NetCDFs

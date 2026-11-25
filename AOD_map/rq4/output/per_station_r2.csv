@@ -1,0 +1,199 @@
+product,stationName,r2,inlier_frac,n_days,variant,region3
+b1_st_kriging,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.035855935611662004,0.6589861751152074,434,no_phys,South
+b1_st_kriging,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),0.000201436984687553,0.6909975669099757,411,no_phys,Central
+b1_st_kriging,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),0.0070658544491450925,0.7218543046357616,453,no_phys,South
+b1_st_kriging,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),3.879704327802713e-07,0.7701149425287356,435,no_phys,South
+b1_st_kriging,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.5199020876883914,0.5971014492753624,345,no_phys,North
+b1_st_kriging,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.4927236628124049,0.6274509803921569,357,no_phys,North
+b1_st_kriging,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.6630981358444465,0.6539509536784741,367,no_phys,North
+b1_st_kriging,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.6420201724774809,0.598314606741573,356,no_phys,North
+b1_st_kriging,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.43035894239368455,0.5975975975975976,333,no_phys,North
+b1_st_kriging,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),0.6000355691247854,0.5425219941348973,341,no_phys,North
+b1_st_kriging,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),0.11434997222920362,0.6883408071748879,446,no_phys,South
+b1_st_kriging,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),0.6803295404399017,0.674863387978142,366,no_phys,North
+b1_st_kriging,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.044090546467984604,0.691747572815534,412,no_phys,Central
+b1_st_kriging,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),0.6165004612990252,0.5714285714285714,336,no_phys,North
+b1_st_kriging,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),0.39442867657852765,0.6234939759036144,332,no_phys,North
+b1_st_kriging,Trà Vinh: Tp. Trà Vinh (KK),0.15645947215616818,0.6770601336302895,449,no_phys,South
+b1_st_kriging,"Trà Vinh: xã Dân Thành, TX Duyên Hải (KK)",0.10629914113495575,0.5489749430523918,439,no_phys,South
+b1_st_kriging,Tây Ninh: Thị xã Trảng Bàng (KK),0.10434790923992177,0.6535796766743649,433,no_phys,South
+b1_st_kriging,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,0.05406371733783277,0.6755555555555556,450,no_phys,South
+b1_st_kriging,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),0.2949333132791331,0.6831168831168831,385,no_phys,Central
+b2_rf,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.0034380606035461225,0.6775599128540305,459,no_phys,South
+b2_rf,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),0.08825354387231521,0.7047413793103449,464,no_phys,Central
+b2_rf,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),0.0006260853804549438,0.6907216494845361,485,no_phys,South
+b2_rf,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),0.006466506043230069,0.7462039045553145,461,no_phys,South
+b2_rf,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.5429960730855212,0.6401766004415012,453,no_phys,North
+b2_rf,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.31791611705273926,0.6527196652719666,478,no_phys,North
+b2_rf,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.5122317093634291,0.6804123711340206,485,no_phys,North
+b2_rf,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.6103704443393192,0.6226415094339622,477,no_phys,North
+b2_rf,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.5656206133859161,0.5818181818181818,440,no_phys,North
+b2_rf,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),0.7066617450377732,0.5973741794310722,457,no_phys,North
+b2_rf,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),0.001975402092173839,0.678646934460888,473,no_phys,South
+b2_rf,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),0.5296991042501948,0.6962025316455697,474,no_phys,North
+b2_rf,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.4113213399528962,0.6816239316239316,468,no_phys,Central
+b2_rf,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),0.6336143296574406,0.5982339955849889,453,no_phys,North
+b2_rf,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),0.3048475465111179,0.6466942148760331,484,no_phys,North
+b2_rf,Trà Vinh: Tp. Trà Vinh (KK),0.009706419083005291,0.6687631027253669,477,no_phys,South
+b2_rf,"Trà Vinh: xã Dân Thành, TX Duyên Hải (KK)",0.1467338577746985,0.547568710359408,473,no_phys,South
+b2_rf,Tây Ninh: Thị xã Trảng Bàng (KK),0.002049687553353108,0.6564551422319475,457,no_phys,South
+b2_rf,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,0.00871020892132568,0.6833333333333333,480,no_phys,South
+b2_rf,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),0.41687992212860125,0.6632231404958677,484,no_phys,Central
+b3_rf_rk,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.01726528686857809,0.690631808278867,459,no_phys,South
+b3_rf_rk,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),0.027862784385616624,0.7004310344827587,464,no_phys,Central
+b3_rf_rk,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),0.008475009499941732,0.6927835051546392,485,no_phys,South
+b3_rf_rk,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),0.009443608181551655,0.754880694143167,461,no_phys,South
+b3_rf_rk,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.5841785354218249,0.6114790286975718,453,no_phys,North
+b3_rf_rk,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.5209262270937263,0.6338912133891214,478,no_phys,North
+b3_rf_rk,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.6472987632838192,0.6412371134020619,485,no_phys,North
+b3_rf_rk,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.5218933711277192,0.5932914046121593,477,no_phys,North
+b3_rf_rk,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.580745011670124,0.5340909090909091,440,no_phys,North
+b3_rf_rk,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),0.33377065486253144,0.5776805251641138,457,no_phys,North
+b3_rf_rk,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),0.021825237621725502,0.6765327695560254,473,no_phys,South
+b3_rf_rk,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),0.5899465648916798,0.689873417721519,474,no_phys,North
+b3_rf_rk,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.012218357397370316,0.6346153846153846,468,no_phys,Central
+b3_rf_rk,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),0.5273121307312261,0.565121412803532,453,no_phys,North
+b3_rf_rk,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),0.5490436980994367,0.5847107438016529,484,no_phys,North
+b3_rf_rk,Trà Vinh: Tp. Trà Vinh (KK),0.01831862618946689,0.6687631027253669,477,no_phys,South
+b3_rf_rk,"Trà Vinh: xã Dân Thành, TX Duyên Hải (KK)",0.06266352088504379,0.5264270613107822,473,no_phys,South
+b3_rf_rk,Tây Ninh: Thị xã Trảng Bàng (KK),0.05618034673360084,0.6630196936542669,457,no_phys,South
+b3_rf_rk,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,0.006073561093999702,0.675,480,no_phys,South
+b3_rf_rk,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),0.4565141638789454,0.6818181818181818,484,no_phys,Central
+hima_only,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.5123621448517159,0.6923076923076923,26,no_phys,South
+hima_only,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),,,1,no_phys,Central
+hima_only,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),,,4,no_phys,South
+hima_only,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),0.09742672198155922,0.8064516129032258,31,no_phys,South
+hima_only,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.06958663177540347,0.8095238095238095,21,no_phys,North
+hima_only,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.834185461954968,0.7586206896551724,29,no_phys,North
+hima_only,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.07965607325843116,0.8518518518518519,27,no_phys,North
+hima_only,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.09918544176746436,0.8,20,no_phys,North
+hima_only,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.03835548074112316,0.8333333333333334,24,no_phys,North
+hima_only,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),,,12,no_phys,North
+hima_only,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),,,16,no_phys,South
+hima_only,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),,,15,no_phys,North
+hima_only,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.7464415428911313,0.7333333333333333,30,no_phys,Central
+hima_only,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),,,4,no_phys,North
+hima_only,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),,,17,no_phys,North
+hima_only,Trà Vinh: Tp. Trà Vinh (KK),0.4624381776034743,0.6923076923076923,39,no_phys,South
+hima_only,Tây Ninh: Thị xã Trảng Bàng (KK),0.004844287603243402,0.9130434782608695,23,no_phys,South
+hima_only,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,,,2,no_phys,South
+hima_only,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),,,1,no_phys,Central
+stage_a_merged,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.20616229252560758,0.7735849056603774,106,no_phys,South
+stage_a_merged,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),0.36180305672414503,0.696969696969697,99,no_phys,Central
+stage_a_merged,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),0.2454326980802235,0.7708333333333334,48,no_phys,South
+stage_a_merged,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),0.01971665825032065,0.7627118644067796,118,no_phys,South
+stage_a_merged,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.12507800424107585,0.8,60,no_phys,North
+stage_a_merged,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.2148052198421182,0.75,68,no_phys,North
+stage_a_merged,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.3142484323919894,0.8243243243243243,74,no_phys,North
+stage_a_merged,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.15820284557909892,0.7704918032786885,61,no_phys,North
+stage_a_merged,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.2495001487212294,0.7341772151898734,79,no_phys,North
+stage_a_merged,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),0.5457786092762035,0.6842105263157895,76,no_phys,North
+stage_a_merged,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),0.1529499493310803,0.7549019607843137,102,no_phys,South
+stage_a_merged,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),0.5669203493490828,0.7307692307692307,78,no_phys,North
+stage_a_merged,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.48762112357891063,0.7608695652173914,138,no_phys,Central
+stage_a_merged,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),0.20412008030618067,0.7076923076923077,65,no_phys,North
+stage_a_merged,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),0.6948594346181085,0.7333333333333333,75,no_phys,North
+stage_a_merged,Trà Vinh: Tp. Trà Vinh (KK),0.28684110783682515,0.6923076923076923,117,no_phys,South
+stage_a_merged,"Trà Vinh: xã Dân Thành, TX Duyên Hải (KK)",0.011398045192287487,0.6739130434782609,92,no_phys,South
+stage_a_merged,Tây Ninh: Thị xã Trảng Bàng (KK),0.08185310766331799,0.8278688524590164,122,no_phys,South
+stage_a_merged,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,0.006457616424002555,0.7155963302752294,109,no_phys,South
+stage_a_merged,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),0.6767319642229201,0.7777777777777778,99,no_phys,Central
+b1_st_kriging,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.21600464612329173,0.6658986175115207,434,phys,South
+b1_st_kriging,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),0.0596550850804104,0.7007299270072993,411,phys,Central
+b1_st_kriging,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),0.3232242993671126,0.7064017660044151,453,phys,South
+b1_st_kriging,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),0.40277862119059793,0.7310344827586207,435,phys,South
+b1_st_kriging,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.7019696747504549,0.6347826086956522,345,phys,North
+b1_st_kriging,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.6807915098977734,0.6638655462184874,357,phys,North
+b1_st_kriging,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.7481802314303665,0.6485013623978202,367,phys,North
+b1_st_kriging,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.7865206107520261,0.6207865168539326,356,phys,North
+b1_st_kriging,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.5757158989668641,0.6096096096096096,333,phys,North
+b1_st_kriging,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),0.8089214856963268,0.5835777126099707,341,phys,North
+b1_st_kriging,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),0.3955095736515658,0.6905829596412556,446,phys,South
+b1_st_kriging,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),0.7077472959589797,0.6830601092896175,366,phys,North
+b1_st_kriging,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.2420419345549678,0.6796116504854369,412,phys,Central
+b1_st_kriging,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),0.6123252060512295,0.6041666666666666,336,phys,North
+b1_st_kriging,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),0.7937809474806208,0.6536144578313253,332,phys,North
+b1_st_kriging,Trà Vinh: Tp. Trà Vinh (KK),0.3850545070181993,0.6703786191536748,449,phys,South
+b1_st_kriging,"Trà Vinh: xã Dân Thành, TX Duyên Hải (KK)",0.11833335511154297,0.5444191343963554,439,phys,South
+b1_st_kriging,Tây Ninh: Thị xã Trảng Bàng (KK),0.05338071772985964,0.6674364896073903,433,phys,South
+b1_st_kriging,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,0.2350996898435046,0.6844444444444444,450,phys,South
+b1_st_kriging,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),0.5712963916703183,0.6831168831168831,385,phys,Central
+b2_rf,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.20196163995224026,0.6688453159041394,459,phys,South
+b2_rf,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),0.24794242428659563,0.6875,464,phys,Central
+b2_rf,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),0.3602839367671067,0.7010309278350515,485,phys,South
+b2_rf,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),0.36265570515514645,0.7006507592190889,461,phys,South
+b2_rf,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.7717831837866838,0.6181015452538632,453,phys,North
+b2_rf,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.6649105714404824,0.6694560669456067,478,phys,North
+b2_rf,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.7070675598916866,0.6804123711340206,485,phys,North
+b2_rf,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.7895927178366685,0.6331236897274634,477,phys,North
+b2_rf,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.7244972609083917,0.6568181818181819,440,phys,North
+b2_rf,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),0.8093826450212511,0.6739606126914661,457,phys,North
+b2_rf,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),0.19290053952087827,0.6744186046511628,473,phys,South
+b2_rf,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),0.7459957680411424,0.6687763713080169,474,phys,North
+b2_rf,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.5745632552948032,0.7222222222222222,468,phys,Central
+b2_rf,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),0.6097560233086525,0.6467991169977925,453,phys,North
+b2_rf,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),0.6704770912274647,0.6508264462809917,484,phys,North
+b2_rf,Trà Vinh: Tp. Trà Vinh (KK),0.15688692825953576,0.6813417190775681,477,phys,South
+b2_rf,"Trà Vinh: xã Dân Thành, TX Duyên Hải (KK)",0.005582902639532872,0.53276955602537,473,phys,South
+b2_rf,Tây Ninh: Thị xã Trảng Bàng (KK),0.03006838454288363,0.6761487964989059,457,phys,South
+b2_rf,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,0.1766304523984492,0.7375,480,phys,South
+b2_rf,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),0.6490823900868115,0.6921487603305785,484,phys,Central
+b3_rf_rk,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.10208067918778019,0.6949891067538126,459,phys,South
+b3_rf_rk,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),0.1095866382775087,0.7068965517241379,464,phys,Central
+b3_rf_rk,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),0.33420889802576903,0.709278350515464,485,phys,South
+b3_rf_rk,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),0.21411163034982095,0.7310195227765727,461,phys,South
+b3_rf_rk,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.6924543916590222,0.6379690949227373,453,phys,North
+b3_rf_rk,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.7198245072926959,0.6673640167364017,478,phys,North
+b3_rf_rk,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.769186930669131,0.6577319587628866,485,phys,North
+b3_rf_rk,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.75891335123293,0.6310272536687631,477,phys,North
+b3_rf_rk,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.7201692545970108,0.5863636363636363,440,phys,North
+b3_rf_rk,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),0.7106755067928082,0.612691466083151,457,phys,North
+b3_rf_rk,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),0.3164198463952007,0.6765327695560254,473,phys,South
+b3_rf_rk,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),0.6368187789939269,0.6708860759493671,474,phys,North
+b3_rf_rk,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.2992865871851914,0.688034188034188,468,phys,Central
+b3_rf_rk,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),0.5618311842431829,0.5960264900662252,453,phys,North
+b3_rf_rk,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),0.7052814793197422,0.6570247933884298,484,phys,North
+b3_rf_rk,Trà Vinh: Tp. Trà Vinh (KK),0.2665292481798315,0.6771488469601677,477,phys,South
+b3_rf_rk,"Trà Vinh: xã Dân Thành, TX Duyên Hải (KK)",0.06611202754393475,0.5285412262156448,473,phys,South
+b3_rf_rk,Tây Ninh: Thị xã Trảng Bàng (KK),0.08106479013760381,0.6608315098468271,457,phys,South
+b3_rf_rk,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,0.14337330219879285,0.7104166666666667,480,phys,South
+b3_rf_rk,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),0.5680804039932972,0.71900826446281,484,phys,Central
+hima_only,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.5162304246704016,0.7307692307692307,26,phys,South
+hima_only,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),,,1,phys,Central
+hima_only,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),,,4,phys,South
+hima_only,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),0.5049397957569738,0.7741935483870968,31,phys,South
+hima_only,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.23376185510968017,0.7142857142857143,21,phys,North
+hima_only,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.28676664158615284,0.7586206896551724,29,phys,North
+hima_only,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.18381084678324366,0.7407407407407407,27,phys,North
+hima_only,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.23157401753195284,0.8,20,phys,North
+hima_only,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.1172914850607828,0.7083333333333334,24,phys,North
+hima_only,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),,,12,phys,North
+hima_only,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),,,16,phys,South
+hima_only,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),,,15,phys,North
+hima_only,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.4269983138419158,0.7333333333333333,30,phys,Central
+hima_only,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),,,4,phys,North
+hima_only,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),,,17,phys,North
+hima_only,Trà Vinh: Tp. Trà Vinh (KK),0.19475597778766585,0.6410256410256411,39,phys,South
+hima_only,Tây Ninh: Thị xã Trảng Bàng (KK),0.10722616887420344,0.8695652173913043,23,phys,South
+hima_only,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,,,2,phys,South
+hima_only,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),,,1,phys,Central
+stage_a_merged,"Bình Dương: số 593 Đại lộ Bình Dương, P. Hiệp Thành (KK)",0.2737878804906263,0.7452830188679245,106,phys,South
+stage_a_merged,Bình Định: Khuôn viên Cây xanh gần cầu chui đường Hoa Lư - TP. Quy Nhơn (KK),0.14732544734593545,0.6868686868686869,99,phys,Central
+stage_a_merged,HCM: Khu Liên cơ quan Bộ Tài Nguyên và Môi Trường - số 20 Đ. Lý Chính Thắng (KK),0.5751209558176107,0.7916666666666666,48,phys,South
+stage_a_merged,HCM: Đ. Lê Hữu Kiều - P. Bình Trưng Tây - Quận 2 (Ngã ba Lê Hữu Kiểu và Trương Văn Bang) (KK),0.580839133752231,0.7457627118644068,118,phys,South
+stage_a_merged,Hà Nam: Công Viên Nam Cao - P.Quang Trung - TP. Phủ Lý (KK),0.23650107363609996,0.8,60,phys,North
+stage_a_merged,Hà Nội: 556 Nguyễn Văn Cừ (KK),0.7080368529306107,0.7352941176470589,68,phys,North
+stage_a_merged,Hà Nội: Công viên Nhân Chính - Khuất Duy Tiến (KK),0.41096736124867694,0.7702702702702703,74,phys,North
+stage_a_merged,Hà Nội: ĐHBK cổng Parabol đường Giải Phóng (KK),0.3968594384916715,0.819672131147541,61,phys,North
+stage_a_merged,Hưng Yên: số 437 Nguyễn Văn Linh - Tp Hưng Yên (KK),0.22614369458604644,0.7721518987341772,79,phys,North
+stage_a_merged,Hải Dương: UBND TP. Hải Dương - 106 Đường Trần Hưng Đạo (KK),0.5360599208850012,0.7631578947368421,76,phys,North
+stage_a_merged,Long An: UBND Tp Tân An - 76 Hùng Vương - P.2 (KK),0.5366239698631394,0.7450980392156863,102,phys,South
+stage_a_merged,Phú Thọ: đường Hùng Vương - Tp Việt Trì (KK),0.8002789572884734,0.7051282051282052,78,phys,North
+stage_a_merged,Quảng Nam: Tiếp giáp Đ. Hùng Vương - KDC Đ. Hồ Xuân Hương (KK),0.6779654291017279,0.717391304347826,138,phys,Central
+stage_a_merged,Thái Bình: Cầu Thái Bình - Đ. Trần Thái Tông - P. Bồ Xuyên - TP Thái Bình (KK),0.09429301034820392,0.8307692307692308,65,phys,North
+stage_a_merged,Thái Nguyên: Sân vận động Gang thép - P Trung Thành - TP Thái Nguyên (KK),0.6758111415757648,0.64,75,phys,North
+stage_a_merged,Trà Vinh: Tp. Trà Vinh (KK),0.2182023138919429,0.7008547008547008,117,phys,South
+stage_a_merged,"Trà Vinh: xã Dân Thành, TX Duyên Hải (KK)",0.08366098645754749,0.6956521739130435,92,phys,South
+stage_a_merged,Tây Ninh: Thị xã Trảng Bàng (KK),0.22329026081770387,0.8114754098360656,122,phys,South
+stage_a_merged,Vũng Tàu: Đ. Huyền Trân Công Chúa - Phường 8 - TP Vũng Tàu,4.3449054607958004e-05,0.7247706422018348,109,phys,South
+stage_a_merged,Đà Nẵng: Khuôn viên trường ĐH sư phạm Đà Nẵng (KK),0.7625483114262462,0.7070707070707071,99,phys,Central

@@ -209,3 +209,9 @@ __marimo__/
 #data
 *.nc
 *.png
+
+#models
+*.pkl
+*.pt
+*.npz
+*.npy

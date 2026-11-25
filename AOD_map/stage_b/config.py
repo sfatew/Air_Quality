@@ -50,18 +50,25 @@ TEST_END = _stage_a_cfg.TEST_END
 AERONET_SITES = _stage_a_cfg.AERONET_SITES
 TZ_OFFSET_HOURS = _stage_a_cfg.TZ_OFFSET_HOURS
 SLOT_MINUTES = _stage_a_cfg.SLOT_MINUTES
+SLOTS_PER_DAY_STAGE_A = _stage_a_cfg.SLOTS_PER_DAY
 DATA_ROOT = _stage_a_cfg.DATA_ROOT
 MERGED_DIR = _stage_a_cfg.MERGED_DIR
 ERA5_MONTHLY_DIR = _stage_a_cfg.ERA5_MONTHLY_DIR
 
 # ── Slot geometry (data-driven; only the slot grid itself is fixed) ──────────
-# Universal slot index: hhmm → idx in 0..47 (every possible 30-min slot in a day).
-SLOTS_PER_DAY      = 48
+# Universal slot index: hhmm → idx in 0..SLOTS_PER_DAY-1 (every possible
+# SLOT_MINUTES-wide slot in a day).  Derived from Stage A's switch — change
+# the cadence there, not here.
+SLOTS_PER_DAY      = SLOTS_PER_DAY_STAGE_A
 WINDOW_MEDIAN_HALF_DAYS = 3   # 7-day window for the median fallback (±3)
-WINDOW_MIN_SLOTS_PRESENT = 10  # < this triggers the 7-day median fallback
+# Fallback threshold expresses "≥ 5 hours of daytime observed slots" (the
+# original intent at 48 slots/day = 10) — scale inversely with cadence so the
+# physical span stays constant: 10 at 30-min, 5 at 60-min.
+WINDOW_MIN_SLOTS_PRESENT = max(2, (10 * 30) // SLOT_MINUTES)  # < this triggers the 7-day median fallback
 
 # ── Stage B paths ─────────────────────────────────────────────────────────────
-STAGE_B_DIR     = DATA_ROOT / 'Stage_B'
+# STAGE_B_DIR     = DATA_ROOT / 'Stage_B'
+STAGE_B_DIR     = DATA_ROOT / 'Stage_B_hourly'
 ST_KRIGING_DIR  = STAGE_B_DIR / 'output' / 'st_kriging'   # parallel product tree
 RF_OUTPUT_DIR   = STAGE_B_DIR / 'output' / 'rf'           # parallel product tree
 # Regression-kriging (B3): RF drift + kriged RF-residual.  RF_PRED_DIR holds the
@@ -276,10 +283,19 @@ CAMS_LAG_HOURS               = 3.0
 #   forgets fast (trust only very recent), large τ trusts older obs.  Tune on
 #   blind AERONET R² at NGHIA_DO (the site where the kriging gap lives).
 OBS_NEIGHBORHOOD_BOX        = 5   # 5x5 ≈ 25 km at 0.05° grid (matches kriging scale)
-PERSISTENCE_TAU_SLOTS       = 6   # e-folding 3 h; matches CAMS native cadence
-PERSISTENCE_LOOKBACK_SLOTS  = 24  # hard cap on backward search (~1/2 daytime window)
+# Tunables below are expressed in SLOT units, so their *physical* duration
+# follows the SLOT_MINUTES switch.  Expressed as (hours × 60 // SLOT_MINUTES)
+# so hourly and 30-min cadences keep the same physical τ (3 h) and lookback
+# (12 h).
+PERSISTENCE_TAU_HOURS       = 3.0   # e-folding 3 h; matches CAMS native cadence
+PERSISTENCE_LOOKBACK_HOURS  = 12.0  # hard cap on backward search (~1/2 daytime window)
+PERSISTENCE_TAU_SLOTS       = max(1, int(round(PERSISTENCE_TAU_HOURS * 60 / SLOT_MINUTES)))
+PERSISTENCE_LOOKBACK_SLOTS  = max(1, int(round(PERSISTENCE_LOOKBACK_HOURS * 60 / SLOT_MINUTES)))
 
 # ── §8 — slots_since_last_observed audit bins (validation-side only) ─────────
-# Counted in 30-min steps; nighttime gap ≈ 26-30 steps (13-15 h) depending on day.
-SSO_BINS   = [-1, 0, 1, 4, 19, 49, 1_000_000]
+# Bin edges in slot units; the legacy 30-min cadence used
+# [-1, 0, 1, 4, 19, 49, 1_000_000] (≤2h, ≤10h, ≤25h "one night" boundaries).
+# At 60-min cadence, each legacy edge halves.
+_SPH = 60 // SLOT_MINUTES   # slots per hour (2 at 30-min, 1 at 60-min)
+SSO_BINS   = [-1, 0, 1, 2 * _SPH, 10 * _SPH - 1, 25 * _SPH - 1, 1_000_000]
 SSO_LABELS = ['observed', '1 slot', '≤2 h', '≤10 h', '≤25 h (one night)', '>25 h']

@@ -67,6 +67,7 @@ from config import (
     TC_MIN_TRIPLETS, TC_MIN_COLLOCATIONS,
     TRAIN_START, TRAIN_END,
     SOFT_CAL_FILE, TC_VARIANCE_FILE,
+    SLOTS_PER_DAY as _GRID_SLOTS_PER_DAY,
 )
 from extract_satellite import extract_site
 from collocate import match_site, collocate_site
@@ -74,7 +75,6 @@ from grid import grid_day, ALL_SENSORS as _ALL_GRID_SENSORS
 
 _ALL_SENSORS = ('himawari_l2', 'himawari_l3', 'viirs_snpp', 'viirs_noaa20', 'modis_maiac')
 _ALL_SITES   = list(AERONET_SITES.keys())
-_GRID_SLOTS_PER_DAY = 48
 
 
 # ── Environment banner ────────────────────────────────────────────────────────

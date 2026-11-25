@@ -43,7 +43,8 @@ import numpy as np
 
 from config import (
     LATS, LONS, NLAT, NLON,
-    GRIDDED_DIR, SLOT_MINUTES,
+    GRIDDED_DIR, SLOT_MINUTES, SLOTS_PER_DAY,
+    HIMAWARI_L2_WINDOW_MIN, HIMAWARI_L3_WINDOW_MIN,
 )
 from gridder  import bin_to_grid, grid_from_himawari
 from himawari import read_l2_slot, read_l3_slot
@@ -57,7 +58,7 @@ ALL_SENSORS = (
     'modis_maiac',
 )
 
-_SLOTS_PER_DAY = (24 * 60) // SLOT_MINUTES
+_SLOTS_PER_DAY = SLOTS_PER_DAY
 
 
 # ── Path helpers ─────────────────────────────────────────────────────────────
@@ -97,14 +98,14 @@ def compute_slot_grids(
     out: dict[str, dict[str, np.ndarray]] = {}
 
     if 'himawari_l2' in sensors:
-        res = read_l2_slot(slot_utc)
+        res = read_l2_slot(slot_utc, window_min=HIMAWARI_L2_WINDOW_MIN)
         if res is not None:
             g = grid_from_himawari(res)
             if _has_aod(g):
                 out['himawari_l2'] = g
 
     if 'himawari_l3' in sensors:
-        res = read_l3_slot(slot_utc)
+        res = read_l3_slot(slot_utc, window_min=HIMAWARI_L3_WINDOW_MIN)
         if res is not None:
             g = grid_from_himawari(res)
             if _has_aod(g):

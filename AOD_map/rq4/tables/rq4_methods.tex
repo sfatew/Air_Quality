@@ -1,0 +1,22 @@
+\begin{table}[H]
+\centering
+\caption{RQ4 headline: per-method daily AOD--\PMtwo $\bar{R}^{2}$ averaged across Envisoft stations passing the $\geq$85\% completeness gate for 2025-01/2026-04 (Equation~\ref{eq:rq4-mean}), under the post-processing chain of \S\ref{sec:validation-pm25}. Reported with and without the per-slot physics normalisation of Equation~\ref{eq:phys-norm}. Target: $\ge 0.35$ (\S9).}
+\label{tab:res-rq4-methods}
+\small
+\begin{tabular}{lrrrr}
+\hline
+\textbf{Product / post-processing variant} & \textbf{Stations w/ fit} & \textbf{Mean $\bar{R}^{2}$} & \textbf{Median per-station $R^{2}$} & \textbf{Mean inlier fraction} \\
+\hline
+Himawari-only, no physics & 10 & 0.294 & 0.098 & 0.789 \\
+Himawari-only, with physics & 10 & 0.280 & 0.233 & 0.747 \\
+\textbf{Stage~A merged only, no physics} & 20 & 0.281 & 0.230 & 0.747 \\
+\textbf{Stage~A merged only, with physics} & 20 & 0.408 & 0.404 & 0.745 \\
+\textbf{Stage~B B1 ST-kriging, no physics} & 20 & 0.298 & 0.226 & 0.647 \\
+\textbf{Stage~B B1 ST-kriging, with physics} & 20 & 0.471 & 0.487 & 0.656 \\
+\textbf{Stage~B B2 Random Forest, no physics} & 20 & 0.291 & 0.311 & 0.656 \\
+\textbf{Stage~B B2 Random Forest, with physics} & 20 & 0.473 & 0.592 & 0.669 \\
+\textbf{Stage~B B3 regression kriging, no physics} & 20 & 0.278 & 0.198 & 0.640 \\
+\textbf{Stage~B B3 regression kriging, with physics} & 20 & 0.439 & 0.448 & 0.661 \\
+\hline
+\end{tabular}
+\end{table}

@@ -45,6 +45,7 @@ from config import (
     NDVI_DIR, LANDCOVER_DIR, LANDSCAN_DIR, DEM_DIR, IMERG_DIR,
     FIRMS_ZIP, FIRMS_RADIUS_KM, FIRMS_LOOKBACK_H,
     EARTH_RADIUS_KM,
+    SLOT_MINUTES,
 )
 
 os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
@@ -139,18 +140,23 @@ def _select_era5_hour(ds: xr.Dataset, t: datetime) -> Optional[xr.Dataset]:
 def era5_slot(slot_utc: datetime) -> dict[str, np.ndarray]:
     """ERA5 fields at `slot_utc` (linear interp between flanking hourly steps).
 
-    Slots aligned to HH:00 take the hourly field directly. Slots at HH:30
-    use 0.5 × ERA5(HH:00) + 0.5 × ERA5(HH+1:00).  All requested keys are
-    populated — missing variables return all-NaN grids.
+    Slots aligned to HH:00 take the hourly field directly.  Sub-hourly slots
+    (e.g. HH:30 at the 30-min cadence) linearly interpolate between
+    ERA5(HH:00) and ERA5(HH+1:00) using weights (1-f, f) where
+    f = minute / 60.  All requested keys are populated — missing variables
+    return all-NaN grids.
     """
     out = {key: _nan_grid() for key in _ERA5_VARS}
 
     minute = slot_utc.minute
-    if minute not in (0, 30):
-        raise ValueError(f'ERA5 slot timestamp {slot_utc} not aligned to 30-min')
+    if (minute % SLOT_MINUTES) != 0 or (minute >= 60 and SLOT_MINUTES < 60):
+        raise ValueError(
+            f'ERA5 slot timestamp {slot_utc} not aligned to SLOT_MINUTES={SLOT_MINUTES}'
+        )
 
     hour_floor = slot_utc.replace(minute=0, second=0, microsecond=0)
-    needs_pair = minute == 30
+    frac       = minute / 60.0            # 0.0 at HH:00, 0.5 at HH:30
+    needs_pair = frac > 0.0
     hour_ceil  = hour_floor + timedelta(hours=1) if needs_pair else hour_floor
 
     ds_a = _open_era5_month(hour_floor.strftime('%Y%m'))
@@ -173,10 +179,7 @@ def era5_slot(slot_utc: datetime) -> dict[str, np.ndarray]:
             b = sub_b[var].values
         except Exception:
             continue
-        if needs_pair:
-            field = 0.5 * (a + b)
-        else:
-            field = a
+        field = (1.0 - frac) * a + frac * b if needs_pair else a
         out[feature] = _interp_to_grid(lat, lon, field)
     return out
 
@@ -336,6 +339,33 @@ def imerg_slot(slot_utc: datetime) -> Optional[np.ndarray]:
 @lru_cache(maxsize=320)
 def _imerg_slot_cached(slot_utc: datetime) -> Optional[np.ndarray]:
     return imerg_slot(slot_utc)
+
+
+def imerg_slot_total(slot_utc: datetime) -> Optional[np.ndarray]:
+    """Precipitation accumulated over the slot's full duration (mm).
+
+    IMERG tiles are native 30-min; this helper sums the SLOT_MINUTES/30 tiles
+    starting at `slot_utc` so a 60-min slot correctly includes both the HH:00
+    and HH:30 half-hours.  At 30-min cadence it returns the single tile
+    unchanged.  Missing tiles contribute 0 but the whole-grid result is None
+    if no tile in the window exists.
+    """
+    native_step = 30
+    n_tiles = max(1, SLOT_MINUTES // native_step)
+    if n_tiles == 1:
+        return _imerg_slot_cached(slot_utc)
+    acc = np.zeros((NLAT, NLON), dtype=np.float32)
+    any_finite = np.zeros((NLAT, NLON), dtype=bool)
+    for k in range(n_tiles):
+        arr = _imerg_slot_cached(slot_utc + timedelta(minutes=k * native_step))
+        if arr is None:
+            continue
+        finite = np.isfinite(arr)
+        acc = acc + np.where(finite, arr.astype(np.float32), 0.0)
+        any_finite |= finite
+    if not any_finite.any():
+        return None
+    return np.where(any_finite, acc, np.nan).astype(np.float32)
 
 
 def imerg_accum_hours(slot_utc: datetime, hours: float,
